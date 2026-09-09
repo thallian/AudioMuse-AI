@@ -1,3 +1,79 @@
+## Updating this fork
+
+The fork adds `*_FILE` secrets to `config.py`, plus a couple of Dockerfile
+tweaks. `file-based-secrets.patch` is the diff vs upstream v3.5.2
+(`0083e793`).
+
+Changed files: `config.py`, `Dockerfile`, `app_auth.py`, `app_backup.py`,
+`lyrics/*.py`, `tasks/ai/providers/*.py`, `test/unit/test_config.py`.
+
+### Build
+
+CPU:
+
+```bash
+docker build -t audiomuse-ai .
+```
+
+CUDA (x86_64):
+
+```bash
+docker build --build-arg BASE_IMAGE=nvidia/cuda:13.3.1-cudnn-runtime-ubuntu24.04 -t audiomuse-ai-gpu .
+```
+
+CUDA (ARM64 / DGX Spark):
+
+```bash
+docker build \
+  --build-arg BASE_IMAGE=nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04 \
+  --build-arg ONNXRUNTIME_WHEEL_URL=https://github.com/NeptuneHub/AudioMuse-AI/releases/download/v5.0.0-model/onnxruntime_gpu-1.25.0-cp312-cp312-linux_aarch64.whl \
+  -t audiomuse-ai-gpu-arm .
+```
+
+Same build-args work with buildah. The nvidia regex accepts any registry
+prefix, so `docker.io/nvidia/cuda:...` is fine.
+
+### Merge a new upstream tag
+
+```bash
+git fetch upstream --tags
+git merge <new-upstream-tag>
+```
+
+`config.py` will conflict. Take upstream's version, then re-apply the fork:
+
+```bash
+git checkout --theirs config.py
+git apply --3way file-based-secrets.patch
+```
+
+Fix any leftover `<<<<<<<` markers, then:
+
+```bash
+git add -A
+git commit
+```
+
+`--3way` merges instead of failing when context lines moved. It needs the
+full blob hashes (the patch uses `--full-index`) and the base commit still
+fetched. If it can't find the base:
+
+```bash
+git fetch upstream refs/tags/v3.5.2
+```
+
+### Refresh the patch
+
+After a successful merge, rebase the patch onto the new tag:
+
+```bash
+git diff --full-index <new-upstream-tag> HEAD > file-based-secrets.patch
+git add file-based-secrets.patch
+git commit -m "Refresh fork delta patch"
+```
+
+---
+
 ![GitHub license](https://img.shields.io/github/license/neptunehub/AudioMuse-AI.svg)
 ![Latest Tag](https://img.shields.io/github/v/tag/neptunehub/AudioMuse-AI?label=latest-tag)
 ![Media Server Support: Navidrome 0.62.0, Jellyfin 12.0, LMS v3.69.0, Lyrion 9.0.2, Emby 4.9.1.80, Plex 1.43.2](https://img.shields.io/badge/Media%20Server-Navidrome%200.62.0%2C%20Jellyfin%2012.0%2C%20LMS%20v3.69.0%2C%20Lyrion%209.0.2%2C%20Emby%204.9.1.80%2C%20Plex%201.43.2-blue?style=flat-square&logo=server&logoColor=white)
