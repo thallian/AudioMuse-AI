@@ -817,11 +817,8 @@ SUPERVISORCTL_CMD = get_config("SUPERVISORCTL_CMD", "/usr/bin/supervisorctl")
 SUPERVISOR_CONF = get_config("SUPERVISOR_CONF", "/etc/supervisor/conf.d/supervisord.conf")
 DISABLE_FLASK_RESTART = get_config("DISABLE_FLASK_RESTART", "false").lower() == "true"
 
-# DATABASE_URL is DERIVED, never configured. Every deployment sets the five
-# POSTGRES_* parts and this is the single place that assembles them, so a
-# DATABASE_URL in the environment is deliberately ignored: two config sources for
-# one connection is what broke pg_dump when only one of them was set (#832).
-DATABASE_URL = _DERIVED_DATABASE_URL
+# Explicit DATABASE_URL (env or *_FILE) wins; otherwise derive from POSTGRES_*.
+DATABASE_URL = get_config("DATABASE_URL", _DERIVED_DATABASE_URL)
 
 # --- AI User for Chat SQL Execution ---
 AI_CHAT_DB_USER_NAME = get_config("AI_CHAT_DB_USER_NAME", "ai_user")
