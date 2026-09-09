@@ -35,25 +35,27 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
+import config
+
 logger = logging.getLogger(__name__)
 
-LYRICS_WHISPER_MIN_FREE_RAM_GB = float(os.environ.get("LYRICS_WHISPER_MIN_FREE_RAM_GB", "2.5"))
+LYRICS_WHISPER_MIN_FREE_RAM_GB = float(config.get_config("LYRICS_WHISPER_MIN_FREE_RAM_GB", "2.5"))
 
-LYRICS_WHISPER_LANG_CONFIDENCE = float(os.environ.get("LYRICS_WHISPER_LANG_CONFIDENCE", "0.7"))
+LYRICS_WHISPER_LANG_CONFIDENCE = float(config.get_config("LYRICS_WHISPER_LANG_CONFIDENCE", "0.7"))
 
-WHISPER_MAX_NEW_TOKENS = int(os.environ.get("LYRICS_WHISPER_MAX_NEW_TOKENS", "180"))
+WHISPER_MAX_NEW_TOKENS = int(config.get_config("LYRICS_WHISPER_MAX_NEW_TOKENS", "180"))
 
-WHISPER_REPETITION_PENALTY = float(os.environ.get("LYRICS_WHISPER_REPETITION_PENALTY", "1.15"))
+WHISPER_REPETITION_PENALTY = float(config.get_config("LYRICS_WHISPER_REPETITION_PENALTY", "1.15"))
 
-WHISPER_NO_REPEAT_NGRAM = int(os.environ.get("LYRICS_WHISPER_NO_REPEAT_NGRAM", "3"))
+WHISPER_NO_REPEAT_NGRAM = int(config.get_config("LYRICS_WHISPER_NO_REPEAT_NGRAM", "3"))
 
 WHISPER_COMPRESSION_RATIO_THRESHOLD = float(
-    os.environ.get("LYRICS_WHISPER_COMPRESSION_RATIO", "2.4")
+    config.get_config("LYRICS_WHISPER_COMPRESSION_RATIO", "2.4")
 )
 
 
 def _resolve_whisper_threads() -> int:
-    raw = os.environ.get('LYRICS_WHISPER_INTRA_OP_THREADS', '').strip()
+    raw = config.get_config('LYRICS_WHISPER_INTRA_OP_THREADS', '').strip()
     if raw == '':
         cpu_count = os.cpu_count() or 1
         return max(1, cpu_count // 3)

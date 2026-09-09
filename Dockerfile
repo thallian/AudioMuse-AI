@@ -6,12 +6,12 @@
 #   CPU:  docker build -t audiomuse-ai .
 #   GPU:  docker build --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 -t audiomuse-ai-gpu .
 
-ARG BASE_IMAGE=ubuntu:24.04
+ARG BASE_IMAGE=docker.io/ubuntu:24.04
 
 # ============================================================================
 # Stage 1: Download ML models (cached separately for faster rebuilds)
 # ============================================================================
-FROM ubuntu:24.04 AS models
+FROM docker.io/ubuntu:24.04 AS models
 
 SHELL ["/bin/bash", "-lc"]
 
@@ -476,9 +476,9 @@ COPY --from=models /app/model/ /app/model/
 COPY --from=models /app/.cache/huggingface/ /app/.cache/huggingface/
 
 # Verify cache was copied correctly
-RUN ls -lah /app/.cache/huggingface/ && \
-    echo "HuggingFace cache contents:" && \
-    du -sh /app/.cache/huggingface/* || echo "Cache directory empty!"
+RUN ls -lah /app/.cache/huggingface/ \
+    && echo "HuggingFace cache contents:" \
+    && du -sh /app/.cache/huggingface/* || echo "Cache directory empty!"
 
 # Copy Python packages from libraries stage
 COPY --from=libraries /usr/local/lib/python3.12/dist-packages/ /usr/local/lib/python3.12/dist-packages/

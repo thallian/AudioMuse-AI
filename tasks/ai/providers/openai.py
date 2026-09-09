@@ -120,7 +120,7 @@ def generate_text(
     for attempt in range(max_retries + 1):
         try:
             if is_openai_format and attempt == 0 and not skip_delay:
-                openai_call_delay = int(os.environ.get("OPENAI_API_CALL_DELAY_SECONDS", "7"))
+                openai_call_delay = int(config.get_config("OPENAI_API_CALL_DELAY_SECONDS", "7"))
                 if openai_call_delay > 0:
                     logger.debug(
                         "Waiting for %ss before OpenAI/OpenRouter API call to respect rate limits.",

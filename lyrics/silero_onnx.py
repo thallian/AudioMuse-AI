@@ -48,7 +48,8 @@ _session_lock = threading.Lock()
 def _load_session(model_path: Optional[str] = None):
     global _session, _session_path
 
-    path = model_path or os.environ.get('SILERO_VAD_ONNX_PATH', _DEFAULT_MODEL_PATH)
+    import config
+    path = model_path or config.get_config('SILERO_VAD_ONNX_PATH', _DEFAULT_MODEL_PATH)
 
     if _session is not None and _session_path == path:
         return _session

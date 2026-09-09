@@ -68,7 +68,7 @@ def generate_text(
         from mistralai import Mistral
 
         if not skip_delay:
-            mistral_call_delay = int(os.environ.get("MISTRAL_API_CALL_DELAY_SECONDS", "7"))
+            mistral_call_delay = int(config.get_config("MISTRAL_API_CALL_DELAY_SECONDS", "7"))
             if mistral_call_delay > 0:
                 logger.debug(
                     "Waiting for %ss before mistral API call to respect rate limits.",

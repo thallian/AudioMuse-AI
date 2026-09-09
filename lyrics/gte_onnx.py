@@ -43,11 +43,13 @@ _load_lock = threading.Lock()
 
 
 def _resolve_onnx_path() -> str:
-    return os.environ.get('LYRICS_GTE_ONNX_PATH', _DEFAULT_ONNX_PATH)
+    import config
+    return config.get_config('LYRICS_GTE_ONNX_PATH', _DEFAULT_ONNX_PATH)
 
 
 def _resolve_tokenizer_dir() -> str:
-    return os.environ.get('LYRICS_GTE_TOKENIZER_DIR', _DEFAULT_TOKENIZER_DIR)
+    import config
+    return config.get_config('LYRICS_GTE_TOKENIZER_DIR', _DEFAULT_TOKENIZER_DIR)
 
 
 def load_gte_model():

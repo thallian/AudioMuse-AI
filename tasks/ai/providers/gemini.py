@@ -24,6 +24,8 @@ import os
 import time
 from typing import Dict, List, Optional
 
+import config
+
 logger = logging.getLogger(__name__)
 
 EMPTY_RESPONSE_RETRIES = 3
@@ -52,7 +54,7 @@ def generate_text(
         client = None
         for attempt in range(EMPTY_RESPONSE_RETRIES):
             if not skip_delay:
-                gemini_call_delay = int(os.environ.get("GEMINI_API_CALL_DELAY_SECONDS", "7"))
+                gemini_call_delay = int(config.get_config("GEMINI_API_CALL_DELAY_SECONDS", "7"))
                 if gemini_call_delay > 0:
                     logger.debug(
                         "Waiting for %ss before Gemini API call to respect rate limits.",

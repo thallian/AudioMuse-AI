@@ -65,7 +65,9 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 DEFAULT_SAMPLE_RATE = 16000
-MAX_AUDIO_SECONDS = float(os.environ.get('LYRICS_MAX_AUDIO_SECONDS', '240'))
+import config
+
+MAX_AUDIO_SECONDS = float(config.get_config('LYRICS_MAX_AUDIO_SECONDS', '240'))
 
 from config import LYRICS_MIN_CHARS_FOR_EMBEDDING as MIN_CHARS_FOR_EMBEDDING
 from config import LYRICS_ASR_MIN_AVG_LOGPROB as ASR_MIN_AVG_LOGPROB

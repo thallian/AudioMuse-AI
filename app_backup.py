@@ -49,8 +49,8 @@ logger = logging.getLogger(__name__)
 
 backup_bp = Blueprint('backup_bp', __name__)
 
-BACKUP_DIR = os.environ.get("BACKUP_DIR", "/app/backup")
-RESTORE_LOG_DIR = os.environ.get("RESTORE_LOG_DIR", BACKUP_DIR)
+BACKUP_DIR = config.get_config("BACKUP_DIR", "/app/backup")
+RESTORE_LOG_DIR = config.get_config("RESTORE_LOG_DIR", BACKUP_DIR)
 
 # Cross-container restore lock. Only one restore may run at a time.
 # TTL self-releases on crash; runner releases explicitly on clean exit.
