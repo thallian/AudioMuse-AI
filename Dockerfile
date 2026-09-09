@@ -401,7 +401,7 @@ RUN set -ux; \
             supervisor procps \
             git vim strace iputils-ping \
             postgresql-common ca-certificates \
-            "$(if [[ "$BASE_IMAGE" =~ (^|/)nvidia/cuda:([0-9]+)\.([0-9]+).+$ ]]; then echo "cuda-compiler-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"; fi)" \
+            "$(if [[ "$BASE_IMAGE" =~ nvidia/cuda:([0-9]+)\.([0-9]+).+$ ]]; then echo "cuda-compiler-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"; fi)" \
             # PostgreSQL 18 client from PGDG (pg_dump 18 backs up PG 15-18; psql restore stays compatible with old pg_dump 16 / PG 15 dumps)
             && /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y \
             && DEBIAN_FRONTEND=noninteractive apt-get update \
@@ -471,7 +471,7 @@ COPY requirements/ /app/requirements/
 # Note: --index-strategy unsafe-best-match resolves conflicts between pypi.nvidia.com and pypi.org
 RUN rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED; \
     export UV_BREAK_SYSTEM_PACKAGES=1; \
-    if [[ "$BASE_IMAGE" =~ (^|/)nvidia/cuda: ]]; then \
+    if [[ "$BASE_IMAGE" =~ nvidia/cuda: ]]; then \
         if [[ -n "$ONNXRUNTIME_WHEEL_URL" ]]; then \
             echo "NVIDIA (arm64/CUDA 13) base: installing GPU packages (cupy-cuda13x, cuml-cu13) with prebuilt aarch64 onnxruntime-gpu wheel"; \
             uv pip install --system --no-cache --index-strategy unsafe-best-match -r /app/requirements/gpu-arm64.txt -r /app/requirements/common.txt "$ONNXRUNTIME_WHEEL_URL" || exit 1; \
