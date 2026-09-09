@@ -1,0 +1,167 @@
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""Google Gemini client for the playlist AI.
+
+One of the per-provider backends dispatched from ``tasks.ai.api``, using the
+google-genai SDK. Exposes generate_text for plain naming/brainstorm calls and
+call_with_tools for single-turn function-calling that returns a normalized
+list of tool calls.
+
+Main Features:
+* call_with_tools forces function_calling_config mode ANY and flattens the SDK function_call parts into the shared {"name","arguments"} shape.
+* generate_text strips the returned text and retries an empty response, which thinking models produce when the token budget goes to thought parts.
+* Applies an optional pre-call delay (env GEMINI_API_CALL_DELAY_SECONDS, default 7s) for rate limits; on any SDK error returns a generic "AI service unavailable" string, never a traceback.
+"""
+
+import logging
+import os
+import time
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+EMPTY_RESPONSE_RETRIES = 3
+
+
+def generate_text(
+    api_key: str,
+    model_name: str,
+    full_prompt: str,
+    *,
+    skip_delay: bool = False,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
+    if not api_key or api_key == "YOUR-GEMINI-API-KEY-HERE":
+        return "Error: Gemini API key is missing or empty. Please provide a valid API key."
+
+    try:
+        import google.genai as genai
+
+        temp = 0.9 if temperature is None else float(temperature)
+        cfg_kwargs = {"temperature": temp}
+        if max_tokens is not None:
+            cfg_kwargs["max_output_tokens"] = int(max_tokens)
+
+        client = None
+        for attempt in range(EMPTY_RESPONSE_RETRIES):
+            if not skip_delay:
+                gemini_call_delay = int(os.environ.get("GEMINI_API_CALL_DELAY_SECONDS", "7"))
+                if gemini_call_delay > 0:
+                    logger.debug(
+                        "Waiting for %ss before Gemini API call to respect rate limits.",
+                        gemini_call_delay,
+                    )
+                    time.sleep(gemini_call_delay)
+
+            if client is None:
+                client = genai.Client(api_key=api_key)
+            logger.debug("Starting API call for model '%s'.", model_name)
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=full_prompt,
+                config=genai.types.GenerateContentConfig(**cfg_kwargs),
+            )
+
+            extracted_text = (getattr(response, "text", None) or "").strip()
+            if extracted_text:
+                logger.info("Gemini API returned: '%s'", extracted_text)
+                return extracted_text
+            logger.warning(
+                "Gemini returned no content (attempt %d/%d).",
+                attempt + 1,
+                EMPTY_RESPONSE_RETRIES,
+            )
+
+        return "Error: Gemini returned no content."
+
+    except Exception:
+        logger.exception("Error calling Gemini API")
+        return "Error: AI service is currently unavailable."
+
+
+def call_with_tools(
+    api_key: str,
+    model_name: str,
+    system_prompt: str,
+    user_message: str,
+    tools: List[Dict],
+    log_messages: List[str],
+) -> Dict:
+    try:
+        import google.genai as genai
+
+        if not api_key or api_key == "YOUR-GEMINI-API-KEY-HERE":
+            return {"error": "Valid Gemini API key required"}
+
+        client = genai.Client(api_key=api_key)
+
+        function_declarations = [
+            {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["inputSchema"],
+            }
+            for tool in tools
+        ]
+
+        tools_list = [genai.types.Tool(function_declarations=function_declarations)]
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=user_message,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=tools_list,
+                tool_config=genai.types.ToolConfig(
+                    function_calling_config=genai.types.FunctionCallingConfig(mode="ANY")
+                ),
+                temperature=0,
+            ),
+        )
+
+        log_messages.append(f"Gemini response type: {type(response)}")
+
+        def convert_to_dict(obj):
+            if hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes, dict)):
+                if hasattr(obj, "items"):
+                    return {k: convert_to_dict(v) for k, v in obj.items()}
+                return [convert_to_dict(item) for item in obj]
+            elif isinstance(obj, dict):
+                return {k: convert_to_dict(v) for k, v in obj.items()}
+            return obj
+
+        tool_calls = []
+        if hasattr(response, "candidates") and response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
+                for part in candidate.content.parts:
+                    if hasattr(part, "function_call") and part.function_call:
+                        fc = part.function_call
+                        args_dict = {}
+                        if hasattr(fc, "args"):
+                            args_dict = dict(fc.args) if fc.args else {}
+                        elif hasattr(fc, "arguments"):
+                            args_dict = fc.arguments if isinstance(fc.arguments, dict) else {}
+                        tool_calls.append(
+                            {"name": fc.name, "arguments": convert_to_dict(args_dict)}
+                        )
+
+        if not tool_calls:
+            text_response = response.text if hasattr(response, "text") else str(response)
+            log_messages.append(f"Gemini did not call tools. Response: {text_response[:200]}")
+            return {"error": "AI did not call any tools", "ai_response": text_response}
+
+        log_messages.append(f"Gemini called {len(tool_calls)} tools")
+        return {"tool_calls": tool_calls}
+
+    except Exception:
+        logger.exception("Error calling Gemini with tools")
+        return {"error": "Gemini service is currently unavailable."}

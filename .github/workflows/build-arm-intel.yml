@@ -4,25 +4,26 @@
 # After both builds complete, a manifest is created to combine them into a single multi-arch tag.
 #
 # Tags are automatically generated based on the triggering event:
-# - devel branch -> 'devel'
-# - mulan branch -> 'mulan'
+# - push to main (e.g. a merged PR) -> 'devel'
 # - version tags (e.g., v1.2.3) -> 'latest' + version number (e.g., '1.2.3')
 
 name: Build, Test, and Push AudioMuse AI Docker Image INTEL and ARM
 
 on:
   push:
-    # We avoid triggering this workflow on direct pushes to `main` to prevent
-    # accidental builds from routine commits. Keep `devel` and `mulan` as before.
     branches:
-      - devel         # Trigger for 'devel' tag
-      - mulan         # New branch also triggers for 'mulan' tag
+      - main          # Trigger on merge/push to main -> 'devel' tag
     tags:
       - 'v*.*.*'      # Trigger for version tags like v1.0.0
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
   # Allow manual runs for debugging or manual pushes
   workflow_dispatch:
 
-# Prevent concurrent builds for the same branch/tag — a new push cancels the in-progress build.
+# Prevent concurrent builds for the same branch/tag - a new push cancels the in-progress build.
 # This avoids race conditions where two builds overwrite each other's temporary tags.
 concurrency:
   group: build-${{ github.ref }}
@@ -36,7 +37,15 @@ jobs:
   # Step 1: Compute image name and tags once (shared by all jobs)
   # ============================================================================
   prepare:
+    # Run on non-PR events; for PR events skip drafts and fork PRs (the
+    # latter only get a read-only GITHUB_TOKEN and cannot push to ghcr.io).
+    # Maintainers can build a fork PR manually via workflow_dispatch.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
+    permissions: {}
     outputs:
       image: ${{ steps.repo_name.outputs.image }}
       tags: ${{ steps.tags.outputs.tags }}
@@ -56,12 +65,14 @@ jobs:
             VERSION="${VERSION#v}"
             TAGS="latest ${VERSION}"
             SUFFIX="release"
-          elif [[ "${{ github.ref }}" == refs/heads/devel ]]; then
+          elif [[ "${{ github.ref }}" == refs/heads/main ]]; then
             TAGS="devel"
             SUFFIX="devel"
-          elif [[ "${{ github.ref }}" == refs/heads/mulan ]]; then
-            TAGS="mulan"
-            SUFFIX="mulan"
+          elif [[ "${{ github.event_name }}" == "pull_request" && "${{ github.event.pull_request.draft }}" == "false" ]]; then
+            PR_NUM="${{ github.event.pull_request.number }}"
+            TAGS="pr-${PR_NUM}"
+            SUFFIX="pr-${PR_NUM}"
+            echo "Building PR image tag: ${TAGS}"
           fi
           echo "tags=${TAGS}" >> $GITHUB_OUTPUT
           echo "suffix=${SUFFIX}" >> $GITHUB_OUTPUT
@@ -114,7 +125,7 @@ jobs:
 
   build-arm64:
     needs: prepare
-    runs-on: ubuntu-24.04-arm  # Native ARM64 runner — no QEMU emulation
+    runs-on: ubuntu-24.04-arm  # Native ARM64 runner - no QEMU emulation
     permissions:
       contents: read
       packages: write
@@ -184,7 +195,7 @@ jobs:
               --tag "${IMAGE}:${TAG}" \
               "${AMD64}" \
               "${ARM64}"
-            echo "✓ Pushed ${IMAGE}:${TAG}"
+            echo "OK: Pushed ${IMAGE}:${TAG}"
           done
 
       - name: Verify multi-arch manifest

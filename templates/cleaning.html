@@ -9,34 +9,6 @@
         padding: 1rem;
         margin-bottom: 1.5rem;
     }
-    .active-button {
-        background-color: var(--color-primary) !important;
-        border-color: var(--color-primary) !important;
-        color: white !important;
-    }
-    .active-button:hover {
-        background-color: var(--color-primary-hover) !important;
-        border-color: var(--color-primary-hover) !important;
-    }
-    .active-button:disabled {
-        background-color: var(--text-muted) !important;
-        border-color: var(--text-muted) !important;
-        cursor: not-allowed;
-    }
-    .danger-button {
-        background-color: var(--color-danger) !important;
-        border-color: var(--color-danger) !important;
-        color: white !important;
-    }
-    .danger-button:hover {
-        background-color: var(--color-danger-hover) !important;
-        border-color: var(--color-danger-hover) !important;
-    }
-    .danger-button:disabled {
-        background-color: var(--text-muted) !important;
-        border-color: var(--text-muted) !important;
-        cursor: not-allowed;
-    }
 </style>
 {% endblock %}
 
@@ -44,7 +16,7 @@
 <div id="main-content-inner">
     <section>
         <div class="page-header">
-            <h1>Database Cleaning</h1>
+            <h1>AudioMuse-AI - Database Cleaning</h1>
             <p class="subtitle">Automatically scan and clean orphaned albums from the database that no longer exist on the media server.</p>
         </div>
     </section>
@@ -54,9 +26,23 @@
         <h2>Database Cleaning</h2>
         <p>Run a scan to identify and automatically remove albums that exist in the database but are no longer present on your media server.</p>
 
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1rem;">
+            <label for="clean-catalogue-toggle" class="label-with-tooltip">
+                Also delete orphans from the catalogue:
+                <span class="info-tooltip" tabindex="0">
+                    <span class="info-icon"></span>
+                    <span class="tooltip-text">When ON, tracks that are on NO music server (orphans) are DELETED from the centralized catalogue, along with their analysis - it is re-created for free if the files ever return. When OFF (default), cleaning only unbinds each server's stale mappings and leaves the catalogue untouched. Applies to this run only.</span>
+                </span>
+            </label>
+            <label class="toggle-switch">
+                <input type="checkbox" id="clean-catalogue-toggle" {% if cleaning_catalogue_default %}checked{% endif %}>
+                <span class="toggle-slider"></span>
+            </label>
+        </div>
+
         <div class="task-buttons">
-            <button id="start-clean-btn" class="active-button">Start Database Cleaning</button>
-            <button id="cancel-clean-btn" class="danger-button" style="display: none;" disabled>Cancel Cleaning</button>
+            <button id="start-clean-btn" class="btn btn-primary btn-block">Start Database Cleaning</button>
+            <button id="cancel-clean-btn" class="btn btn-danger btn-block" style="display: none;" disabled>Cancel Cleaning</button>
         </div>
 
         <!-- Task Status Display -->
@@ -71,6 +57,11 @@
                     <div id="progress-bar"></div>
                 </div>
                 <p><span class="status-label">Message:</span> <span id="status-message">N/A</span></p>
+                <div id="status-error-block" class="status-error-block status-failure" style="display:none;">
+                    <p><span class="status-label">Error Code:</span> <span id="status-error-code">N/A</span></p>
+                    <p><span class="status-label">Error Class:</span> <span id="status-error-class">N/A</span></p>
+                    <p><span class="status-label">Error Message:</span> <span id="status-error-message">N/A</span></p>
+                </div>
                 <div style="margin-top: 1rem;">
                     <h4>Details / Log:</h4>
                     <pre id="status-details"></pre>
@@ -194,6 +185,9 @@
                 document.getElementById('status-details').textContent = JSON.stringify(task.details, null, 2);
             }
             document.getElementById('status-message').textContent = statusMessage;
+            if (typeof renderTaskError === 'function') {
+                renderTaskError(task);
+            }
         }
 
         // Format running time
@@ -246,9 +240,11 @@
         // Start cleaning function
         async function startCleaning() {
             try {
+                const cleanCatalogue = document.getElementById('clean-catalogue-toggle').checked;
                 const response = await fetch("{{ url_for('analysis_bp.start_cleaning_endpoint') }}", {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' }
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ clean_catalogue: cleanCatalogue })
                 });
 
                 if (!response.ok) {
@@ -395,6 +391,9 @@
             if (data.details) {
                 document.getElementById('status-details').textContent = JSON.stringify(data.details, null, 2);
             }
+            if (typeof renderTaskError === 'function') {
+                renderTaskError(data);
+            }
         }
 
         // Handle cleaning completion
@@ -442,32 +441,51 @@
             // RESET UI BUTTONS immediately
             resetCleaningUI();
 
-            alert(`Cleaning failed: ${data.details?.error_message || 'Unknown error'}`);
+            const structured = (typeof formatErrorText === 'function') ? formatErrorText(data.details?.error) : '';
+            alert(`Cleaning failed: ${structured || data.details?.error_message || 'Unknown error'}`);
         }
 
         // Display cleaning results
         function displayCleaningResults(data) {
             const summaryDiv = document.getElementById('cleaning-summary');
 
-            if (data.deleted_count > 0) {
+            const chromaprintSplits = data.chromaprint_splits || 0;
+            if ((data.unbound_mappings || 0) > 0 || (data.orphaned_tracks_count || 0) > 0 || chromaprintSplits > 0) {
+                const orphans = data.orphaned_tracks_count || 0;
+                const deleted = data.deleted_count || 0;
+                let orphanMsg;
+                if (deleted > 0) {
+                    orphanMsg = `Cleanup finished. Deleted ${deleted} track(s) that were on no server; their analysis is re-created if the files return.`;
+                } else if (orphans > 0 && data.catalogue_deletion === false) {
+                    orphanMsg = `Cleanup finished. ${orphans} track(s) are on no server and were KEPT - catalogue cleaning is off for this run. Tick "Also delete orphans from the catalogue" to remove them.`;
+                } else if (orphans > 0) {
+                    orphanMsg = `Cleanup finished. ${orphans} track(s) are on no server but were NOT deleted this run (a server could not be read completely, or an implausibly large share looked orphaned); re-run when every server is reachable.`;
+                } else if (chromaprintSplits > 0 && (data.unbound_mappings || 0) === 0) {
+                    orphanMsg = `Cleanup finished. Thanks to Chromaprint, ${chromaprintSplits} false merge(s) were split into separate songs.`;
+                } else {
+                    orphanMsg = `Cleanup finished. ${data.unbound_mappings} stale server mapping(s) unbound.`;
+                }
+                const chromaprintLine = chromaprintSplits > 0
+                    ? `<p><strong>False merges split by Chromaprint:</strong> ${chromaprintSplits}</p>`
+                    : '';
                 summaryDiv.innerHTML = `
-                    <h3>✅ Database Cleaning Completed Successfully</h3>
-                    <p><strong>Total albums on media server:</strong> ${data.total_media_server_albums}</p>
-                    <p><strong>Total tracks on media server:</strong> ${data.total_media_server_tracks}</p>
-                    <p><strong>Total tracks in database (before cleaning):</strong> ${data.total_database_tracks}</p>
-                    <p><strong>Orphaned albums found:</strong> ${data.orphaned_albums_count}</p>
-                    <p><strong>Orphaned tracks deleted:</strong> ${data.deleted_count}</p>
-                    ${data.failed_deletions && data.failed_deletions.length > 0 ?
-                        `<p><strong>Failed deletions:</strong> ${data.failed_deletions.length}</p>` : ''}
-                    <p style="color: var(--color-success); font-weight: bold;">Database cleaned successfully! ${data.deleted_count} orphaned tracks removed.</p>
+                    <h3>✅ Library Cleanup Completed</h3>
+                    <p><strong>Total tracks on media server(s):</strong> ${data.total_media_server_tracks}</p>
+                    <p><strong>Unique tracks in the catalogue:</strong> ${data.total_database_tracks}</p>
+                    <p style="color: var(--text-muted); font-size: 0.9em;">The catalogue counts each song once. A song on more than one server, or duplicate files of the same song, is a single catalogue entry, so this is normally lower than the media-server total (which sums the files on every server).</p>
+                    <p><strong>Stale server mappings unbound:</strong> ${data.unbound_mappings}</p>
+                    <p><strong>Catalogue tracks on no server:</strong> ${orphans}</p>
+                    <p><strong>Orphaned tracks deleted:</strong> ${deleted}</p>
+                    ${chromaprintLine}
+                    <p style="color: var(--color-success); font-weight: bold;">${orphanMsg}</p>
                 `;
             } else {
                 summaryDiv.innerHTML = `
-                    <h3>✅ Database is Clean</h3>
-                    <p><strong>Total albums on media server:</strong> ${data.total_media_server_albums}</p>
-                    <p><strong>Total tracks on media server:</strong> ${data.total_media_server_tracks}</p>
-                    <p><strong>Total tracks in database:</strong> ${data.total_database_tracks}</p>
-                    <p style="color: var(--color-success); font-weight: bold;">No orphaned tracks found. Your database is already clean!</p>
+                    <h3>✅ Library is Clean</h3>
+                    <p><strong>Total tracks on media server(s):</strong> ${data.total_media_server_tracks}</p>
+                    <p><strong>Unique tracks in the catalogue:</strong> ${data.total_database_tracks}</p>
+                    <p style="color: var(--text-muted); font-size: 0.9em;">The catalogue counts each song once. A song on more than one server, or duplicate files of the same song, is a single catalogue entry, so this is normally lower than the media-server total (which sums the files on every server).</p>
+                    <p style="color: var(--color-success); font-weight: bold;">Every server mapping is current and every catalogue track is on at least one server.</p>
                 `;
             }
         }

@@ -1,33 +1,14 @@
 # Authentication
 
-Authentication is off by default; the server runs in legacy (open) mode when
-any of `AUDIOMUSE_USER`, `AUDIOMUSE_PASSWORD` or `API_TOKEN` are empty.
+From v1.0.0, only PostgreSQL, Redis, and `TZ` must still be configured via environment variables. All other configuration values are managed through the browser Setup Wizard and stored in the database. For compatibility with older installations, environment variables are imported into the database automatically on first startup. The Setup Wizard is the landing page on a clean installation and is also available later from the menu under Administration > Setup Wizard.
 
-To enable auth set all three environment variables (for example in a `.env`).
-If you deploy to Kubernetes, **do not place these values in a ConfigMap**; use a
-Secret resource so the credentials aren’t stored in plaintext imagery or git
-history:
+Authentication is enabled by default since v0.9.6 through the `AUTH_ENABLED` parameter. It uses the mandatory `AUDIOMUSE_USER` and `AUDIOMUSE_PASSWORD`, plus the optional `API_TOKEN` and `JWT_SECRET`.
 
-```yaml
-AUDIOMUSE_USER=alice
-AUDIOMUSE_PASSWORD=secret123
-API_TOKEN=foo-bar-baz
-JWT_SECRET=<random-string>
-```
+The `API_TOKEN` is only needed by external plugins. Set `JWT_SECRET` if you want sessions to survive a container restart; without it a new secret is generated at every start and everybody has to log in again.
 
-```
-AUDIOMUSE_USER=alice
-AUDIOMUSE_PASSWORD=secret123
-API_TOKEN=foo-bar-baz
-JWT_SECRET=<random-string>
-```
+The web UI provides a `/login` page where the user posts the username/password and receives a JWT cookie on success.  Subsequent browser requests are authenticated via that cookie.
 
-The web UI provides a `/login` page where the user posts the username/password
-and receives a JWT cookie on success.  Subsequent browser requests are
-authenticated via that cookie.
-
-Machine‑to‑machine callers may bypass the login page by supplying the
-`API_TOKEN` in an `Authorization: Bearer …` header.  For example:
+Machine-to-machine callers may skip the login page by sending the `API_TOKEN` in an `Authorization: Bearer ...` header. For example:
 
 ```bash
 curl -v \
@@ -37,9 +18,54 @@ curl -v \
   -d '{}'
 ```
 
+## Session validation and revocation
+
+Every request authenticated with the JWT cookie is also validated against the `audiomuse_users` table:
+
+- The user in the token must still exist; deleting a user immediately terminates their active sessions.
+- Changing a user's password immediately invalidates every session token issued before the change (the token's issue time is compared with the `password_changed_at` column). When you change your own password, the response sets a fresh cookie so your current session keeps working; other devices are logged out.
+- The role stored in the database wins over the role claim inside the token, so a stale token can never keep more privileges than the account currently has.
+
+## Confirming sensitive operations
+
+Creating a user, changing any password (your own, or - as an admin - another user's), and deleting a user require the acting user to re-enter their own password. The Users page asks for it in a dedicated confirmation field; API callers send it as `current_password` in the JSON body of `POST /api/users`, `PUT /api/users/<id>/password` and `DELETE /api/users/<id>`.
+
+Bearer-token (`API_TOKEN`) callers are exempt from `current_password`: the token itself is the credential and it is not tied to an account password.
+
+# Password reset
+
+If you have lost access to all admin accounts, reset admin access by deleting both the legacy admin config entries and the admin rows in `audiomuse_users`.
+
+From an ubuntu cli you can install the postgresql client if you don't already have it:
+```
+sudo apt update && sudo apt install -y postgresql-client
+```
+
+Then replace these parameters:
+- `PGPASSWORD=audiomusepassword`: database password
+- `-U audiomuse`: database user
+- `-d audiomusedb`: database name
+- `-h 192.168.3.213`: database host
+- `-p 5432`: database port
+
+Run:
+```
+PGPASSWORD=audiomusepassword psql -h 192.168.3.213 -p 5432 -U audiomuse -d audiomusedb \
+  -c "DELETE FROM app_config WHERE key IN ('AUDIOMUSE_USER','AUDIOMUSE_PASSWORD'); DELETE FROM audiomuse_users WHERE role = 'admin';"
+```
+If everything is configured correctly you should see something like:
+```
+DELETE 2
+DELETE 1
+```
+
+Then restart the Flask and worker containers. On next access you'll be able to set a new admin user and password.
+
+If another admin still has access, do not use this procedure; the other admin can delete and recreate the admin account from the web UI.
+
 ## HTTPS
 
-To have a more secure Authentication running everything over HTTPS is needed to avoid that your password go in plain text. This part is something that relay from your infrastracture and not from AudioMuse-AI itself. For example if you're deploy everything on K3S thatr come with Traefik integrated, and you have certmanager with let's encrypt, you can add an IngressRoute like this:
+To have a more secure Authentication running everything over HTTPS is needed to avoid that your password go in plain text. This part is something that relay from your infrastructure and not from AudioMuse-AI itself. For example if you're deploy everything on K3S thatr come with Traefik integrated, and you have certmanager with let's encrypt, you can add an IngressRoute like this:
 
 ```
 apiVersion: traefik.io/v1alpha1
@@ -60,10 +86,10 @@ spec:
     certResolver: letsencrypt-production
 ```
 
-## Plugin 
+## Media server plugins
 
-Before enabling the authentication be sure that the plugin that use AudioMuse-AI support it.
+The media server plugins authenticate with the `API_TOKEN`, so make sure the plugin and AudioMuse-AI are set to the same value.
 
-> Actually Jellyfin plugin `v0.1.51` (for Jellyfin 10.10.7) and `v0.1.52` (for jellyfin 10.11) already added this support
-> 
-> Navidrome plugin is still work in progress.
+> The Navidrome plugin supports it from release v7. See [NAVIDROME](NAVIDROME.md) for the full setup.
+>
+> The Jellyfin plugin supports it from `v0.1.51` (for Jellyfin 10.10.7) and `v0.1.52` (for Jellyfin 10.11).

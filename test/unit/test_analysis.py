@@ -1,0 +1,2381 @@
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""Unit tests for the tasks.analysis audio-analysis internals.
+
+Covers the ONNX helper functions and the analyze_track pipeline with mocked
+models and audio loading, plus the media-server reachability probe.
+
+Main Features:
+* ONNX output-name resolution, run_inference, and numerically stable sigmoid.
+* Robust audio load with fallback and analyze_track key/tempo/energy output.
+* OOM-to-CPU inference fallback and media-server auth/unreachable detection.
+* Chromaprint fail-soft: a failed fingerprint keeps the track's analysis alive
+  under its provider id and records the empty-string retry-stop sentinel.
+* run_analysis_task scope handling: empty enabled-server list skips instead of
+  falling back to the config default server.
+* Chromaprint backfill liveness: the per-track loop writes throttled progress so
+  the task row never looks hung, and it honours revocation mid-loop instead of
+  fingerprinting thousands of tracks after a Cancel.
+"""
+
+import numpy as np
+import pytest
+from unittest.mock import Mock, patch
+from tasks.analysis import (
+    sigmoid,
+    robust_load_audio_with_fallback,
+    analyze_track,
+)
+from tasks.analysis.song import run_inference, _find_onnx_name
+
+
+def test_union_analysis_runs_each_server_once_with_no_sweeps(monkeypatch):
+    import tasks.analysis.main as analysis
+    import tasks.multiserver_sync as sync
+
+    servers = [
+        {'server_id': 'a', 'name': 'A', 'is_default': True},
+        {'server_id': 'b', 'name': 'B', 'is_default': False},
+        {'server_id': 'c', 'name': 'C', 'is_default': False},
+    ]
+    events = []
+    monkeypatch.setattr(analysis, '_enabled_analysis_servers', lambda scope: servers)
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+    monkeypatch.setattr(analysis, 'get_task_info_from_db', lambda task_id: None)
+    monkeypatch.setattr(
+        analysis, 'get_task_statuses', lambda ids: {i: 'STARTED' for i in ids}
+    )
+    monkeypatch.setattr(analysis, 'save_task_status', lambda *args, **kwargs: None)
+    monkeypatch.setattr(analysis, '_run_all_index_builds', lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        analysis,
+        'run_analysis_server_task',
+        lambda *args, server_id=None, **kwargs: events.append(('analyze', server_id))
+        or {'status': 'SUCCESS'},
+    )
+
+    def forbidden_sweep(*args, **kwargs):
+        raise AssertionError('analysis must never run an alignment sweep')
+
+    monkeypatch.setattr(sync, 'sweep_all_secondary_servers', forbidden_sweep)
+
+    result = analysis.run_analysis_task(0, 5)
+
+    assert result['status'] == 'SUCCESS'
+    assert events == [
+        ('analyze', 'a'),
+        ('analyze', 'b'),
+        ('analyze', 'c'),
+    ]
+
+
+def _union_harness(monkeypatch, phase_results):
+    """Drive run_analysis_task over len(phase_results) servers, returning (result, saved)."""
+    import tasks.analysis.main as analysis
+
+    servers = [
+        {'server_id': f's{i}', 'name': name, 'is_default': i == 0}
+        for i, (name, _) in enumerate(phase_results)
+    ]
+    saved = []
+    monkeypatch.setattr(analysis, '_enabled_analysis_servers', lambda scope: servers)
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+    monkeypatch.setattr(analysis, 'get_task_info_from_db', lambda task_id: None)
+    monkeypatch.setattr(
+        analysis, 'get_task_statuses', lambda ids: {i: 'STARTED' for i in ids}
+    )
+    monkeypatch.setattr(analysis, '_run_all_index_builds', lambda *a, **k: None)
+    monkeypatch.setattr(
+        analysis, '_albums_per_server', lambda servers, n: [[] for _ in servers]
+    )
+    monkeypatch.setattr(
+        analysis,
+        'save_task_status',
+        lambda task_id, task_type, status, **kwargs: saved.append(
+            (status, kwargs.get('details') or {})
+        ),
+    )
+    by_id = {f's{i}': status for i, (_, status) in enumerate(phase_results)}
+    monkeypatch.setattr(
+        analysis,
+        'run_analysis_server_task',
+        lambda *a, server_id=None, **k: {'status': by_id[server_id]},
+    )
+    return analysis.run_analysis_task(0, 5), saved
+
+
+def test_union_analysis_succeeds_when_only_some_servers_fail(monkeypatch):
+    result, saved = _union_harness(
+        monkeypatch, [('Jellyfin', 'FAILURE'), ('Plex', 'SUCCESS')]
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert result['failed_servers'] == ['Jellyfin']
+    status, details = saved[-1]
+    assert status == 'SUCCESS'
+    assert 'error' not in details
+    assert 'Jellyfin' in details['message']
+
+
+def test_union_analysis_fails_only_when_every_server_fails(monkeypatch):
+    from error.error_dictionary import ERR_ANALYSIS_SERVER_FAILED
+
+    result, saved = _union_harness(
+        monkeypatch, [('Jellyfin', 'FAILURE'), ('Plex', 'FAILURE')]
+    )
+
+    assert result['status'] == 'FAILURE'
+    status, details = saved[-1]
+    assert status == 'FAILURE'
+    assert details['error']['error_code'] == ERR_ANALYSIS_SERVER_FAILED
+    assert details['error']['error_code'] != 9999
+
+
+def test_union_analysis_treats_a_wiped_parent_row_as_revoked(monkeypatch):
+    """Cancel WIPES task_status, so a missing parent row IS the cancellation
+    signal. Reading it as 'carry on' let a cancelled union run keep launching
+    whole server phases onto the queue the cancel had just emptied."""
+    import tasks.analysis.main as analysis
+
+    servers = [
+        {'server_id': 's0', 'name': 'A', 'is_default': True},
+        {'server_id': 's1', 'name': 'B', 'is_default': False},
+    ]
+    monkeypatch.setattr(analysis, '_enabled_analysis_servers', lambda scope: servers)
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+    monkeypatch.setattr(analysis, 'get_task_statuses', lambda ids: {})
+    monkeypatch.setattr(
+        analysis, '_albums_per_server', lambda servers, n: [[] for _ in servers]
+    )
+    ran = []
+    monkeypatch.setattr(
+        analysis,
+        'run_analysis_server_task',
+        lambda *a, server_id=None, **k: ran.append(server_id) or {'status': 'SUCCESS'},
+    )
+
+    result = analysis.run_analysis_task(0, 5)
+
+    assert result['status'] == 'REVOKED'
+    assert ran == [], "no phase may run after the cancel wiped the row"
+
+
+def test_union_analysis_stops_when_a_phase_is_revoked(monkeypatch):
+    result, _ = _union_harness(monkeypatch, [('Jellyfin', 'REVOKED'), ('Plex', 'SUCCESS')])
+
+    assert result['status'] == 'REVOKED'
+    assert result['servers_completed'] == 1
+
+
+def test_run_analysis_task_skips_when_no_enabled_server_matches_scope(monkeypatch):
+    import tasks.analysis.main as analysis
+
+    monkeypatch.setattr(analysis, '_enabled_analysis_servers', lambda scope: [])
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+    statuses = []
+    monkeypatch.setattr(
+        analysis,
+        'save_task_status',
+        lambda task_id, task_type, status, **kwargs: statuses.append(status),
+    )
+    server_runs = []
+    monkeypatch.setattr(
+        analysis,
+        'run_analysis_server_task',
+        lambda *args, **kwargs: server_runs.append((args, kwargs)),
+    )
+
+    result = analysis.run_analysis_task(0, 5, server_scope='default')
+
+    assert result['status'] == 'SKIPPED'
+    assert 'default' in result['message']
+    assert not server_runs
+    assert statuses == ['SUCCESS']
+
+
+def test_enabled_analysis_servers_registry_failure_keeps_config_default(monkeypatch):
+    import importlib
+    import tasks.analysis.main as analysis
+
+    registry = importlib.import_module('tasks.mediaserver.registry')
+
+    def broken_scope(scope):
+        raise RuntimeError('registry down')
+
+    monkeypatch.setattr(registry, 'servers_for_scope', broken_scope)
+
+    assert analysis._enabled_analysis_servers('all') == [None]
+
+
+def test_enabled_analysis_servers_lost_connection_fails_the_batch_not_shrinks_it(monkeypatch):
+    import importlib
+    import pytest
+    import tasks.analysis.main as analysis
+    from psycopg2 import OperationalError
+
+    registry = importlib.import_module('tasks.mediaserver.registry')
+
+    def dropped(scope):
+        raise OperationalError('connection lost')
+
+    monkeypatch.setattr(registry, 'servers_for_scope', dropped)
+
+    with pytest.raises(OperationalError):
+        analysis._enabled_analysis_servers('all')
+
+
+_FAKE_EMBEDDING = np.sin(np.arange(1, 201, dtype=np.float32))
+
+
+def _run_album_impl(monkeypatch, tmp_path, item, known_index, persisted_ids, map_upserts,
+                    analyzed_embedding=None, existing_ids_fn=None, persist_calls=None,
+                    tracks=None, job=None, clap_broken=False, lyrics_enabled=False,
+                    download_fn=None):
+    import importlib
+    import tasks.analysis.album as analysis
+    import tasks.analysis.helper as helper
+    import tasks.analysis.song as song
+    import tasks.clap_analyzer as clap
+
+    registry = importlib.import_module('tasks.mediaserver.registry')
+    album_tracks = tracks if tracks is not None else [item]
+
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: job)
+    monkeypatch.setattr(analysis, 'save_task_status', lambda *args, **kwargs: None)
+    monkeypatch.setattr(helper, 'save_task_status', lambda *args, **kwargs: None)
+    monkeypatch.setattr(analysis, 'get_tracks_from_album', lambda album_id: album_tracks)
+    monkeypatch.setattr(
+        analysis, 'download_track',
+        download_fn or (lambda temp_dir, track: str(tmp_path / 'gone.flac')),
+    )
+    monkeypatch.setattr(song, 'load_musicnn_sessions', lambda model_paths: {})
+    monkeypatch.setattr(analysis, 'cleanup_musicnn_sessions', lambda *args, **kwargs: None)
+    monkeypatch.setattr(analysis, 'cleanup_optional_models', lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        analysis, 'comprehensive_memory_cleanup', lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(analysis, 'cleanup_cuda_memory', lambda *args, **kwargs: None)
+    fake_embedding = (
+        _FAKE_EMBEDDING if analyzed_embedding is None else analyzed_embedding
+    )
+    monkeypatch.setattr(
+        analysis,
+        'analyze_track',
+        lambda *args, **kwargs: (
+            {
+                'tempo': 120.0,
+                'energy': 0.5,
+                'key': 'C',
+                'scale': 'major',
+                'moods': {'happy': 0.9},
+                'duration_seconds': 200.0,
+            },
+            fake_embedding,
+        ),
+    )
+    monkeypatch.setattr(helper, '_fetch_row_duration', lambda item_id: 200.0)
+
+    monkeypatch.setattr(analysis, 'LYRICS_ENABLED', lyrics_enabled)
+    monkeypatch.setattr(clap, 'is_clap_available', lambda: True if clap_broken else False)
+    if clap_broken:
+        monkeypatch.setattr(helper, 'run_clap_for_track', lambda *a, **k: None)
+        monkeypatch.setattr(
+            clap, 'get_or_cache_other_feature_text_embeddings', lambda conn: None
+        )
+    monkeypatch.setattr(registry, 'get_default_server_id', lambda conn=None: 'srv-def')
+    monkeypatch.setattr(
+        registry,
+        'upsert_track_maps',
+        lambda server_id, mapping, conn=None: map_upserts.append((server_id, mapping)),
+    )
+
+    monkeypatch.setattr(
+        helper,
+        'attach_catalog_item_ids',
+        lambda tracks, server_id=None, conn=None: tracks,
+    )
+    # Mirrors the real thing: "which of these ids already have a score row". That is
+    # the catalogue this run started with, plus whatever it has persisted so far - so
+    # a JUST-MINTED id is absent, which is exactly what lets the mint path tell a
+    # genuinely new track from one another worker already wrote under the same id.
+    seeded_catalogue = set(getattr(known_index, '_taken', set()))
+
+    def _default_existing_ids(ids):
+        have = seeded_catalogue | set(persisted_ids)
+        return {i for i in ids if i in have}
+
+    monkeypatch.setattr(
+        helper, 'get_existing_track_ids', existing_ids_fn or _default_existing_ids
+    )
+    monkeypatch.setattr(
+        helper,
+        'get_missing_ids_in_table',
+        lambda table, ids: (
+            set(ids)
+            if (clap_broken and table == 'clap_embedding')
+            or (lyrics_enabled and table == 'lyrics_embedding')
+            else set()
+        ),
+    )
+    monkeypatch.setattr(helper, 'load_fingerprint_index', lambda: known_index)
+    monkeypatch.setattr(
+        helper, 'upsert_artist_mappings_for_tracks', lambda tracks, album_name=None: None
+    )
+    monkeypatch.setattr(helper, 'run_song_analyzed_hook', lambda *args, **kwargs: None)
+
+    def fake_persist(track, *args, **kwargs):
+        persisted_ids.append(helper.catalog_item_id(track))
+        if persist_calls is not None:
+            persist_calls.append(kwargs)
+
+    monkeypatch.setattr(helper, 'persist_musicnn_results', fake_persist)
+    monkeypatch.setattr(
+        helper, 'persist_clap_embedding', lambda *args, **kwargs: False
+    )
+
+    return analysis._analyze_album_task_impl('album1', 'Album One', 5, 'parent1')
+
+
+def test_new_track_persists_under_signature_id_and_maps_it(monkeypatch, tmp_path):
+    from tasks import simhash
+
+    item = {'Id': 'prov1', 'Name': 'Song', 'AlbumArtist': 'Artist'}
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch, tmp_path, item, simhash.CatalogResolver(), persisted_ids, map_upserts
+    )
+
+    expected_id = simhash.canonical_id_str(simhash.embedding_signature(_FAKE_EMBEDDING))
+    assert result['status'] == 'SUCCESS'
+    assert result['tracks_analyzed'] == 1
+    assert persisted_ids == [expected_id]
+    assert item['_catalog_item_id'] == expected_id
+    assert map_upserts == [('srv-def', {'prov1': (expected_id, 'fingerprint', None)})]
+
+
+def test_missing_source_file_is_skipped_and_album_still_succeeds(monkeypatch, tmp_path):
+    from tasks import simhash
+
+    ok = {'Id': 'prov_ok', 'Name': 'Present', 'AlbumArtist': 'Artist'}
+    gone = {'Id': 'prov_gone', 'Name': 'Deleted', 'AlbumArtist': 'Artist'}
+
+    def _download(temp_dir, track):
+        return None if track['Id'] == 'prov_gone' else str(tmp_path / 'present.flac')
+
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch, tmp_path, ok, simhash.CatalogResolver(), persisted_ids, map_upserts,
+        tracks=[ok, gone], download_fn=_download,
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert result['tracks_analyzed'] == 1
+    assert result['tracks_unavailable'] == 1
+
+
+def test_album_fails_when_every_track_source_is_unavailable(monkeypatch, tmp_path):
+    import pytest
+    from tasks import simhash
+
+    gone = {'Id': 'prov_gone', 'Name': 'Deleted', 'AlbumArtist': 'Artist'}
+    persisted_ids, map_upserts = [], []
+    with pytest.raises(RuntimeError):
+        _run_album_impl(
+            monkeypatch, tmp_path, gone, simhash.CatalogResolver(), persisted_ids,
+            map_upserts, tracks=[gone], download_fn=lambda temp_dir, track: None,
+        )
+
+
+def test_same_audio_skips_persist_and_just_maps_the_server(monkeypatch, tmp_path):
+    from tasks import simhash
+
+    known_id = simhash.canonical_id_str(simhash.embedding_signature(_FAKE_EMBEDDING))
+    catalog = simhash.CatalogResolver()
+    catalog.register(known_id, embedding=_FAKE_EMBEDDING, duration=201.0)
+
+    item = {'Id': 'prov1', 'Name': 'Song', 'AlbumArtist': 'Artist'}
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch, tmp_path, item, catalog, persisted_ids, map_upserts
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert result['tracks_analyzed'] == 1
+    assert persisted_ids == []
+    assert map_upserts == [('srv-def', {'prov1': (known_id, 'fingerprint', None)})]
+
+
+def test_same_audio_with_different_duration_gets_its_own_id(monkeypatch, tmp_path):
+    from tasks import simhash
+
+    known_id = simhash.canonical_id_str(simhash.embedding_signature(_FAKE_EMBEDDING))
+    catalog = simhash.CatalogResolver()
+    catalog.register(known_id, embedding=_FAKE_EMBEDDING, duration=300.0)
+
+    item = {'Id': 'prov1', 'Name': 'Song', 'AlbumArtist': 'Artist'}
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch, tmp_path, item, catalog, persisted_ids, map_upserts
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert len(persisted_ids) == 1
+    assert persisted_ids[0] != known_id
+    assert persisted_ids[0].startswith(simhash.CURRENT_ID_HEAD)
+
+
+def test_same_audio_with_unknown_catalogue_duration_gets_its_own_id(
+    monkeypatch, tmp_path
+):
+    from tasks import simhash
+
+    known_id = simhash.canonical_id_str(simhash.embedding_signature(_FAKE_EMBEDDING))
+    catalog = simhash.CatalogResolver()
+    catalog.register(known_id, embedding=_FAKE_EMBEDDING)
+
+    item = {'Id': 'prov1', 'Name': 'Song', 'AlbumArtist': 'Artist'}
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch, tmp_path, item, catalog, persisted_ids, map_upserts
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert len(persisted_ids) == 1
+    assert persisted_ids[0] != known_id
+    assert persisted_ids[0].startswith(simhash.CURRENT_ID_HEAD)
+
+
+def test_same_signature_different_audio_gets_its_own_id(monkeypatch, tmp_path):
+    from tasks import simhash
+
+    half = simhash.SIGNATURE_BITS // 2
+    first = np.concatenate([np.full(half, 1.0), np.full(half, -1.0)]).astype(np.float32)
+    second = first.copy()
+    second[0:half:2] = 2.0
+    second[1:half:2] = 0.1
+    second[half::2] = -2.0
+    second[half + 1::2] = -0.1
+    assert simhash.embedding_signature(first) == simhash.embedding_signature(second)
+    assert simhash.cosine_distance(first, second) > 0.01
+
+    taken_id = simhash.canonical_id_str(simhash.embedding_signature(first))
+    catalog = simhash.CatalogResolver()
+    catalog.register(taken_id, embedding=first)
+
+    item = {'Id': 'prov1', 'Name': 'Song', 'AlbumArtist': 'Artist'}
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch, tmp_path, item, catalog, persisted_ids, map_upserts,
+        analyzed_embedding=second,
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert len(persisted_ids) == 1
+    assert persisted_ids[0] != taken_id
+    assert persisted_ids[0].startswith(simhash.CURRENT_ID_HEAD)
+    assert map_upserts == [('srv-def', {'prov1': (persisted_ids[0], 'fingerprint', None)})]
+
+
+def test_degenerate_embedding_is_still_mapped_so_it_is_not_re_analyzed_forever(
+    monkeypatch, tmp_path
+):
+    """A constant/non-finite embedding has no signature, so resolve() returns no
+    canonical id. The track must STILL get a track_server_map row: without one
+    nothing records it as done for this server and every later run re-downloads
+    and re-runs MusiCNN on it, forever.
+
+    And it must NOT be catalogued under its raw provider id. A non-`fp_` id is what
+    the availability rule calls a pre-migration row and silently grants to the
+    DEFAULT server, so a SECONDARY's provider id would be counted as present on the
+    default in clustering, search, sync and the dashboard alike. It gets a
+    server-scoped `fp_0` id instead: deterministic, so the same file resolves to it
+    on every run and is skipped."""
+    from tasks import simhash
+
+    item = {'Id': 'prov-degenerate', 'Name': 'Song', 'AlbumArtist': 'Artist'}
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch,
+        tmp_path,
+        item,
+        simhash.CatalogResolver(),
+        persisted_ids,
+        map_upserts,
+        analyzed_embedding=np.zeros(simhash.SIGNATURE_BITS, dtype=np.float32),
+        existing_ids_fn=lambda ids: {i for i in ids if i in persisted_ids},
+    )
+
+    expected_id = simhash.unsignable_canonical_id('srv-def', 'prov-degenerate')
+    assert result['status'] == 'SUCCESS'
+    assert expected_id.startswith('fp_0'), "never a raw provider id in the catalogue"
+    assert not simhash.signature_from_canonical_id(expected_id), (
+        "and never mistakable for a signature id"
+    )
+    assert persisted_ids == [expected_id]
+    assert map_upserts == [
+        ('srv-def', {'prov-degenerate': (expected_id, 'analysis', None)})
+    ]
+    assert simhash.unsignable_canonical_id('srv-def', 'prov-degenerate') == expected_id, (
+        "deterministic, or the track is re-analyzed on every run"
+    )
+    assert simhash.unsignable_canonical_id('srv-b', 'prov-degenerate') != expected_id, (
+        "server-scoped, or two servers' provider ids collide in one namespace"
+    )
+
+
+def test_two_duplicate_files_on_one_server_both_get_a_map_row(monkeypatch, tmp_path):
+    """Two files of the SAME audio on one server share one canonical id. Both
+    provider ids must be mapped: the map is keyed by provider id, so the second
+    copy cannot evict the first. Before the N:1 fix only one row survived and the
+    duplicate was re-downloaded and re-analyzed on every run (the flip-flop)."""
+    from tasks import simhash
+
+    expected_id = simhash.canonical_id_str(simhash.embedding_signature(_FAKE_EMBEDDING))
+    track_a = {'Id': 'provA', 'Name': 'Song', 'AlbumArtist': 'Artist'}
+    track_b = {'Id': 'provB', 'Name': 'Song (copy)', 'AlbumArtist': 'Artist'}
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch, tmp_path, track_a, simhash.CatalogResolver(),
+        persisted_ids, map_upserts, tracks=[track_a, track_b],
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert result['tracks_analyzed'] == 2
+    # The audio is persisted once (first track mints the canonical row); the
+    # second is recognised as a duplicate and only mapped.
+    assert persisted_ids == [expected_id]
+
+    # Mappings are flushed per TRACK, not batched to the end of the album: a Stop
+    # or a killed worker mid-album must not strand an already-committed track with
+    # no map row, or the next run re-downloads and re-analyzes it forever.
+    assert len(map_upserts) == 2
+    assert {sid for sid, _ in map_upserts} == {'srv-def'}
+    merged = {}
+    for _sid, mapping in map_upserts:
+        merged.update(mapping)
+    assert merged == {
+        'provA': (expected_id, 'fingerprint', None),
+        'provB': (expected_id, 'fingerprint', None),
+    }
+
+
+def test_a_signature_collision_is_refuted_against_the_catalogue_not_the_cache(
+    monkeypatch,
+):
+    """The concurrent-mint guard must compare against the CATALOGUE's embedding.
+
+    resolve() registers a freshly minted id with the CALLER'S OWN embedding before
+    returning it, and the resolver's lookup is cache-first. So asking the resolver
+    to confirm the candidate compared the track against ITSELF - cosine(x, x) == 0 -
+    and the refute branch could NEVER run: every real signature collision silently
+    ADOPTED the other recording's row, discarding this track's analysis and mapping
+    its file onto a different song.
+    """
+    import tasks.analysis.helper as helper
+    from tasks import simhash
+
+    mine = _FAKE_EMBEDDING
+    theirs = np.cos(np.arange(1, 201, dtype=np.float32))
+    assert simhash.cosine_distance(mine, theirs) > 0.01, "must be different audio"
+
+    minted = simhash.canonical_id_str(simhash.embedding_signature(mine))
+    resolver = simhash.CatalogResolver()
+    # Exactly what resolve() does on the mint path: the id is cached against OUR
+    # embedding. This is the poison that made the old guard a no-op.
+    resolver.register(minted, embedding=mine)
+
+    # The DB already holds that id, and it belongs to a DIFFERENT recording.
+    monkeypatch.setattr(
+        helper, 'get_existing_track_ids', lambda ids: {i for i in ids if i == minted}
+    )
+    monkeypatch.setattr(
+        helper, 'catalogue_embedding', lambda item_id: theirs if item_id == minted else None
+    )
+
+    kind, settled = helper.claim_new_canonical_id(resolver, minted, mine)
+
+    assert kind == 'new', "a collision with DIFFERENT audio must never be adopted"
+    assert settled != minted, "it must step to the next free id, not clobber the row"
+    cached = resolver._embedding_for(minted)
+    assert simhash.cosine_distance(theirs, cached) <= 0.01, (
+        "the refused id must now cache the CATALOGUE's embedding, or the next "
+        "copy of this audio resolves straight back onto the row we just refused"
+    )
+
+
+def test_a_failing_stage_never_blocks_a_later_one(monkeypatch, tmp_path):
+    """One model failing must not stop the models that come after it.
+
+    The stages run MusiCNN -> CLAP -> lyrics, and each is independently tracked by
+    its own work bit, so a failure in one must cost only that one. Raising inside
+    the CLAP stage meant that a track whose MusiCNN was ALREADY done (so nothing
+    had been produced yet this pass) and whose CLAP failed never reached the lyrics
+    stage at all - so as long as CLAP kept failing, its lyrics were never analyzed.
+    """
+    import tasks.analysis.helper as helper
+    from tasks import simhash
+
+    item = {'Id': 'prov1', 'Name': 'Song', 'AlbumArtist': 'Artist'}
+    lyrics_ran = []
+    monkeypatch.setattr(
+        helper,
+        'run_lyrics_for_track',
+        lambda *a, **k: lyrics_ran.append(True) or True,
+    )
+
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch, tmp_path, item, simhash.CatalogResolver(),
+        persisted_ids, map_upserts, clap_broken=True, lyrics_enabled=True,
+        # MusiCNN is ALREADY done for this track, so the CLAP stage is the first
+        # thing that could produce anything this pass - and it fails.
+        existing_ids_fn=lambda ids: set(ids),
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert lyrics_ran, "a CLAP failure must not stop lyrics from being analyzed"
+    assert result['tracks_not_analyzable'] == 0
+
+
+def test_a_clap_failure_never_throws_away_a_completed_musicnn_analysis(
+    monkeypatch, tmp_path
+):
+    """CLAP failing must NOT discard the audio analysis that already succeeded.
+
+    The CLAP check runs BEFORE the score row is persisted, so raising there threw
+    away a completed MusiCNN pass AND its pending map row. The track then had no
+    score row and no map row, so the next run re-downloaded it and re-ran MusiCNN
+    on it - and the album still reported SUCCESS, so nothing ever said so.
+
+    `run_clap_for_track` swallows EVERY exception and returns None, so one corrupt
+    CLAP model did this to every new track in the library, forever, in silence.
+    """
+    from tasks import simhash
+
+    item = {'Id': 'prov1', 'Name': 'Song', 'AlbumArtist': 'Artist'}
+    persisted_ids, map_upserts = [], []
+    result = _run_album_impl(
+        monkeypatch, tmp_path, item, simhash.CatalogResolver(),
+        persisted_ids, map_upserts, clap_broken=True,
+    )
+
+    expected_id = simhash.canonical_id_str(simhash.embedding_signature(_FAKE_EMBEDDING))
+    assert result['status'] == 'SUCCESS'
+    assert persisted_ids == [expected_id], (
+        "the MusiCNN analysis must be persisted even though CLAP produced nothing"
+    )
+    assert map_upserts == [('srv-def', {'prov1': (expected_id, 'fingerprint', None)})], (
+        "and the map row must be written, or the track is re-analyzed forever"
+    )
+    assert result['tracks_not_analyzable'] == 0, (
+        "a CLAP miss on an otherwise-analyzed track is not an unanalyzable track"
+    )
+
+
+def test_every_server_records_its_own_path_on_its_own_map_row(monkeypatch, tmp_path):
+    """A path is a property of a FILE ON A SERVER, not of the shared song row.
+
+    A SECONDARY server must record the path IT sees, exactly as the default does.
+    The old rule (only the default may write a path) left the sweep matcher's two
+    strongest tiers with no evidence at all for any track the default happens not
+    to have, so onboarding an 11th server could only match those by metadata.
+    """
+    from tasks import simhash
+    from tasks.mediaserver import context as ms_context
+
+    item = {
+        'Id': 'prov1', 'Name': 'Song', 'AlbumArtist': 'Artist',
+        'FilePath': '/music/song.flac',
+    }
+
+    default_maps = []
+    _run_album_impl(
+        monkeypatch, tmp_path, dict(item), simhash.CatalogResolver(), [], default_maps,
+    )
+    assert default_maps[0][1]['prov1'][2] == '/music/song.flac'
+
+    secondary_item = dict(item, FilePath='/plex-media/song.flac')
+    secondary_maps = []
+    with ms_context.use_server({'server_id': 'srv-b', 'server_type': 'plex'}):
+        _run_album_impl(
+            monkeypatch, tmp_path, secondary_item, simhash.CatalogResolver(),
+            [], secondary_maps,
+        )
+    assert secondary_maps[0][0] == 'srv-b'
+    assert secondary_maps[0][1]['prov1'][2] == '/plex-media/song.flac'
+
+
+def test_persist_musicnn_results_never_writes_a_path_to_the_shared_row(monkeypatch):
+    """The shared score row carries no path at all any more; it rides the map row."""
+    import tasks.analysis.helper as helper
+    import tasks.analysis.song as song
+
+    saved = {}
+    monkeypatch.setattr(
+        song,
+        'save_track_analysis_and_embedding',
+        lambda *args, **kwargs: saved.update(kwargs),
+    )
+    item = {
+        'Id': 'p1', 'Name': 'Song', 'AlbumArtist': 'Artist',
+        'FilePath': '/music/song.flac', '_catalog_item_id': 'fp_2abc',
+    }
+    analysis = {'tempo': 120.0, 'energy': 0.5, 'key': 'C', 'scale': 'major'}
+
+    helper.persist_musicnn_results(item, analysis, {}, b'', '')
+    assert 'file_path' not in saved
+
+
+def test_revocation_is_checked_once_per_album_not_once_per_track(monkeypatch, tmp_path):
+    """The per-track loop used to run TWO get_task_info_from_db queries plus a
+    status write for every track, including skipped ones."""
+    from unittest.mock import MagicMock
+    from tasks import simhash
+    import tasks.analysis.album as analysis
+
+    tracks = [
+        {'Id': f'prov{i}', 'Name': f'Song {i}', 'AlbumArtist': 'Artist'}
+        for i in range(4)
+    ]
+    job = MagicMock()
+    job.id = 'job-1'
+    job.meta = {}
+
+    status_calls = []
+    # A row that EXISTS and is live. An empty answer would mean the cancel wiped
+    # task_status, which the run correctly reads as revoked.
+    monkeypatch.setattr(
+        analysis,
+        'get_task_statuses',
+        lambda ids: status_calls.append(list(ids)) or {i: 'STARTED' for i in ids if i},
+    )
+    # Widen the throttle window so the single-check invariant is decided by the
+    # per-album logic, not by wall-clock: on a slow runner the first track's model
+    # load can outlast the real 10s interval and fire a legitimate second check.
+    monkeypatch.setattr(analysis, 'ANALYSIS_MONITOR_DB_INTERVAL', 10_000_000)
+
+    def forbidden(task_id):
+        raise AssertionError('the per-track loop must not query task info per track')
+
+    monkeypatch.setattr(analysis, 'get_task_info_from_db', forbidden, raising=False)
+
+    result = _run_album_impl(
+        monkeypatch, tmp_path, tracks[0], simhash.CatalogResolver(), [], [],
+        tracks=tracks, job=job,
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert len(status_calls) == 1
+    assert status_calls[0] == ['job-1', 'parent1']
+
+
+def _run_parent_phase(monkeypatch, albums, tracks_by_album, work_map,
+                      terminal_children=None, status_calls=None,
+                      expired_but_db_terminal=False, child_rows=None,
+                      extra_jobs=None):
+    import importlib
+    import tasks.analysis.main as analysis
+    import tasks.analysis.helper as helper
+    import tasks.clap_analyzer as clap
+
+    registry = importlib.import_module('tasks.mediaserver.registry')
+
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+    monkeypatch.setattr(analysis, 'get_task_info_from_db', lambda task_id: None)
+    def _record_status(*args, **kwargs):
+        if status_calls is not None:
+            status_calls.append(kwargs.get('details') or {})
+
+    monkeypatch.setattr(analysis, 'save_task_status', _record_status)
+    monkeypatch.setattr(helper, 'save_task_status', _record_status)
+    monkeypatch.setattr(analysis, 'clean_temp', lambda *args, **kwargs: None)
+    monkeypatch.setattr(analysis, 'get_recent_albums', lambda limit: albums)
+    monkeypatch.setattr(
+        analysis, 'get_tracks_from_album', lambda album_id: tracks_by_album[album_id]
+    )
+    monkeypatch.setattr(
+        analysis, 'get_failed_child_summary', lambda task_id: (0, [])
+    )
+    monkeypatch.setattr(analysis, '_run_all_index_builds', lambda *a, **k: None)
+    monkeypatch.setattr(analysis, 'LYRICS_ENABLED', False)
+    monkeypatch.setattr(clap, 'is_clap_available', lambda: False)
+    monkeypatch.setattr(registry, 'get_default_server_id', lambda conn=None: 'srv-def')
+    monkeypatch.setattr(
+        helper, 'load_server_work_map', lambda *args, **kwargs: work_map
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('the album loop must not query the DB per album')
+
+    for name in ('get_existing_track_ids', 'get_missing_ids_in_table',
+                 'attach_catalog_item_ids'):
+        monkeypatch.setattr(helper, name, forbidden)
+
+    enqueued = []
+    jobs = dict(extra_jobs or {})
+
+    def _finished_job(job_id):
+        job = Mock()
+        job.id = job_id
+        job.get_status = lambda refresh=False: 'finished'
+        job.is_finished = True
+        job.is_failed = False
+        job.is_canceled = False
+        job.is_stopped = False
+        job.is_queued = False
+        job.is_scheduled = False
+        job.is_started = False
+        return job
+
+    class FakeQueue:
+        @staticmethod
+        def enqueue(func, args=None, **kwargs):
+            job = _finished_job(f'job-{len(enqueued)}')
+            jobs[job.id] = job
+            enqueued.append(args)
+            return job
+
+    class FakeJob:
+        @staticmethod
+        def fetch(job_id, connection=None):
+            return jobs[job_id]
+
+        @staticmethod
+        def fetch_many(job_ids, connection=None):
+            if expired_but_db_terminal:
+                return [None for _ in job_ids]
+            return [jobs.get(job_id) for job_id in job_ids]
+
+    monkeypatch.setattr(analysis, 'rq_queue_default', FakeQueue)
+    monkeypatch.setattr(analysis, 'Job', FakeJob)
+    # The monitor reconciles with ONE count now, not by fetching every child row.
+    monkeypatch.setattr(
+        analysis, 'count_terminal_children',
+        terminal_children or (lambda task_id: 0),
+    )
+    monkeypatch.setattr(
+        analysis, 'get_child_tasks_from_db', lambda task_id: list(child_rows or [])
+    )
+    if child_rows:
+        monkeypatch.setattr(analysis.time, 'sleep', lambda *a, **k: None)
+
+    def _statuses(ids):
+        return {
+            i: ('SUCCESS' if expired_but_db_terminal and str(i).startswith('job-')
+                else 'STARTED')
+            for i in ids if i
+        }
+
+    # The run's own row exists and is live. An empty answer would mean the cancel
+    # wiped task_status, which the dispatch loop correctly reads as revoked.
+    monkeypatch.setattr(analysis, 'get_task_statuses', _statuses)
+    if expired_but_db_terminal:
+        monkeypatch.setattr(analysis, 'ANALYSIS_MONITOR_DB_INTERVAL', 0)
+        monkeypatch.setattr(analysis.time, 'sleep', lambda *a, **k: None)
+        monkeypatch.setattr(analysis, '_rq_job_still_pending', lambda job_id: False)
+
+    result = analysis._run_analysis_server_task_impl(
+        0, 5, server_id='srv-def', task_id='parent-1'
+    )
+    return result, enqueued
+
+
+def test_union_run_counts_albums_across_every_server(monkeypatch):
+    """The status line is 'Albums X/Y' where Y is the total across ALL servers, so
+    the number keeps climbing across phases instead of restarting per server."""
+    import tasks.analysis.main as analysis
+
+    servers = [
+        {'server_id': 'a', 'name': 'A', 'is_default': True},
+        {'server_id': 'b', 'name': 'B', 'is_default': False},
+    ]
+    albums_by_server = {'a': [{'Id': 'a1'}, {'Id': 'a2'}], 'b': [{'Id': 'b1'}]}
+    monkeypatch.setattr(analysis, '_enabled_analysis_servers', lambda scope: servers)
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+    monkeypatch.setattr(analysis, 'get_task_info_from_db', lambda task_id: None)
+    monkeypatch.setattr(
+        analysis, 'get_task_statuses', lambda ids: {i: 'STARTED' for i in ids}
+    )
+    monkeypatch.setattr(analysis, 'save_task_status', lambda *a, **k: None)
+    monkeypatch.setattr(analysis, '_run_all_index_builds', lambda *a, **k: None)
+    monkeypatch.setattr(
+        analysis,
+        '_albums_per_server',
+        lambda servers_, limit: [albums_by_server[s['server_id']] for s in servers_],
+    )
+
+    calls = []
+
+    def fake_phase(*args, server_id=None, albums=None, albums_offset=0,
+                   albums_total=None, **kwargs):
+        calls.append((server_id, len(albums), albums_offset, albums_total))
+        return {'status': 'SUCCESS'}
+
+    monkeypatch.setattr(analysis, 'run_analysis_server_task', fake_phase)
+
+    analysis.run_analysis_task(0, 5)
+
+    assert calls == [('a', 2, 0, 3), ('b', 1, 2, 3)]
+
+
+def test_settled_library_enqueues_nothing_and_never_queries_per_album(monkeypatch):
+    """The whole point of the work map: a run with nothing to do costs ONE query,
+    not a handful per album."""
+    import tasks.analysis.helper as helper
+
+    albums = [{'Id': f'al{i}', 'Name': f'Album {i}'} for i in range(3)]
+    tracks_by_album = {
+        f'al{i}': [{'Id': f'p{i}-{t}', 'Name': 't'} for t in range(2)]
+        for i in range(3)
+    }
+    work_map = {
+        f'p{i}-{t}': helper.WORK_MUSICNN for i in range(3) for t in range(2)
+    }
+
+    result, enqueued = _run_parent_phase(monkeypatch, albums, tracks_by_album, work_map)
+
+    assert result['status'] == 'SUCCESS'
+    assert enqueued == []
+    assert result['message'] == 'Albums 3/3'
+
+
+def test_album_with_one_unanalyzed_track_is_still_enqueued(monkeypatch):
+    import tasks.analysis.helper as helper
+
+    albums = [{'Id': 'al0', 'Name': 'Album 0'}, {'Id': 'al1', 'Name': 'Album 1'}]
+    tracks_by_album = {
+        'al0': [{'Id': 'done-1', 'Name': 't'}, {'Id': 'done-2', 'Name': 't'}],
+        'al1': [{'Id': 'done-3', 'Name': 't'}, {'Id': 'missing', 'Name': 't'}],
+    }
+    work_map = {
+        'done-1': helper.WORK_MUSICNN,
+        'done-2': helper.WORK_MUSICNN,
+        'done-3': helper.WORK_MUSICNN,
+    }
+
+    result, enqueued = _run_parent_phase(monkeypatch, albums, tracks_by_album, work_map)
+
+    assert result['status'] == 'SUCCESS'
+    assert [args[0] for args in enqueued] == ['al1']
+    assert result['message'] == 'Albums 2/2'
+
+
+def test_phase_outcome_never_reports_more_albums_than_the_total():
+    import tasks.analysis.main as analysis
+
+    message, status, _ = analysis._phase_outcome(
+        7523, 6949, albums_launched=10, failed_count=0,
+        failed_errors=[], albums_work_check_failed=0,
+    )
+
+    assert message == 'Albums 6949/6949'
+    assert status == 'SUCCESS'
+
+
+def test_retry_with_stale_child_rows_counts_each_album_once(monkeypatch):
+    albums = [{'Id': f'al{i}', 'Name': f'Album {i}'} for i in range(3)]
+    tracks_by_album = {f'al{i}': [{'Id': f'p{i}', 'Name': 't'}] for i in range(3)}
+    work_map = {}
+
+    counts = iter([0])
+
+    def terminal_children(task_id):
+        return next(counts, 999)
+
+    status_calls = []
+    result, enqueued = _run_parent_phase(
+        monkeypatch, albums, tracks_by_album, work_map,
+        terminal_children=terminal_children, status_calls=status_calls,
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert result['message'] == 'Albums 3/3'
+    reported = [d['albums_completed'] for d in status_calls if 'albums_completed' in d]
+    assert reported
+    assert max(reported) <= 3
+
+
+def test_baseline_read_failure_does_not_double_count_on_retry(monkeypatch):
+    albums = [{'Id': f'al{i}', 'Name': f'Album {i}'} for i in range(3)]
+    tracks_by_album = {f'al{i}': [{'Id': f'p{i}', 'Name': 't'}] for i in range(3)}
+    work_map = {}
+
+    calls = {'n': 0}
+
+    def terminal_children(task_id):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError('db blip while reading the baseline')
+        return 999
+
+    status_calls = []
+    result, _ = _run_parent_phase(
+        monkeypatch, albums, tracks_by_album, work_map,
+        terminal_children=terminal_children, status_calls=status_calls,
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert result['message'] == 'Albums 3/3'
+    reported = [d['albums_completed'] for d in status_calls if 'albums_completed' in d]
+    assert reported
+    assert max(reported) <= 3
+
+
+def test_baseline_failure_still_counts_a_child_confirmed_done_after_redis_expiry(monkeypatch):
+    albums = [{'Id': 'al0', 'Name': 'Album 0'}]
+    tracks_by_album = {'al0': [{'Id': 'p0', 'Name': 't'}]}
+    work_map = {}
+
+    calls = {'n': 0}
+
+    def terminal_children(task_id):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError('db blip while reading the baseline')
+        return 999
+
+    result, _ = _run_parent_phase(
+        monkeypatch, albums, tracks_by_album, work_map,
+        terminal_children=terminal_children, expired_but_db_terminal=True,
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert result['message'] == 'Albums 1/1'
+
+
+class _StillRunningStaleJob:
+    def __init__(self, job_id):
+        self.id = job_id
+        self.status_reads = 0
+
+    def get_status(self, refresh=False):
+        self.status_reads += 1
+        return 'started' if self.status_reads <= 2 else 'finished'
+
+
+def test_retry_adopts_previous_attempts_running_album_instead_of_duplicating(monkeypatch):
+    albums = [{'Id': 'al0', 'Name': 'Album 0'}]
+    tracks_by_album = {'al0': [{'Id': 'p0', 'Name': 't'}]}
+    work_map = {}
+    child_rows = [
+        {'task_id': 'stale-1', 'status': 'STARTED', 'sub_type_identifier': 'al0'}
+    ]
+    counts = iter([0, 0])
+
+    result, enqueued = _run_parent_phase(
+        monkeypatch, albums, tracks_by_album, work_map,
+        terminal_children=lambda task_id: next(counts, 1),
+        child_rows=child_rows,
+        extra_jobs={'stale-1': _StillRunningStaleJob('stale-1')},
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert enqueued == []
+    assert result['message'] == 'Albums 1/1'
+
+
+def test_retry_reenqueues_album_whose_previous_job_died_with_the_container(monkeypatch):
+    albums = [{'Id': 'al0', 'Name': 'Album 0'}]
+    tracks_by_album = {'al0': [{'Id': 'p0', 'Name': 't'}]}
+    work_map = {}
+    child_rows = [
+        {'task_id': 'stale-dead', 'status': 'PROGRESS', 'sub_type_identifier': 'al0'}
+    ]
+
+    result, enqueued = _run_parent_phase(
+        monkeypatch, albums, tracks_by_album, work_map, child_rows=child_rows,
+    )
+
+    assert result['status'] == 'SUCCESS'
+    assert [args[0] for args in enqueued] == ['al0']
+    assert result['message'] == 'Albums 1/1'
+
+
+def test_unknown_catalogue_track_requires_real_musicnn_analysis():
+    from tasks.analysis.helper import plan_track_stages
+
+    assert plan_track_stages(
+        'provider-new',
+        existing_ids={'fp_existing'},
+        missing_clap_ids={'provider-new'},
+        missing_lyrics_ids={'provider-new'},
+        lyrics_enabled=True,
+    ) == (True, True, True)
+
+
+class TestFindOnnxName:
+    def test_direct_match(self):
+        names = ['model/Placeholder', 'model/dense/BiasAdd']
+        result = _find_onnx_name('model/Placeholder', names)
+        assert result == 'model/Placeholder'
+
+    def test_strip_colon_suffix(self):
+        names = ['model/Placeholder', 'model/dense/BiasAdd']
+        result = _find_onnx_name('model/Placeholder:0', names)
+        assert result == 'model/Placeholder'
+
+    def test_extract_last_part_after_slash(self):
+        names = ['Placeholder', 'BiasAdd']
+        result = _find_onnx_name('model/dense/Placeholder:0', names)
+        assert result == 'Placeholder'
+
+    def test_replace_slash_with_underscore(self):
+        names = ['model_Placeholder', 'model_dense_BiasAdd']
+        result = _find_onnx_name('model/Placeholder:0', names)
+        assert result == 'model_Placeholder'
+
+    def test_fallback_to_first_name(self):
+        names = ['first_input', 'second_input']
+        result = _find_onnx_name('completely_unknown_name', names)
+        assert result == 'first_input'
+
+    def test_empty_names_list(self):
+        names = []
+        result = _find_onnx_name('any_name', names)
+        assert result is None
+
+    def test_complex_tensorflow_name(self):
+        names = ['serving_default_model_Placeholder']
+        result = _find_onnx_name('serving_default_model_Placeholder:0', names)
+        assert result == 'serving_default_model_Placeholder'
+
+    def test_nested_path_extraction(self):
+        names = ['BiasAdd']
+        result = _find_onnx_name('model/layer1/layer2/BiasAdd:0', names)
+        assert result == 'BiasAdd'
+
+
+class TestRunInference:
+    def test_successful_inference_direct_match(self):
+        mock_session = Mock()
+
+        mock_input = Mock()
+        mock_input.name = 'model/Placeholder'
+        mock_session.get_inputs.return_value = [mock_input]
+
+        mock_output = Mock()
+        mock_output.name = 'model/dense/BiasAdd'
+        mock_session.get_outputs.return_value = [mock_output]
+
+        expected_result = np.array([[0.1, 0.2, 0.3]])
+        mock_session.run.return_value = [expected_result]
+
+        feed_dict = {'model/Placeholder': np.random.rand(1, 10)}
+        result = run_inference(mock_session, feed_dict, 'model/dense/BiasAdd')
+
+        assert result is not None
+        np.testing.assert_array_equal(result, expected_result)
+        mock_session.run.assert_called_once()
+
+    def test_inference_with_tensorflow_style_names(self):
+        mock_session = Mock()
+
+        mock_input = Mock()
+        mock_input.name = 'model_Placeholder'
+        mock_session.get_inputs.return_value = [mock_input]
+
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_outputs.return_value = [mock_output]
+
+        expected_result = np.array([[0.5]])
+        mock_session.run.return_value = [expected_result]
+
+        feed_dict = {'model/Placeholder:0': np.random.rand(1, 5)}
+        result = run_inference(mock_session, feed_dict)
+
+        assert result is not None
+        np.testing.assert_array_equal(result, expected_result)
+
+    def test_inference_without_output_tensor_name(self):
+        mock_session = Mock()
+
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_session.get_inputs.return_value = [mock_input]
+
+        mock_output1 = Mock()
+        mock_output1.name = 'first_output'
+        mock_output2 = Mock()
+        mock_output2.name = 'second_output'
+        mock_session.get_outputs.return_value = [mock_output1, mock_output2]
+
+        expected_result = np.array([[1.0, 2.0]])
+        mock_session.run.return_value = [expected_result]
+
+        feed_dict = {'input': np.random.rand(1, 3)}
+        result = run_inference(mock_session, feed_dict, output_tensor_name=None)
+
+        assert result is not None
+        mock_session.run.assert_called_with(['first_output'], {'input': feed_dict['input']})
+
+    def test_inference_with_multiple_inputs(self):
+        mock_session = Mock()
+
+        mock_input1 = Mock()
+        mock_input1.name = 'input1'
+        mock_input2 = Mock()
+        mock_input2.name = 'input2'
+        mock_session.get_inputs.return_value = [mock_input1, mock_input2]
+
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_outputs.return_value = [mock_output]
+
+        expected_result = np.array([[0.7]])
+        mock_session.run.return_value = [expected_result]
+
+        rng = np.random.default_rng(0)
+        feed_dict = {'input1': rng.random((1, 5)), 'input2': rng.random((1, 3))}
+        result = run_inference(mock_session, feed_dict)
+
+        assert result is not None
+        call_args = mock_session.run.call_args
+        assert 'input1' in call_args[0][1]
+        assert 'input2' in call_args[0][1]
+
+    def test_inference_returns_none_when_input_mapping_fails(self):
+        mock_session = Mock()
+
+        mock_session.get_inputs.return_value = []
+
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_outputs.return_value = [mock_output]
+
+        feed_dict = {'unknown_input': np.random.rand(1, 5)}
+        result = run_inference(mock_session, feed_dict)
+
+        assert result is None
+
+    def test_inference_returns_none_when_no_outputs(self):
+        mock_session = Mock()
+
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_session.get_inputs.return_value = [mock_input]
+
+        mock_session.get_outputs.return_value = []
+
+        feed_dict = {'input': np.random.rand(1, 5)}
+        result = run_inference(mock_session, feed_dict)
+
+        assert result is None
+
+    def test_inference_with_path_based_name_mapping(self):
+        mock_session = Mock()
+
+        mock_input = Mock()
+        mock_input.name = 'Placeholder'
+        mock_session.get_inputs.return_value = [mock_input]
+
+        mock_output = Mock()
+        mock_output.name = 'BiasAdd'
+        mock_session.get_outputs.return_value = [mock_output]
+
+        expected_result = np.array([[0.3, 0.4]])
+        mock_session.run.return_value = [expected_result]
+
+        feed_dict = {'model/dense/Placeholder:0': np.random.rand(1, 8)}
+        result = run_inference(mock_session, feed_dict, 'model/dense/BiasAdd:0')
+
+        assert result is not None
+        np.testing.assert_array_equal(result, expected_result)
+
+    def test_inference_with_underscore_conversion(self):
+        mock_session = Mock()
+
+        mock_input = Mock()
+        mock_input.name = 'model_Placeholder'
+        mock_session.get_inputs.return_value = [mock_input]
+
+        mock_output = Mock()
+        mock_output.name = 'model_output'
+        mock_session.get_outputs.return_value = [mock_output]
+
+        expected_result = np.array([[0.6]])
+        mock_session.run.return_value = [expected_result]
+
+        feed_dict = {'model/Placeholder': np.random.rand(1, 4)}
+        result = run_inference(mock_session, feed_dict, 'model/output')
+
+        assert result is not None
+        np.testing.assert_array_equal(result, expected_result)
+
+    def test_inference_result_unwrapping(self):
+        mock_session = Mock()
+
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_session.get_inputs.return_value = [mock_input]
+
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_outputs.return_value = [mock_output]
+
+        expected_array = np.array([[1.0, 2.0, 3.0]])
+        mock_session.run.return_value = [expected_array]
+
+        feed_dict = {'input': np.random.rand(1, 5)}
+        result = run_inference(mock_session, feed_dict)
+
+        assert isinstance(result, np.ndarray)
+        np.testing.assert_array_equal(result, expected_array)
+
+    def test_inference_with_empty_result_list(self):
+        mock_session = Mock()
+
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_session.get_inputs.return_value = [mock_input]
+
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_outputs.return_value = [mock_output]
+
+        mock_session.run.return_value = []
+
+        feed_dict = {'input': np.random.rand(1, 5)}
+        result = run_inference(mock_session, feed_dict)
+
+        assert result == []
+
+
+class TestSigmoid:
+    def test_sigmoid_basic(self):
+        result = sigmoid(0)
+        assert np.isclose(result, 0.5)
+
+    def test_sigmoid_positive(self):
+        result = sigmoid(2.0)
+        assert result > 0.5
+        assert result < 1.0
+
+    def test_sigmoid_negative(self):
+        result = sigmoid(-2.0)
+        assert result > 0.0
+        assert result < 0.5
+
+    def test_sigmoid_array(self):
+        x = np.array([0, 1, -1, 2, -2])
+        result = sigmoid(x)
+
+        assert len(result) == 5
+        assert np.all(result > 0)
+        assert np.all(result < 1)
+        assert np.isclose(result[0], 0.5)
+
+    def test_sigmoid_numerical_stability_large_positive(self):
+        result = sigmoid(100)
+        assert np.isfinite(result)
+        assert np.isclose(result, 1.0)
+
+    def test_sigmoid_numerical_stability_large_negative(self):
+        result = sigmoid(-100)
+        assert np.isfinite(result)
+        assert np.isclose(result, 0.0)
+
+    def test_sigmoid_symmetry(self):
+        x = 1.5
+        assert np.isclose(sigmoid(x) + sigmoid(-x), 1.0)
+
+
+class TestRobustLoadAudioWithFallback:
+    @patch('tasks.analysis.song.librosa.load')
+    def test_successful_direct_load(self, mock_librosa_load):
+        expected_audio = np.random.rand(16000)
+        expected_sr = 16000
+        mock_librosa_load.return_value = (expected_audio, expected_sr)
+
+        audio, sr = robust_load_audio_with_fallback('test.mp3', target_sr=16000)
+
+        assert audio is not None
+        assert sr == expected_sr
+        np.testing.assert_array_equal(audio, expected_audio)
+        mock_librosa_load.assert_called_once()
+
+    @patch('tasks.analysis.song.librosa.load')
+    def test_direct_load_with_custom_sample_rate(self, mock_librosa_load):
+        expected_audio = np.random.rand(22050)
+        expected_sr = 22050
+        mock_librosa_load.return_value = (expected_audio, expected_sr)
+
+        audio, sr = robust_load_audio_with_fallback('test.wav', target_sr=22050)
+
+        assert sr == 22050
+        mock_librosa_load.assert_called_once_with('test.wav', sr=22050, mono=True, duration=600)
+
+    @patch('tasks.analysis.song.librosa.load')
+    @patch('tasks.analysis.song._decode_audio_with_pyav')
+    def test_fallback_on_librosa_failure(self, mock_pyav_decode, mock_librosa_load):
+        mock_librosa_load.side_effect = Exception("Librosa failed")
+        mock_pyav_decode.return_value = np.random.rand(16000).astype(np.float32)
+
+        audio, sr = robust_load_audio_with_fallback('corrupted.mp3')
+
+        assert audio is not None
+        assert sr == 16000
+        mock_pyav_decode.assert_called_once_with('corrupted.mp3', 16000)
+
+    @patch('tasks.analysis.song.librosa.load')
+    def test_returns_none_on_empty_audio(self, mock_librosa_load):
+        mock_librosa_load.return_value = (np.array([]), 16000)
+
+        audio, sr = robust_load_audio_with_fallback('empty.mp3')
+
+        assert audio is None
+        assert sr is None
+
+    @patch('tasks.analysis.song.librosa.load')
+    def test_returns_none_on_none_audio(self, mock_librosa_load):
+        mock_librosa_load.return_value = (None, 16000)
+
+        audio, sr = robust_load_audio_with_fallback('invalid.mp3')
+
+        assert audio is None
+        assert sr is None
+
+    @patch('tasks.analysis.song.librosa.load')
+    @patch('tasks.analysis.song._decode_audio_with_pyav')
+    def test_fallback_handles_silent_audio(self, mock_pyav_decode, mock_librosa_load):
+        mock_librosa_load.side_effect = Exception("Librosa failed")
+        mock_pyav_decode.return_value = np.zeros(16000, dtype=np.float32)
+
+        audio, sr = robust_load_audio_with_fallback('silent.mp3')
+
+        assert audio is None
+        assert sr is None
+
+    @patch('tasks.analysis.song.librosa.load')
+    @patch('tasks.analysis.song._decode_audio_with_pyav')
+    def test_fallback_handles_decode_failure(self, mock_pyav_decode, mock_librosa_load):
+        mock_librosa_load.side_effect = Exception("Librosa failed")
+        mock_pyav_decode.side_effect = Exception("PyAV failed")
+
+        audio, sr = robust_load_audio_with_fallback('corrupted.mp3')
+
+        assert audio is None
+        assert sr is None
+
+    @patch('tasks.analysis.song.librosa.load')
+    def test_uses_audio_load_timeout_config(self, mock_librosa_load):
+        mock_librosa_load.return_value = (np.random.rand(16000), 16000)
+
+        robust_load_audio_with_fallback('test.mp3', target_sr=16000)
+
+        call_args = mock_librosa_load.call_args
+        assert 'duration' in call_args.kwargs
+        assert call_args.kwargs['duration'] == 600
+
+
+class TestAnalyzeTrack:
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_successful_track_analysis(
+        self, mock_audio_load, mock_mel, mock_beat, mock_rms, mock_chroma, mock_onnx_session
+    ):
+        mock_audio = np.random.rand(16000)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0, 100, 200]))
+        mock_rms.return_value = np.array([[0.5]])
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000)
+
+        mock_session = Mock()
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_inputs.return_value = [mock_input]
+        mock_session.get_outputs.return_value = [mock_output]
+        mock_session.run.return_value = [np.random.rand(5, 200)]
+        mock_onnx_session.return_value = mock_session
+
+        mood_labels = ['happy', 'sad', 'energetic', 'calm', 'aggressive']
+        model_paths = {
+            'embedding': '/path/to/embedding.onnx',
+            'prediction': '/path/to/prediction.onnx',
+            'danceable': '/path/to/danceable.onnx',
+            'aggressive': '/path/to/aggressive.onnx',
+            'happy': '/path/to/happy.onnx',
+            'party': '/path/to/party.onnx',
+            'relaxed': '/path/to/relaxed.onnx',
+            'sad': '/path/to/sad.onnx',
+        }
+
+        result, embeddings = analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert result is not None
+        assert embeddings is not None
+        assert 'tempo' in result
+        assert 'key' in result
+        assert 'scale' in result
+        assert 'moods' in result
+        assert 'energy' in result
+        assert isinstance(result['moods'], dict)
+        assert len(result['moods']) == len(mood_labels)
+
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_returns_none_on_audio_load_failure(self, mock_audio_load):
+        mock_audio_load.return_value = (None, None)
+
+        mood_labels = ['happy', 'sad']
+        model_paths = {'embedding': '/path/to/model.onnx'}
+
+        result, embeddings = analyze_track('bad_file.mp3', mood_labels, model_paths)
+
+        assert result is None
+        assert embeddings is None
+
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_returns_none_on_empty_audio(self, mock_audio_load):
+        mock_audio_load.return_value = (np.array([]), 16000)
+
+        mood_labels = ['happy']
+        model_paths = {'embedding': '/path/to/model.onnx'}
+
+        result, embeddings = analyze_track('empty.mp3', mood_labels, model_paths)
+
+        assert result is None
+        assert embeddings is None
+
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_returns_none_on_silent_audio(self, mock_audio_load):
+        mock_audio_load.return_value = (np.zeros(16000), 16000)
+
+        mood_labels = ['happy']
+        model_paths = {'embedding': '/path/to/model.onnx'}
+
+        result, embeddings = analyze_track('silent.mp3', mood_labels, model_paths)
+
+        assert result is None
+        assert embeddings is None
+
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_returns_none_on_short_audio(
+        self, mock_audio_load, mock_beat, mock_rms, mock_chroma, mock_mel
+    ):
+        mock_audio = np.random.rand(100)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0]))
+        mock_rms.return_value = np.array([[0.5]])
+        mock_chroma.return_value = np.random.rand(12, 10)
+        mock_mel.return_value = np.random.rand(96, 10)
+
+        mood_labels = ['happy']
+        model_paths = {'embedding': '/path/to/model.onnx'}
+
+        result, embeddings = analyze_track('short.mp3', mood_labels, model_paths)
+
+        assert result is None
+        assert embeddings is None
+
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_spectrogram_dtype_conversion(
+        self, mock_audio_load, mock_mel, mock_beat, mock_rms, mock_chroma, mock_onnx_session
+    ):
+        mock_audio = np.random.rand(16000).astype(np.float64)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0, 100]))
+        mock_rms.return_value = np.array([[0.5]])
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000).astype(np.float64)
+
+        captured_input = None
+        call_count = [0]
+
+        def capture_run(output_names, feed_dict):
+            nonlocal captured_input
+            call_count[0] += 1
+            if call_count[0] == 1:
+                for key, val in feed_dict.items():
+                    captured_input = val
+            return [np.random.rand(5, 200).astype(np.float32)]
+
+        mock_session = Mock()
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_inputs.return_value = [mock_input]
+        mock_session.get_outputs.return_value = [mock_output]
+        mock_session.run.side_effect = capture_run
+        mock_onnx_session.return_value = mock_session
+
+        mood_labels = ['happy']
+        model_paths = {
+            'embedding': '/path/to/embedding.onnx',
+            'prediction': '/path/to/prediction.onnx',
+            'danceable': '/path/to/danceable.onnx',
+            'aggressive': '/path/to/aggressive.onnx',
+            'happy': '/path/to/happy.onnx',
+            'party': '/path/to/party.onnx',
+            'relaxed': '/path/to/relaxed.onnx',
+            'sad': '/path/to/sad.onnx',
+        }
+
+        analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert captured_input is not None
+        assert captured_input.dtype == np.dtype('float32')
+
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_key_detection_logic(
+        self, mock_audio_load, mock_mel, mock_beat, mock_rms, mock_chroma, mock_onnx_session
+    ):
+        mock_audio = np.random.rand(16000)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0, 100]))
+        mock_rms.return_value = np.array([[0.5]])
+
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000)
+
+        mock_session = Mock()
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_inputs.return_value = [mock_input]
+        mock_session.get_outputs.return_value = [mock_output]
+        mock_session.run.return_value = [np.random.rand(5, 200)]
+        mock_onnx_session.return_value = mock_session
+
+        mood_labels = ['happy']
+        model_paths = {
+            'embedding': '/path/to/embedding.onnx',
+            'prediction': '/path/to/prediction.onnx',
+            'danceable': '/path/to/danceable.onnx',
+            'aggressive': '/path/to/aggressive.onnx',
+            'happy': '/path/to/happy.onnx',
+            'party': '/path/to/party.onnx',
+            'relaxed': '/path/to/relaxed.onnx',
+            'sad': '/path/to/sad.onnx',
+        }
+
+        result, _ = analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert result is not None
+        assert 'key' in result
+        assert 'scale' in result
+        assert result['key'] in ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+        assert result['scale'] in ['major', 'minor']
+
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_model_inference_failure_handling(
+        self, mock_audio_load, mock_mel, mock_beat, mock_rms, mock_chroma, mock_onnx_session
+    ):
+        mock_audio = np.random.rand(16000)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0, 100]))
+        mock_rms.return_value = np.array([[0.5]])
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000)
+
+        mock_onnx_session.side_effect = Exception("Model loading failed")
+
+        mood_labels = ['happy']
+        model_paths = {'embedding': '/path/to/embedding.onnx'}
+
+        result, embeddings = analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert result is None
+        assert embeddings is None
+
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_tempo_extraction(
+        self, mock_audio_load, mock_mel, mock_beat, mock_rms, mock_chroma, mock_onnx_session
+    ):
+        mock_audio = np.random.rand(16000)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        expected_tempo = 128.5
+        mock_beat.return_value = (expected_tempo, np.array([0, 100]))
+        mock_rms.return_value = np.array([[0.5]])
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000)
+
+        mock_session = Mock()
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_inputs.return_value = [mock_input]
+        mock_session.get_outputs.return_value = [mock_output]
+        mock_session.run.return_value = [np.random.rand(5, 200)]
+        mock_onnx_session.return_value = mock_session
+
+        mood_labels = ['happy']
+        model_paths = {
+            'embedding': '/path/to/embedding.onnx',
+            'prediction': '/path/to/prediction.onnx',
+            'danceable': '/path/to/danceable.onnx',
+            'aggressive': '/path/to/aggressive.onnx',
+            'happy': '/path/to/happy.onnx',
+            'party': '/path/to/party.onnx',
+            'relaxed': '/path/to/relaxed.onnx',
+            'sad': '/path/to/sad.onnx',
+        }
+
+        result, _ = analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert result is not None
+        assert result['tempo'] == expected_tempo
+        assert isinstance(result['tempo'], float)
+
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    def test_energy_calculation(
+        self, mock_audio_load, mock_mel, mock_beat, mock_rms, mock_chroma, mock_onnx_session
+    ):
+        mock_audio = np.random.rand(16000)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0, 100]))
+
+        rms_values = np.array([[0.1, 0.2, 0.3, 0.4]])
+        expected_energy = np.mean(rms_values)
+        mock_rms.return_value = rms_values
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000)
+
+        mock_session = Mock()
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_inputs.return_value = [mock_input]
+        mock_session.get_outputs.return_value = [mock_output]
+        mock_session.run.return_value = [np.random.rand(5, 200)]
+        mock_onnx_session.return_value = mock_session
+
+        mood_labels = ['happy']
+        model_paths = {
+            'embedding': '/path/to/embedding.onnx',
+            'prediction': '/path/to/prediction.onnx',
+            'danceable': '/path/to/danceable.onnx',
+            'aggressive': '/path/to/aggressive.onnx',
+            'happy': '/path/to/happy.onnx',
+            'party': '/path/to/party.onnx',
+            'relaxed': '/path/to/relaxed.onnx',
+            'sad': '/path/to/sad.onnx',
+        }
+
+        result, _ = analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert result is not None
+        assert np.isclose(result['energy'], expected_energy)
+        assert isinstance(result['energy'], float)
+
+
+class TestOOMFallback:
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    @patch('tasks.analysis.song.ort.get_available_providers')
+    def test_embedding_oom_fallback_to_cpu(
+        self,
+        mock_providers,
+        mock_audio_load,
+        mock_mel,
+        mock_beat,
+        mock_rms,
+        mock_chroma,
+        mock_onnx_session,
+    ):
+        mock_providers.return_value = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+        mock_audio = np.random.rand(16000)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0, 100]))
+        mock_rms.return_value = np.array([[0.5]])
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000)
+
+        gpu_session_call_count = [0]
+        cpu_session_call_count = [0]
+
+        def gpu_run(output_names, feed_dict):
+            gpu_session_call_count[0] += 1
+            if gpu_session_call_count[0] == 1:
+                import onnxruntime as ort
+
+                raise ort.capi.onnxruntime_pybind11_state.RuntimeException(
+                    "Failed to allocate memory for requested buffer of size 765249024"
+                )
+            return [np.random.rand(5, 200)]
+
+        def cpu_run(output_names, feed_dict):
+            cpu_session_call_count[0] += 1
+            return [np.random.rand(5, 200)]
+
+        sessions_created = []
+
+        def create_session(model_path, providers=None, provider_options=None, **kwargs):
+            mock_session = Mock()
+            mock_input = Mock()
+            mock_input.name = 'input'
+            mock_output = Mock()
+            mock_output.name = 'output'
+            mock_session.get_inputs.return_value = [mock_input]
+            mock_session.get_outputs.return_value = [mock_output]
+
+            if (
+                isinstance(providers, list)
+                and 'CPUExecutionProvider' in providers
+                and len(providers) == 1
+            ):
+                mock_session.run.side_effect = cpu_run
+                sessions_created.append('CPU')
+            else:
+                mock_session.run.side_effect = gpu_run
+                sessions_created.append('GPU')
+
+            return mock_session
+
+        mock_onnx_session.side_effect = create_session
+
+        mood_labels = ['happy']
+        model_paths = {
+            'embedding': '/path/to/embedding.onnx',
+            'prediction': '/path/to/prediction.onnx',
+            'danceable': '/path/to/danceable.onnx',
+            'aggressive': '/path/to/aggressive.onnx',
+            'happy': '/path/to/happy.onnx',
+            'party': '/path/to/party.onnx',
+            'relaxed': '/path/to/relaxed.onnx',
+            'sad': '/path/to/sad.onnx',
+        }
+
+        result, embeddings = analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert result is not None
+        assert embeddings is not None
+        assert 'CPU' in sessions_created
+        assert cpu_session_call_count[0] > 0
+
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    @patch('tasks.analysis.song.ort.get_available_providers')
+    def test_prediction_oom_fallback_to_cpu(
+        self,
+        mock_providers,
+        mock_audio_load,
+        mock_mel,
+        mock_beat,
+        mock_rms,
+        mock_chroma,
+        mock_onnx_session,
+    ):
+        mock_providers.return_value = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+        mock_audio = np.random.rand(16000)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0, 100]))
+        mock_rms.return_value = np.array([[0.5]])
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000)
+
+        gpu_session_call_count = [0]
+        cpu_session_call_count = [0]
+
+        def gpu_run(output_names, feed_dict):
+            gpu_session_call_count[0] += 1
+            if gpu_session_call_count[0] == 2:
+                import onnxruntime as ort
+
+                raise ort.capi.onnxruntime_pybind11_state.RuntimeException(
+                    "Failed to allocate memory for requested buffer"
+                )
+            return [np.random.rand(5, 200)]
+
+        def cpu_run(output_names, feed_dict):
+            cpu_session_call_count[0] += 1
+            return [np.random.rand(5, 200)]
+
+        sessions_created = []
+
+        def create_session(model_path, providers=None, provider_options=None, **kwargs):
+            mock_session = Mock()
+            mock_input = Mock()
+            mock_input.name = 'input'
+            mock_output = Mock()
+            mock_output.name = 'output'
+            mock_session.get_inputs.return_value = [mock_input]
+            mock_session.get_outputs.return_value = [mock_output]
+
+            if (
+                isinstance(providers, list)
+                and 'CPUExecutionProvider' in providers
+                and len(providers) == 1
+            ):
+                mock_session.run.side_effect = cpu_run
+                sessions_created.append('CPU')
+            else:
+                mock_session.run.side_effect = gpu_run
+                sessions_created.append('GPU')
+
+            return mock_session
+
+        mock_onnx_session.side_effect = create_session
+
+        mood_labels = ['happy']
+        model_paths = {
+            'embedding': '/path/to/embedding.onnx',
+            'prediction': '/path/to/prediction.onnx',
+            'danceable': '/path/to/danceable.onnx',
+            'aggressive': '/path/to/aggressive.onnx',
+            'happy': '/path/to/happy.onnx',
+            'party': '/path/to/party.onnx',
+            'relaxed': '/path/to/relaxed.onnx',
+            'sad': '/path/to/sad.onnx',
+        }
+
+        result, embeddings = analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert result is not None
+        assert embeddings is not None
+        assert 'CPU' in sessions_created
+        assert cpu_session_call_count[0] > 0
+
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    @patch('tasks.analysis.song.ort.get_available_providers')
+    def test_non_oom_exception_is_reraised(
+        self,
+        mock_providers,
+        mock_audio_load,
+        mock_mel,
+        mock_beat,
+        mock_rms,
+        mock_chroma,
+        mock_onnx_session,
+    ):
+        mock_providers.return_value = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+        mock_audio = np.random.rand(16000)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0, 100]))
+        mock_rms.return_value = np.array([[0.5]])
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000)
+
+        def gpu_run(output_names, feed_dict):
+            import onnxruntime as ort
+
+            raise ort.capi.onnxruntime_pybind11_state.RuntimeException(
+                "Model execution error: Invalid input shape"
+            )
+
+        mock_session = Mock()
+        mock_input = Mock()
+        mock_input.name = 'input'
+        mock_output = Mock()
+        mock_output.name = 'output'
+        mock_session.get_inputs.return_value = [mock_input]
+        mock_session.get_outputs.return_value = [mock_output]
+        mock_session.run.side_effect = gpu_run
+        mock_onnx_session.return_value = mock_session
+
+        mood_labels = ['happy']
+        model_paths = {
+            'embedding': '/path/to/embedding.onnx',
+            'prediction': '/path/to/prediction.onnx',
+            'danceable': '/path/to/danceable.onnx',
+            'aggressive': '/path/to/aggressive.onnx',
+            'happy': '/path/to/happy.onnx',
+            'party': '/path/to/party.onnx',
+            'relaxed': '/path/to/relaxed.onnx',
+            'sad': '/path/to/sad.onnx',
+        }
+
+        result, embeddings = analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert result is None
+        assert embeddings is None
+
+    @patch('tasks.analysis.song.ort.InferenceSession')
+    @patch('tasks.analysis.song.librosa.feature.chroma_stft')
+    @patch('tasks.analysis.song.librosa.feature.rms')
+    @patch('tasks.analysis.song.librosa.beat.beat_track')
+    @patch('tasks.analysis.song.librosa.feature.melspectrogram')
+    @patch('tasks.analysis.song.robust_load_audio_with_fallback')
+    @patch('tasks.analysis.song.ort.get_available_providers')
+    def test_successful_gpu_inference_no_fallback(
+        self,
+        mock_providers,
+        mock_audio_load,
+        mock_mel,
+        mock_beat,
+        mock_rms,
+        mock_chroma,
+        mock_onnx_session,
+    ):
+        mock_providers.return_value = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+        mock_audio = np.random.rand(16000)
+        mock_audio_load.return_value = (mock_audio, 16000)
+
+        mock_beat.return_value = (120.0, np.array([0, 100]))
+        mock_rms.return_value = np.array([[0.5]])
+        mock_chroma.return_value = np.random.rand(12, 100)
+        mock_mel.return_value = np.random.rand(96, 1000)
+
+        cpu_fallback_used = [False]
+
+        def create_session(model_path, providers=None, provider_options=None, **kwargs):
+            if (
+                isinstance(providers, list)
+                and 'CPUExecutionProvider' in providers
+                and len(providers) == 1
+            ):
+                cpu_fallback_used[0] = True
+
+            mock_session = Mock()
+            mock_input = Mock()
+            mock_input.name = 'input'
+            mock_output = Mock()
+            mock_output.name = 'output'
+            mock_session.get_inputs.return_value = [mock_input]
+            mock_session.get_outputs.return_value = [mock_output]
+
+            call_count = [0]
+
+            def successful_run(output_names, feed_dict):
+                call_count[0] += 1
+                if call_count[0] <= 2:
+                    return [np.random.rand(5, 200)]
+                else:
+                    return [np.random.rand(5, 2)]
+
+            mock_session.run.side_effect = successful_run
+            return mock_session
+
+        mock_onnx_session.side_effect = create_session
+
+        mood_labels = ['happy']
+        model_paths = {
+            'embedding': '/path/to/embedding.onnx',
+            'prediction': '/path/to/prediction.onnx',
+            'danceable': '/path/to/danceable.onnx',
+            'aggressive': '/path/to/aggressive.onnx',
+            'happy': '/path/to/happy.onnx',
+            'party': '/path/to/party.onnx',
+            'relaxed': '/path/to/relaxed.onnx',
+            'sad': '/path/to/sad.onnx',
+        }
+
+        result, embeddings = analyze_track('test.mp3', mood_labels, model_paths)
+
+        assert result is not None
+        assert embeddings is not None
+        assert cpu_fallback_used[0] is False
+
+
+class TestMediaServerProbe:
+    def test_probe_detects_auth_failure_from_flag(self):
+        from tasks.analysis import _probe_looks_like_auth_failure
+
+        assert _probe_looks_like_auth_failure({'ok': False, 'auth_failed': True}) is True
+
+    def test_probe_detects_auth_failure_from_message(self):
+        from tasks.analysis import _probe_looks_like_auth_failure
+
+        assert (
+            _probe_looks_like_auth_failure({'ok': False, 'error': 'HTTP 401 Unauthorized'}) is True
+        )
+
+    def test_probe_ignores_generic_failure(self):
+        from tasks.analysis import _probe_looks_like_auth_failure
+
+        assert (
+            _probe_looks_like_auth_failure({'ok': False, 'error': 'connection timed out'}) is False
+        )
+
+    def test_verify_returns_silently_when_reachable(self):
+        from tasks.analysis import _verify_media_server_reachable
+
+        with patch('tasks.analysis.main.mediaserver_test_connection', return_value={'ok': True}):
+            _verify_media_server_reachable()
+
+    def test_verify_raises_auth_error_on_bad_credentials(self):
+        from tasks.analysis import _verify_media_server_reachable
+        from error.error_manager import AudioMuseError
+        from error.error_dictionary import ERR_MEDIASERVER_AUTH
+
+        with patch(
+            'tasks.analysis.main.mediaserver_test_connection',
+            return_value={'ok': False, 'auth_failed': True, 'error': 'Wrong username or password'},
+        ):
+            with pytest.raises(AudioMuseError) as exc_info:
+                _verify_media_server_reachable()
+        assert exc_info.value.code == ERR_MEDIASERVER_AUTH
+
+    def test_verify_raises_unreachable_on_generic_failure(self):
+        from tasks.analysis import _verify_media_server_reachable
+        from error.error_manager import AudioMuseError
+        from error.error_dictionary import ERR_MEDIASERVER_UNREACHABLE
+
+        with patch(
+            'tasks.analysis.main.mediaserver_test_connection',
+            return_value={'ok': False, 'error': 'connection refused'},
+        ):
+            with pytest.raises(AudioMuseError) as exc_info:
+                _verify_media_server_reachable()
+        assert exc_info.value.code == ERR_MEDIASERVER_UNREACHABLE
+
+
+@pytest.mark.parametrize('terminal_status', ['REVOKED', 'FAILURE', 'SUCCESS'])
+def test_a_requeued_job_refuses_to_rerun_a_terminal_task(monkeypatch, terminal_status):
+    import tasks.analysis.main as analysis
+
+    monkeypatch.setattr(
+        analysis, 'get_task_statuses', lambda ids: {i: terminal_status for i in ids}
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            'a cancelled, failed or completed task must never run again'
+        )
+
+    monkeypatch.setattr(analysis, '_enabled_analysis_servers', forbidden)
+    monkeypatch.setattr(analysis, '_run_all_index_builds', forbidden)
+    monkeypatch.setattr(analysis, '_run_chromaprint_backfill', forbidden)
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+
+    result = analysis.run_analysis_task(0, 5)
+
+    assert result['status'] == terminal_status
+
+
+def test_a_run_cancelled_during_the_album_phases_never_reaches_chromaprint(monkeypatch):
+    import tasks.analysis.main as analysis
+
+    servers = [
+        {'server_id': 'a', 'name': 'A', 'is_default': True},
+        {'server_id': 'b', 'name': 'B', 'is_default': False},
+    ]
+    statuses = {'value': 'PROGRESS'}
+    monkeypatch.setattr(analysis, '_enabled_analysis_servers', lambda scope: servers)
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+    monkeypatch.setattr(analysis, 'save_task_status', lambda *a, **k: None)
+    monkeypatch.setattr(
+        analysis, 'get_task_statuses', lambda ids: {i: statuses['value'] for i in ids}
+    )
+    monkeypatch.setattr(
+        analysis, '_albums_per_server', lambda servers_, limit: [[], []]
+    )
+
+    def finish_phase(*args, **kwargs):
+        statuses['value'] = 'REVOKED'
+        return {'status': 'SUCCESS'}
+
+    monkeypatch.setattr(analysis, 'run_analysis_server_task', finish_phase)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('the tail phases must not run after a cancel')
+
+    monkeypatch.setattr(analysis, '_run_all_index_builds', forbidden)
+    monkeypatch.setattr(analysis, '_run_chromaprint_backfill', forbidden)
+
+    result = analysis.run_analysis_task(0, 5)
+
+    assert result['status'] == 'REVOKED'
+
+
+def test_a_live_run_is_not_blocked_by_the_terminal_guard(monkeypatch):
+    import tasks.analysis.main as analysis
+
+    monkeypatch.setattr(
+        analysis, 'get_task_statuses', lambda ids: {i: 'PROGRESS' for i in ids}
+    )
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+    monkeypatch.setattr(analysis, 'save_task_status', lambda *a, **k: None)
+    monkeypatch.setattr(analysis, '_enabled_analysis_servers', lambda scope: [])
+
+    result = analysis.run_analysis_task(0, 5)
+
+    assert result['status'] == 'SKIPPED'
+
+
+def test_an_unreadable_status_lets_the_run_proceed_rather_than_stalling(monkeypatch):
+    import tasks.analysis.main as analysis
+
+    def boom(ids):
+        raise RuntimeError('db down')
+
+    monkeypatch.setattr(analysis, 'get_task_statuses', boom)
+    monkeypatch.setattr(analysis, 'get_current_job', lambda connection=None: None)
+    monkeypatch.setattr(analysis, 'save_task_status', lambda *a, **k: None)
+    monkeypatch.setattr(analysis, '_enabled_analysis_servers', lambda scope: [])
+
+    result = analysis.run_analysis_task(0, 5)
+
+    assert result['status'] == 'SKIPPED'
+
+
+def _chromaprint_backfill_harness(monkeypatch, targets_by_server, report_seconds=0):
+    import contextlib
+    import tasks.analysis.main as analysis
+    from tasks.mediaserver import context as server_context
+
+    monkeypatch.setattr(analysis, 'CHROMAPRINT_COLLECTION_ENABLED', True)
+    monkeypatch.setattr(
+        analysis, 'CHROMAPRINT_BACKFILL_REPORT_SECONDS', report_seconds
+    )
+    monkeypatch.setattr(analysis.chromaprint, 'is_available', lambda: True)
+    monkeypatch.setattr(analysis, '_bind_server_context', lambda server_id: server_id)
+    monkeypatch.setattr(
+        server_context, 'use_server', lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        analysis,
+        '_chromaprint_backfill_targets',
+        lambda server_id, limit: list(targets_by_server.get(server_id, [])),
+    )
+    processed = []
+    monkeypatch.setattr(
+        analysis,
+        '_backfill_one_track',
+        lambda server_id, track_id, path: processed.append((server_id, track_id)) or True,
+    )
+    return analysis, processed
+
+
+def _fake_targets(count, prefix='t'):
+    return [(f'{prefix}{i}', f'/music/{prefix}{i}.flac') for i in range(count)]
+
+
+def test_chromaprint_backfill_writes_progress_during_the_loop_not_only_before_it(
+    monkeypatch,
+):
+    analysis, processed = _chromaprint_backfill_harness(
+        monkeypatch, {'srv': _fake_targets(5)}
+    )
+    reports = []
+
+    analysis._run_chromaprint_backfill(
+        ['srv'], log_fn=lambda message, progress=99: reports.append(message)
+    )
+
+    assert len(processed) == 5
+    assert len(reports) == 6
+    assert '5/5 track(s)' in reports[-1]
+
+
+def test_chromaprint_backfill_throttles_progress_writes_to_the_configured_interval(
+    monkeypatch,
+):
+    analysis, processed = _chromaprint_backfill_harness(
+        monkeypatch, {'srv': _fake_targets(5)}, report_seconds=3600
+    )
+    reports = []
+
+    analysis._run_chromaprint_backfill(
+        ['srv'], log_fn=lambda message, progress=99: reports.append(message)
+    )
+
+    assert len(processed) == 5
+    assert len(reports) == 1
+
+
+def test_chromaprint_backfill_stops_mid_loop_once_the_run_is_revoked(monkeypatch):
+    analysis, processed = _chromaprint_backfill_harness(
+        monkeypatch, {'srv': _fake_targets(10)}
+    )
+
+    analysis._run_chromaprint_backfill(
+        ['srv'],
+        log_fn=lambda message, progress=99: None,
+        should_stop=lambda: len(processed) >= 3,
+    )
+
+    assert len(processed) == 3
+
+
+def test_chromaprint_backfill_leaves_remaining_servers_untouched_once_revoked(
+    monkeypatch,
+):
+    analysis, processed = _chromaprint_backfill_harness(
+        monkeypatch,
+        {'srv-a': _fake_targets(2, 'a'), 'srv-b': _fake_targets(2, 'b'),
+         'srv-c': _fake_targets(2, 'c')},
+    )
+
+    analysis._run_chromaprint_backfill(
+        ['srv-a', 'srv-b', 'srv-c'],
+        log_fn=lambda message, progress=99: None,
+        should_stop=lambda: len(processed) >= 2,
+    )
+
+    assert {server_id for server_id, _ in processed} == {'srv-a'}
+
+
+def test_chromaprint_backfill_covers_every_server_when_nothing_is_revoked(monkeypatch):
+    analysis, processed = _chromaprint_backfill_harness(
+        monkeypatch,
+        {'srv-a': _fake_targets(2, 'a'), 'srv-b': [], 'srv-c': _fake_targets(1, 'c')},
+    )
+
+    analysis._run_chromaprint_backfill(
+        ['srv-a', 'srv-b', 'srv-c'], log_fn=lambda message, progress=99: None
+    )
+
+    assert {server_id for server_id, _ in processed} == {'srv-a', 'srv-c'}

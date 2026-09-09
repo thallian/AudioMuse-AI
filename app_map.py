@@ -1,21 +1,50 @@
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""Library map Flask blueprint (map_bp) serving the 2D song projection.
+
+Renders the ``/map`` page and streams the projected library as JSON at
+``/api/map``, reusing the UMAP / discriminant projection helpers from
+``tasks.alchemy_projections`` and the stored projection from ``app_helper``.
+
+Main Features:
+* Serves the map at four density levels (100/75/50/25 percent), each cached
+  in memory as pre-serialized JSON plus a gzip-compressed copy for fast reads.
+* Endpoints to report cache status and to rebuild the cache on demand; songs
+  are labelled by their top mood parsed from the stored mood_vector string.
+* Multi-server: responses are filtered per request to the selected server's
+  catalogue; the shared cache always holds the full union.
+"""
+
+import gc
 import json
 import math
+import time
 import logging
-from flask import Blueprint, jsonify, render_template, request, Response, current_app
+from flask import Blueprint, jsonify, render_template, request, Response
 import numpy as np
 import gzip
 
-from app_helper import get_db, load_map_projection
-import config
+from database import get_db
+from app_helper import load_map_projection
+import app_server_context
 
-# Try to reuse projection helpers from song_alchemy
+# Try to reuse the shared projection helpers
 try:
-    from tasks.song_alchemy import _project_with_umap, _project_to_2d, _project_aligned_add_sub, _project_with_discriminant
+    from tasks.alchemy_projections import (
+        _project_with_umap,
+        _project_to_2d,
+        _project_with_discriminant,
+    )
 except Exception:
     # Fallbacks will be used if import fails
     _project_with_umap = None
     _project_to_2d = None
-    _project_aligned_add_sub = None
     _project_with_discriminant = None
 
 logger = logging.getLogger(__name__)
@@ -25,6 +54,43 @@ map_bp = Blueprint('map_bp', __name__)
 # In-memory cached JSON (and compressed) for fast map responses.
 # Keys: '100','75','50','25' each maps to dict with 'json_bytes' and 'json_gzip_bytes' and 'projection'
 MAP_JSON_CACHE = {}
+
+# Per-server precomputed map buckets, keyed by (server_key, percent). The union
+# MAP_JSON_CACHE above stays in canonical (fp_) ids; this holds each server's OWN
+# provider ids, already serialized and gzipped, so a canonicalized/multi-server
+# request streams precomputed bytes instead of translating the whole catalogue on
+# every call. Built for the default server at cache-build time, lazily for others.
+MAP_SERVER_JSON_CACHE = {}
+
+# Memoized canonical-id probe. Canonicalization is one-way, so a True is sticky
+# forever; a False is re-probed at most once per TTL. This keeps the map fast path
+# from seq-scanning score on every request of a not-yet-canonicalized library.
+_HAS_CANONICAL_IDS = None
+_HAS_CANONICAL_CHECKED_AT = 0.0
+_HAS_CANONICAL_TTL = 60.0
+
+
+def _catalogue_has_canonical_ids():
+    """True when score holds canonical fp_ ids (memoized; fails closed on error)."""
+    global _HAS_CANONICAL_IDS, _HAS_CANONICAL_CHECKED_AT
+    if _HAS_CANONICAL_IDS:
+        return True
+    now = time.monotonic()
+    if _HAS_CANONICAL_IDS is False and (now - _HAS_CANONICAL_CHECKED_AT) < _HAS_CANONICAL_TTL:
+        return False
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM score WHERE item_id LIKE 'fp\\_%%')"
+            )
+            result = bool(cur.fetchone()[0])
+    except Exception:
+        logger.exception("Canonical-id probe failed; failing closed")
+        return True
+    _HAS_CANONICAL_IDS = result
+    _HAS_CANONICAL_CHECKED_AT = now
+    return result
 
 
 def _pick_top_mood(mood_vector_str):
@@ -71,7 +137,8 @@ def _sample_items(items, fraction):
     seen = set()
     out = []
     for i in idxs:
-        if i in seen: continue
+        if i in seen:
+            continue
         seen.add(int(i))
         out.append(items[int(i)])
     return out
@@ -82,6 +149,7 @@ def build_map_cache():
     and build cached JSON blobs for 100/75/50/25 percent samples. This should be called
     once at startup inside app.app_context()."""
     global MAP_JSON_CACHE
+    global _HAS_CANONICAL_IDS, _HAS_CANONICAL_CHECKED_AT
     logger = logging.getLogger(__name__)
     logger.info('Building map JSON cache (this reads the DB once).')
 
@@ -98,8 +166,6 @@ def build_map_cache():
         cur.close()
 
     items = []
-    ids = []
-    embs = []
     for r in rows:
         # r: item_id, title, author, mood_vector, embedding_blob
         item_id = r[0]
@@ -117,9 +183,24 @@ def build_map_cache():
                 emb = np.array(r[4], dtype=np.float32)
             except Exception:
                 continue
-        ids.append(str(item_id))
-        embs.append(emb)
-        items.append({'item_id': str(item_id), 'title': title, 'artist': author, 'mood_vector': mood_vector, 'embedding': emb})
+        items.append(
+            {
+                'item_id': str(item_id),
+                'title': title,
+                'artist': author,
+                'mood_vector': mood_vector,
+                'embedding': emb,
+            }
+        )
+
+    # Set the canonical-id memo from the ids just loaded - NO extra DB probe. The
+    # fast path may stream these cached bytes verbatim only when NONE is a canonical
+    # fp_ id; a rebuild (e.g. after canonicalization) reflects the legacy->fp_ flip
+    # exactly here, instead of a reset that re-triggered a score seq-scan on every
+    # routine rebuild. Canonicalization is one-way, so this only ever flips to True.
+    from tasks.simhash import is_fingerprint_id
+    _HAS_CANONICAL_IDS = any(is_fingerprint_id(it['item_id']) for it in items)
+    _HAS_CANONICAL_CHECKED_AT = time.monotonic()
 
     if not items:
         # empty cache
@@ -154,15 +235,22 @@ def build_map_cache():
             projections = None
             used = 'none'
             # prefer UMAP helper if present
-            if '_project_with_umap' in globals() and globals().get('_project_with_umap') is not None:
+            if (
+                '_project_with_umap' in globals()
+                and globals().get('_project_with_umap') is not None
+            ):
                 try:
-                    projections = globals()['_project_with_umap']([v for v in mat])
+                    projections = globals()['_project_with_umap'](mat)
                     used = 'umap'
                 except Exception as e:
                     logger.debug('UMAP helper failed during cache build: %s', e)
-            if projections is None and '_project_to_2d' in globals() and globals().get('_project_to_2d') is not None:
+            if (
+                projections is None
+                and '_project_to_2d' in globals()
+                and globals().get('_project_to_2d') is not None
+            ):
                 try:
-                    projections = globals()['_project_to_2d']([v for v in mat])
+                    projections = globals()['_project_to_2d'](mat)
                     used = 'pca'
                 except Exception as e:
                     logger.debug('PCA helper failed during cache build: %s', e)
@@ -170,14 +258,18 @@ def build_map_cache():
                 projections = [(0.0, 0.0) for _ in missing_indices]
                 used = 'none'
 
+            del mat
+
             for idx, coord in zip(missing_indices, projections):
                 coords_by_id[str(items[idx]['item_id'])] = (float(coord[0]), float(coord[1]))
             if used_projection == 'none':
                 used_projection = used
-        except Exception as e:
-            logger.exception('Failed to compute missing projections: %s', e)
+        except Exception:
+            logger.exception('Failed to compute missing projections')
 
-    # Build full list of lightweight items and drop heavy embedding vectors
+    for it in items:
+        it.pop('embedding', None)
+
     full_light = []
     for it in items:
         iid = str(it['item_id'])
@@ -187,11 +279,12 @@ def build_map_cache():
             'embedding_2d': _round_coord(coord),
             'item_id': iid,
             'mood_vector': _pick_top_mood(it.get('mood_vector')),
-            'title': it.get('title') or ''
+            'title': it.get('title') or '',
         }
         full_light.append(light)
+    del items
+    gc.collect()
 
-    # create sampled versions
     n = len(full_light)
     frac_map = {'100': 1.0, '75': 0.75, '50': 0.5, '25': 0.25}
     new_cache = {}
@@ -201,12 +294,114 @@ def build_map_cache():
         js = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
         try:
             gz = gzip.compress(js)
+            entry = {'json_gzip_bytes': gz, 'projection': used_projection, 'count': len(sampled)}
         except Exception:
-            gz = None
-        new_cache[k] = {'json_bytes': js, 'json_gzip_bytes': gz, 'projection': used_projection, 'count': len(sampled)}
+            entry = {'json_bytes': js, 'projection': used_projection, 'count': len(sampled)}
+        else:
+            del js
+        new_cache[k] = entry
 
     MAP_JSON_CACHE = new_cache
-    logger.info('Map JSON cache built: %d total items; cache sizes: %s', n, {k: v['count'] for k, v in MAP_JSON_CACHE.items()})
+    MAP_SERVER_JSON_CACHE.clear()
+    _warm_server_buckets()
+    logger.info(
+        'Map JSON cache built: %d total items; cache sizes: %s',
+        n,
+        {k: v['count'] for k, v in MAP_JSON_CACHE.items()},
+    )
+
+
+def _translated_bucket(entry, server_id):
+    """A cached union bucket rewritten to ``server_id``'s provider ids, dropping
+    fp_/unmapped rows, and re-serialized + gzipped. None when the bucket is empty.
+
+    server_id None means the default server. Fails CLOSED on a registry error:
+    legacy provider ids stay as identity, fp_ ids are dropped, never leaked.
+    """
+    raw = entry.get('json_gzip_bytes')
+    raw = gzip.decompress(raw) if raw else entry.get('json_bytes')
+    if not raw:
+        return None
+    from tasks.mediaserver import registry
+    from tasks.simhash import is_fingerprint_id
+
+    payload = json.loads(raw)
+    items = payload.get('items') or []
+    ids = [it.get('item_id') for it in items if it.get('item_id')]
+    try:
+        mapping = registry.translate_ids(ids, server_id)
+    except Exception:
+        logger.exception('Map id translation failed; dropping fp_ rows to avoid a leak')
+        mapping = {i: i for i in ids if not is_fingerprint_id(i)}
+    kept = []
+    for it in items:
+        provider_id = mapping.get(it.get('item_id'))
+        if provider_id is None:
+            continue
+        it['item_id'] = provider_id
+        kept.append(it)
+    payload['items'] = kept
+    payload['count'] = len(kept)
+    js = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    try:
+        gz = gzip.compress(js)
+    except Exception:
+        return {'json_bytes': js, 'projection': payload.get('projection'), 'count': len(kept)}
+    return {'json_gzip_bytes': gz, 'projection': payload.get('projection'), 'count': len(kept)}
+
+
+def _warm_server_buckets():
+    """Precompute EVERY configured server's translated buckets (plus the default)
+    so the first /api/map for ANY server streams bytes instead of translating the
+    whole catalogue live. Runs at build time in the cache-build background thread.
+
+    Skipped for a legacy single-server install with no canonical ids, where the
+    zero-cost verbatim fast path already applies.
+    """
+    from tasks.mediaserver import registry
+
+    try:
+        needs = _catalogue_has_canonical_ids() or registry.has_secondary_servers()
+    except Exception:
+        logger.exception('Map pre-warm scope probe failed; warming defensively')
+        needs = True
+    if not needs:
+        return
+
+    try:
+        servers = registry.list_servers()
+    except Exception:
+        logger.exception('Map pre-warm could not list servers; warming default only')
+        servers = []
+    try:
+        default_id = registry.get_default_server_id()
+    except Exception:
+        default_id = None
+
+    def _warm(server_key, server_id):
+        for k, entry in MAP_JSON_CACHE.items():
+            try:
+                translated = _translated_bucket(entry, server_id)
+            except Exception:
+                logger.exception('Map pre-warm failed for server %s bucket %s', server_key, k)
+                continue
+            if translated is not None:
+                MAP_SERVER_JSON_CACHE[(server_key, k)] = translated
+
+    # None resolves to the default server, keyed '__default__' for requests with no
+    # ?server=. Each configured server is also warmed under its own id so an explicit
+    # ?server=<id> hits the cache; the default's own id reuses the '__default__' work
+    # (same translation target) rather than translating the whole catalogue twice.
+    _warm('__default__', None)
+    for server in servers:
+        sid = server['server_id']
+        if sid == default_id:
+            for k in MAP_JSON_CACHE:
+                mirror = MAP_SERVER_JSON_CACHE.get(('__default__', k))
+                if mirror is not None:
+                    MAP_SERVER_JSON_CACHE[(sid, k)] = mirror
+        else:
+            _warm(sid, sid)
 
 
 def init_map_cache():
@@ -219,11 +414,21 @@ def init_map_cache():
 
 @map_bp.route('/map')
 def map_ui():
-    """Serve the map UI page."""
-    resp = render_template('map.html', title = 'AudioMuse-AI - Music Map', active='map')
+    """
+    Music map UI page.
+    ---
+    tags:
+      - Map
+    summary: HTML page for the 2D music map (UMAP/projection of song embeddings).
+    responses:
+      200:
+        description: HTML page rendered with no-cache headers.
+    """
+    resp = render_template('map.html', title='AudioMuse-AI - Music Map', active='map')
     # Ensure the rendered page is not cached by browsers or intermediary caches.
     # We return a Response object below so Flask will set the appropriate headers.
     from flask import make_response
+
     response = make_response(resp)
     response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     response.headers['Pragma'] = 'no-cache'
@@ -231,52 +436,62 @@ def map_ui():
     return response
 
 
-def _fetch_genre_samples(conn, genre, limit):
-    cur = conn.cursor()
-    # mood_vector is stored as 'label:score,label2:score' so use ILIKE for simple match
-    try:
-        cur.execute("""
-            SELECT s.item_id, s.title, s.author, s.mood_vector, s.other_features, e.embedding
-            FROM score s
-            JOIN embedding e ON s.item_id = e.item_id
-            WHERE s.mood_vector ILIKE %s
-            LIMIT %s
-        """, (f"%{genre}%", limit))
-        rows = cur.fetchall()
-    finally:
-        cur.close()
-    return rows
-
-
-def _rows_to_items(rows):
-    items = []
-    for r in rows:
-        # r is a tuple-like from psycopg2; map by index to be robust
-        item_id = r[0]
-        title = r[1]
-        author = r[2]
-        mood_vector = r[3]
-        other_features = r[4]
-        embedding_blob = r[5]
-        if embedding_blob is None:
-            continue
-        emb = np.frombuffer(embedding_blob, dtype=np.float32)
-        items.append({
-            'item_id': item_id,
-            'title': title,
-            'author': author,
-            'mood_vector': mood_vector,
-            'other_features': other_features,
-            'embedding': emb
-        })
-    return items
+def _bucket_response(entry):
+    """Stream a precomputed bucket's bytes, honoring Accept-Encoding: gzip."""
+    accept_enc = request.headers.get('Accept-Encoding', '')
+    gz = entry.get('json_gzip_bytes')
+    if gz and 'gzip' in accept_enc.lower():
+        resp = Response(gz, mimetype='application/json; charset=utf-8')
+        resp.headers['Content-Encoding'] = 'gzip'
+        resp.headers['Content-Length'] = str(len(gz))
+    elif gz:
+        raw = gzip.decompress(gz)
+        resp = Response(raw, mimetype='application/json; charset=utf-8')
+        resp.headers['Content-Length'] = str(len(raw))
+    elif entry.get('json_bytes'):
+        raw = entry['json_bytes']
+        resp = Response(raw, mimetype='application/json; charset=utf-8')
+        resp.headers['Content-Length'] = str(len(raw))
+    else:
+        return jsonify({'items': [], 'projection': 'none'})
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 
 @map_bp.route('/api/map', methods=['GET'])
 def map_api():
-    """Return up to 2000 embeddings sampled across configured genres, projected to 2D.
-
-    Response: JSON list of items with title, artist, embedding_2d, mood_vector, other_feature
+    """
+    Music map data.
+    ---
+    tags:
+      - Map
+    summary: Return embeddings projected to 2D, sampled across configured genres, for the music-map UI.
+    description: |
+      Served exclusively from the in-memory `MAP_JSON_CACHE` built at startup
+      (or rebuilt via `/api/rebuild_map_cache`). Supports four sampling
+      buckets - 25/50/75/100 percent of the cached set - plus a legacy `n`
+      parameter that maps the closest bucket. Honors `Accept-Encoding: gzip`
+      when the cache contains a precompressed payload.
+    parameters:
+      - name: percent
+        in: query
+        schema:
+          type: string
+          enum: ["25", "50", "75", "100"]
+        description: Percentage bucket of cached items to return. Default 25.
+      - name: p
+        in: query
+        schema: { type: string }
+        description: Alias for `percent`.
+      - name: n
+        in: query
+        schema: { type: integer }
+        description: Legacy parameter - mapped to the nearest available bucket.
+    responses:
+      200:
+        description: JSON payload with `items` (each having `embedding_2d`, `title`, `author`, `mood_vector`, `other_features`) and `projection` name.
     """
     # Serve exclusively from the in-memory MAP_JSON_CACHE built at startup.
     # Accept either explicit percent param (?percent=25|50|75|100) or legacy ?n=<count>.
@@ -323,40 +538,83 @@ def map_api():
     if not entry:
         return jsonify({'items': [], 'projection': 'none'})
 
-    # Prefer serving gzip if the client accepts it and gzip bytes were built
-    accept_enc = request.headers.get('Accept-Encoding', '')
-    gz = entry.get('json_gzip_bytes')
-    if gz and 'gzip' in accept_enc.lower():
-        resp = Response(gz, mimetype='application/json; charset=utf-8')
-        resp.headers['Content-Encoding'] = 'gzip'
-        resp.headers['Content-Length'] = str(len(gz))
-        # Prevent browser from storing the map response beyond the page session.
-        resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-        resp.headers['Pragma'] = 'no-cache'
-        resp.headers['Expires'] = '0'
-        return resp
+    # Multi-server: filter the cached union per request. Single-server installs
+    # with no explicit selection keep the zero-cost pre-serialized path below.
+    try:
+        server_id = app_server_context.resolve_request_server_id()
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
+    from tasks.mediaserver import registry
 
-    # Fallback to plain JSON
-    resp = Response(entry['json_bytes'], mimetype='application/json; charset=utf-8')
-    resp.headers['Content-Length'] = str(len(entry['json_bytes']))
-    # Prevent browser from storing the map response beyond the page session.
-    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-    resp.headers['Pragma'] = 'no-cache'
-    resp.headers['Expires'] = '0'
-    return resp
+    # The legacy fast path streams score.item_id verbatim; that is safe only while
+    # ids are still legacy provider ids. Once the catalogue is canonicalized (fp_
+    # ids), or a secondary server exists, or a ?server= is selected, serve the
+    # per-server bucket instead: it is precomputed ONCE to that server's provider
+    # ids (fp_ dropped) and pre-gzipped, so every request streams bytes rather than
+    # re-translating the whole catalogue. ALL configured servers are warmed at build
+    # time; a lookup miss (a server added since the last build) builds+caches lazily.
+    if server_id is not None or registry.has_secondary_servers() or _catalogue_has_canonical_ids():
+        server_key = server_id or '__default__'
+        cached = MAP_SERVER_JSON_CACHE.get((server_key, pct))
+        if cached is None:
+            cached = _translated_bucket(entry, server_id)
+            if cached is None:
+                return jsonify({'items': [], 'projection': 'none'})
+            MAP_SERVER_JSON_CACHE[(server_key, pct)] = cached
+        return _bucket_response(cached)
+
+    return _bucket_response(entry)
 
 
 @map_bp.route('/api/map_cache_status', methods=['GET'])
 def map_cache_status():
-    """Return diagnostic information about the in-memory map JSON cache."""
+    """
+    Diagnostic info for the map cache.
+    ---
+    tags:
+      - Map
+    summary: Return per-bucket stats (count, payload size, projection algorithm) for the in-memory map cache.
+    responses:
+      200:
+        description: Cache summary.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ok:
+                  type: boolean
+                buckets:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    properties:
+                      count:
+                        type: integer
+                      json_bytes:
+                        type: integer
+                      projection:
+                        type: string
+                reason:
+                  type: string
+                  description: Set to `empty_cache` when no buckets exist.
+      500:
+        description: Internal error.
+    """
     try:
         if not MAP_JSON_CACHE:
             return jsonify({'ok': False, 'reason': 'empty_cache', 'buckets': {}})
         info = {}
         for k, v in MAP_JSON_CACHE.items():
-            info[k] = {'count': v.get('count', 0), 'json_bytes': len(v.get('json_bytes') or b''), 'projection': v.get('projection')}
+            payload = v.get('json_gzip_bytes') or v.get('json_bytes') or b''
+            info[k] = {
+                'count': v.get('count', 0),
+                'json_bytes': len(payload),
+                'projection': v.get('projection'),
+            }
         return jsonify({'ok': True, 'buckets': info}), 200
-    except Exception as e:
+    except Exception:
         # Log the full exception (including stack) for diagnostics, but do not expose
         # internal exception details to API clients.
         logger.exception('map_cache_status failed')
@@ -365,12 +623,32 @@ def map_cache_status():
 
 @map_bp.route('/api/rebuild_map_cache', methods=['POST'])
 def rebuild_map_cache():
-    """Trigger a synchronous rebuild of the in-memory cache. Useful for debugging.
-    Note: this reads the DB and may take time."""
+    """
+    Synchronously rebuild the map cache.
+    ---
+    tags:
+      - Map
+    summary: Re-read embeddings from the DB and rebuild every percent bucket.
+    description: Synchronous; can take a while on large libraries. Useful for debugging.
+    responses:
+      200:
+        description: Cache rebuilt successfully.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ok:
+                  type: boolean
+                message:
+                  type: string
+      500:
+        description: Internal error during rebuild.
+    """
     try:
         build_map_cache()
         return jsonify({'ok': True, 'message': 'map cache rebuilt'}), 200
-    except Exception as e:
+    except Exception:
         # Log the full exception for debugging, but return a generic error to the caller.
         logger.exception('rebuild_map_cache failed')
         return jsonify({'ok': False, 'error': 'Internal server error'}), 500

@@ -1,18 +1,43 @@
-# app_analysis.py
-from flask import Blueprint, jsonify, request
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""Flask blueprint for launching library analysis and database cleaning.
+
+Thin route layer that enqueues the long-running main tasks onto the high
+priority RQ queue and returns their job id for the UI to poll via the generic
+status routes in `app.py`.
+
+Main Features:
+* Routes: `/cleaning` page, `/api/analysis/start` (enqueues
+  `tasks.analysis.run_analysis_task`) and `/api/cleaning/start`.
+* Archives previously successful main tasks to REVOKED on a new start and
+  guards against a second concurrent main task via `get_active_main_task`.
+"""
+
+from flask import Blueprint, jsonify, request, render_template
 import uuid
 import logging
 
 # Import configuration from the main config.py
-from config import NUM_RECENT_ALBUMS, TOP_N_MOODS
+from config import NUM_RECENT_ALBUMS, TOP_N_MOODS, TASK_STATUS_PENDING, CLEANING_CATALOGUE
 
 # RQ import
 from rq import Retry
+
+# App helper functions
+from app_helper import rq_queue_high, save_task_status
+from database import clean_up_previous_main_tasks, get_active_main_task
 
 logger = logging.getLogger(__name__)
 
 # Create a Blueprint for analysis-related routes
 analysis_bp = Blueprint('analysis_bp', __name__)
+
 
 @analysis_bp.route('/cleaning', methods=['GET'])
 def cleaning_page():
@@ -29,8 +54,11 @@ def cleaning_page():
             schema:
               type: string
     """
-    from flask import render_template
-    return render_template('cleaning.html', title = 'AudioMuse-AI - Database Cleaning', active='cleaning')
+    return render_template(
+        'cleaning.html', title='AudioMuse-AI - Database Cleaning', active='cleaning',
+        cleaning_catalogue_default=CLEANING_CATALOGUE,
+    )
+
 
 @analysis_bp.route('/api/analysis/start', methods=['POST'])
 def start_analysis_endpoint():
@@ -80,21 +108,33 @@ def start_analysis_endpoint():
       500:
         description: Server error during task enqueue.
     """
-    # Local imports to prevent circular dependency at startup
-    from app_helper import rq_queue_high, clean_up_previous_main_tasks, save_task_status, TASK_STATUS_PENDING
+    # Check for any existing active main task to prevent parallel batch runs.
+    active_task = get_active_main_task()
+    if active_task:
+        return jsonify(
+            {
+                "error": "An active batch task is already in progress.",
+                "task_id": active_task['task_id'],
+                "status": active_task['status'],
+            }
+        ), 409
 
     data = request.json or {}
     # MODIFIED: Removed jellyfin_url, jellyfin_user_id, and jellyfin_token as they are no longer passed to the task.
     # The task now gets these details from the central config.
     num_recent_albums = int(data.get('num_recent_albums', NUM_RECENT_ALBUMS))
     top_n_moods = int(data.get('top_n_moods', TOP_N_MOODS))
-    logger.info(f"Starting analysis request: num_recent_albums={num_recent_albums}, top_n_moods={top_n_moods}")
+    logger.info(
+        f"Starting analysis request: num_recent_albums={num_recent_albums}, top_n_moods={top_n_moods}"
+    )
 
     job_id = str(uuid.uuid4())
 
     # Clean up details of previously successful or stale tasks before starting a new one
     clean_up_previous_main_tasks()
-    save_task_status(job_id, "main_analysis", TASK_STATUS_PENDING, details={"message": "Task enqueued."})
+    save_task_status(
+        job_id, "main_analysis", TASK_STATUS_PENDING, details={"message": "Task enqueued."}
+    )
 
     # Enqueue task using a string path to its function.
     # MODIFIED: The arguments passed to the task are updated to match the new function signature.
@@ -104,9 +144,12 @@ def start_analysis_endpoint():
         job_id=job_id,
         description="Main Music Analysis",
         retry=Retry(max=3),
-        job_timeout=-1 # No timeout
+        job_timeout=-1,  # No timeout
     )
-    return jsonify({"task_id": job.id, "task_type": "main_analysis", "status": job.get_status()}), 202
+    return jsonify(
+        {"task_id": job.id, "task_type": "main_analysis", "status": job.get_status()}
+    ), 202
+
 
 @analysis_bp.route('/api/cleaning/start', methods=['POST'])
 def start_cleaning_endpoint():
@@ -137,21 +180,45 @@ def start_cleaning_endpoint():
       500:
         description: Server error during task enqueue.
     """
-    # Local imports to prevent circular dependency at startup
-    from app_helper import rq_queue_high, clean_up_previous_main_tasks, save_task_status, TASK_STATUS_PENDING
+    # Cleaning is the ONE start that must also refuse while a sweep is running: both
+    # prune track_server_map, each against a snapshot of the server's catalogue taken
+    # minutes earlier, so an overlap lets cleaning delete the mappings the sweep just
+    # wrote. Every other task type may run alongside a sweep, so they keep the
+    # default exclusion.
+    active_task = get_active_main_task(exclude_task_types=())
+    if active_task:
+        return jsonify(
+            {
+                "error": "An active batch task is already in progress.",
+                "task_id": active_task['task_id'],
+                "status": active_task['status'],
+            }
+        ), 409
+
+    # Per-run opt-in: when the cleaning page's checkbox is ticked (or CLEANING_CATALOGUE
+    # is the env default) the task also DELETES catalogue rows bound to no server;
+    # otherwise it only unbinds each server's stale mappings.
+    data = request.get_json(silent=True) or {}
+    clean_catalogue = bool(data.get('clean_catalogue', CLEANING_CATALOGUE))
 
     # Clean up any previous cleaning tasks
     clean_up_previous_main_tasks()
 
     job_id = str(uuid.uuid4())
-    save_task_status(job_id, "cleaning", TASK_STATUS_PENDING, details={"message": "Database cleaning task enqueued."})
+    save_task_status(
+        job_id,
+        "cleaning",
+        TASK_STATUS_PENDING,
+        details={"message": "Database cleaning task enqueued."},
+    )
 
     # Enqueue combined cleaning task
     job = rq_queue_high.enqueue(
         'tasks.cleaning.identify_and_clean_orphaned_albums_task',
+        clean_catalogue,
         job_id=job_id,
         description="Database Cleaning (Identify and Delete Orphaned Albums)",
         retry=Retry(max=2),
-        job_timeout=-1 # No timeout
+        job_timeout=-1,  # No timeout
     )
     return jsonify({"task_id": job.id, "task_type": "cleaning", "status": job.get_status()}), 202

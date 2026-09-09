@@ -1,0 +1,1176 @@
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""First-run setup wizard routes, registered on the shared Flask ``app``.
+
+Attaches the ``/setup`` page and ``/api/setup*`` endpoints directly to the app
+from ``flask_app`` (no blueprint), persisting configuration through
+``tasks.setup_manager`` and triggering a config reload / restart via
+``restart_manager``.
+
+Main Features:
+* Reads and saves the wizard config (basic server + auth fields plus advanced
+  and lyrics-API fields), masking secrets and treating a blank secret as
+  "keep the stored value" except where blank has its own meaning.
+* Validates enum fields against fixed option sets, tests the media-server
+  connection, and lists provider libraries so the wizard can populate itself.
+"""
+
+import re
+import types
+import requests
+from flask import request, jsonify, render_template, make_response, after_this_request
+import config
+from flask_app import app
+from tasks.setup_manager import setup_manager
+from app_auth import check_setup_needed
+from ssrf_guard import validate_outbound_url
+import restart_manager
+import tasks.mediaserver as mediaserver
+from error import error_manager
+from error.error_manager import AudioMuseError
+from error.error_dictionary import (
+    ERR_MEDIASERVER_UNREACHABLE,
+    ERR_CONFIG_MEDIASERVER_CREDENTIALS,
+    ERR_DB_QUERY,
+)
+
+BASIC_SERVER_FIELDS = ["MEDIASERVER_TYPE"] + [
+    field for fields in config.MEDIASERVER_FIELDS_BY_TYPE.values() for field in fields
+]
+
+# Plex account-linking (plex.tv/link) proxy. plex.tv's PIN endpoints send no
+# CORS headers, so the browser can't call them directly; these constants back
+# the two /api/setup/plex/pin routes that proxy the request server-side.
+PLEX_PIN_API_BASE = "https://plex.tv/api/v2/pins"
+PLEX_PIN_PRODUCT = "AudioMuse-AI"
+PLEX_PIN_TIMEOUT = 30
+
+
+def _plex_pin_headers(client_id):
+    return {
+        "Accept": "application/json",
+        "X-Plex-Product": PLEX_PIN_PRODUCT,
+        "X-Plex-Version": str(config.APP_VERSION or ""),
+        "X-Plex-Client-Identifier": client_id,
+        "X-Plex-Device-Name": PLEX_PIN_PRODUCT,
+    }
+
+
+AUTH_FIELDS = ["AUTH_ENABLED", "AUDIOMUSE_USER", "AUDIOMUSE_PASSWORD", "API_TOKEN", "JWT_SECRET"]
+SECRET_FIELDS = {
+    "AUDIOMUSE_PASSWORD",
+    "API_TOKEN",
+    "JELLYFIN_TOKEN",
+    "EMBY_TOKEN",
+    "NAVIDROME_PASSWORD",
+    "PLEX_TOKEN",
+    "JWT_SECRET",
+    "AI_CHAT_DB_USER_PASSWORD",
+    "LYRICS_API_1_APIKEY_VALUE",
+    "LYRICS_API_2_APIKEY_VALUE",
+}
+# Secrets whose own blank-handling lives elsewhere: AUDIOMUSE_PASSWORD goes
+# through the admin-user path, JWT_SECRET blank means "auto-generate". Every
+# other secret treats a blank submission as "keep the stored value".
+BLANK_KEEP_EXCLUDED_SECRETS = {"AUDIOMUSE_PASSWORD", "JWT_SECRET"}
+BASIC_FIELDS = set(BASIC_SERVER_FIELDS + AUTH_FIELDS)
+
+LYRICS_API_CONFIG_FIELDS = [
+    'LYRICS_API_1_URL_TEMPLATE',
+    'LYRICS_API_1_ARTIST_PARAM',
+    'LYRICS_API_1_TITLE_PARAM',
+    'LYRICS_API_1_LYRICS_FIELD',
+    'LYRICS_API_1_APIKEY_PARAM',
+    'LYRICS_API_1_APIKEY_VALUE',
+    'LYRICS_API_1_TIMEOUT',
+    'LYRICS_API_2_URL_TEMPLATE',
+    'LYRICS_API_2_ARTIST_PARAM',
+    'LYRICS_API_2_TITLE_PARAM',
+    'LYRICS_API_2_LYRICS_FIELD',
+    'LYRICS_API_2_APIKEY_PARAM',
+    'LYRICS_API_2_APIKEY_VALUE',
+    'LYRICS_API_2_TIMEOUT',
+]
+
+# Advanced fields whose value must be one of a fixed set. The wizard renders
+# these as <select> dropdowns and the save path normalizes the value to the
+# canonical casing so legacy free-text entries (e.g. "DBSCAN") are cleaned up.
+ENUM_FIELD_OPTIONS = {
+    'AI_MODEL_PROVIDER': ['NONE', 'OLLAMA', 'OPENAI', 'GEMINI', 'MISTRAL'],
+    'CLUSTER_ALGORITHM': ['kmeans', 'dbscan', 'gmm', 'spectral'],
+    'PATH_DISTANCE_METRIC': ['angular', 'euclidean'],
+    'IVF_METRIC': ['angular', 'euclidean', 'dot'],
+}
+
+HIDDEN_ADVANCED_FIELDS = {
+    'DURATION_TOLERANCE_SECONDS',
+    'FPCALC_BINARY',
+    'CHROMAPRINT_MAX_ALIGN_OFFSET',
+    'CHROMAPRINT_MIN_OVERLAP',
+    'AI_BRAINSTORM_GENRE_SCORE_THRESHOLD',
+    'AI_BRAINSTORM_LYRIC_THEMES_MAX',
+    'AI_BRAINSTORM_POOL_FLOOR',
+    'AI_BRAINSTORM_RELAX_YEAR_PAD',
+    'AI_BRAINSTORM_SEED_ARTISTS_MAX',
+    'AI_BRAINSTORM_SIMILAR_ARTISTS_PER_SEED',
+    'AI_BRAINSTORM_SOUND_DESCRIPTIONS_MAX',
+    'AI_BRAINSTORM_USE_ARTIST_SEEDS',
+    'AI_CHAT_DB_USER_NAME',
+    'AI_CHAT_DB_USER_PASSWORD',
+    'AI_FALLBACK_GENRES',
+    'AI_NAMING_CANDIDATES',
+    'AI_NAMING_MAX_ATTEMPTS',
+    'AUDIOMUSE_CONTROL_HOST',
+    'AUDIOMUSE_CONTROL_PORT',
+    'AUDIOMUSE_CONTROL_SOCKET',
+    'AUDIOMUSE_PLATFORM',
+    'DATABASE_URL',
+    'DATABASE_TYPE',
+    'POSTGRES_USER',
+    'POSTGRES_PASSWORD',
+    'POSTGRES_HOST',
+    'POSTGRES_PORT',
+    'POSTGRES_DB',
+    'REDIS_URL',
+    'MEDIASERVER_FIELDS_BY_TYPE',
+    'MEDIASERVER_OBSOLETE_FIELDS_BY_TYPE',
+    'MEDIASERVER_CRED_KEY_BY_FIELD',
+    'SETUP_BOOTSTRAP_EXCLUDED_KEYS',
+    'CHROMAPRINT_BACKFILL_REPORT_SECONDS',
+    'MOOD_LABELS',
+    'APP_VERSION',
+    'TEMP_DIR',
+    'APP_DATA_DIR',
+    'CLAP_AUDIO_FMAX',
+    'CLAP_AUDIO_FMIN',
+    'CLAP_AUDIO_HOP_LENGTH',
+    'CLAP_AUDIO_MEL_TRANSPOSE',
+    'CLAP_AUDIO_N_FFT',
+    'CLAP_AUDIO_N_MELS',
+    'CLAP_CATEGORY_WEIGHTS',
+    'CLAP_CATEGORY_WEIGHTS_DEFAULT',
+    'CLAP_EMBEDDING_DIMENSION',
+    'CLAP_OTHER_FEATURES_REDIS_KEY',
+    'EMBEDDING_DIMENSION',
+    'INDEX_NAME',
+    'IVF_DISK_CACHE_DIR',
+    'IVF_QUERY_PARALLEL_MIN_VECTORS',
+    'LYRICS_WHISPER_MODEL_DIR',
+    'MINIBATCH_KMEANS_PROCESSING_BATCH_SIZE',
+    'OTHER_FEATURE_PREDOMINANCE_THRESHOLD_FOR_PURITY',
+    'PROBE_TOP_PLAYED_LIMIT',
+    'MIGRATION_MAX_COLLISION_DETAILS',
+    'MIGRATION_UNMATCHED_ALBUMS_PAYLOAD_LIMIT',
+    'QUEUE_TYPE',
+    'VOICE_VOCAB',
+    'MOOD_CENTROIDS_FILE',
+    'OTHER_FEATURE_LABELS',
+    'STRATIFIED_GENRES',
+    'TASK_STATUS_FAILURE',
+    'TASK_STATUS_PENDING',
+    'TASK_STATUS_PROGRESS',
+    'TASK_STATUS_REVOKED',
+    'TASK_STATUS_STARTED',
+    'TASK_STATUS_SUCCESS',
+    'TEMPO_MAX_BPM',
+    'TEMPO_MIN_BPM',
+    'USE_MINIBATCH_KMEANS',
+    'JWT_SECRET',
+    'HEADERS',
+    'LYRICS_DEFAULT_SAMPLE_RATE',
+    'LYRICS_DEFAULT_SEGMENT_DURATION',
+    'LYRICS_DEFAULT_TOPIC_EMBEDDING_CACHE_DIR',
+    'LYRICS_DEFAULT_TOPIC_EMBEDDING_MODEL',
+    'LYRICS_EMBEDDING_DIMENSION',
+    'LYRICS_GTE_MAX_TOKENS',
+    'LYRICS_INSTRUMENTAL_AXIS_FILL',
+    'LYRICS_INSTRUMENTAL_EMBEDDING',
+    'LYRICS_MAX_SONGS_TO_ANALYZE',
+    'LYRICS_MODEL_DIR',
+    'LYRICS_SUPPORTED_AUDIO_EXTENSIONS',
+    'LYRICS_VAD_MIN_SILENCE_MS',
+    'LYRICS_VAD_MIN_SPEECH_MS',
+    'LYRICS_VAD_NEG_THRESHOLD',
+    'LYRICS_VAD_RETRY_FLOOR',
+    'LYRICS_VAD_SPEECH_PAD_MS',
+    'LYRICS_VAD_THRESHOLD',
+    # Undocumented internals / quality gates that leaked into the wizard
+    'RADIUS_INSTRUMENTATION',
+    'ENERGY_MIN',
+    'ENERGY_MAX',
+    'CLAP_TEXT_SEARCH_WARMUP_DURATION',
+    'CLAP_TOP_QUERIES_COUNT',
+    'ALCHEMY_SUBTRACT_DISTANCE_ANGULAR',
+    'ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN',
+    'ALCHEMY_PLAYLIST_MAX_SONGS',
+    'ALCHEMY_PLAYLIST_MAX_CENTROIDS',
+    'ALCHEMY_MAX_ANCHOR_POINTS',
+    'DUPLICATE_DISTANCE_THRESHOLD_COSINE_LYRICS',
+    'SONIC_FINGERPRINT_CRON_PLAYLIST_NAME',
+    # Worker / queue / batch-orchestration infra knobs (operator-level)
+    'RQ_MAX_JOBS',
+    'RQ_MAX_JOBS_HIGH',
+    'RQ_LOGGING_LEVEL',
+    'MAX_QUEUED_ANALYSIS_JOBS',
+    'REBUILD_INDEX_BATCH_SIZE',
+    'DB_FETCH_CHUNK_SIZE',
+    'AUDIO_LOAD_TIMEOUT',
+    'ITERATIONS_PER_BATCH_JOB',
+    'MAX_CONCURRENT_BATCH_JOBS',
+    'CLUSTERING_BATCH_TIMEOUT_MINUTES',
+    'CLUSTERING_MAX_FAILED_BATCHES',
+    'CLUSTERING_BATCH_CHECK_INTERVAL_SECONDS',
+    # Pathfinding internals
+    'PATH_AVG_JUMP_SAMPLE_SIZE',
+    'PATH_CANDIDATES_PER_STEP',
+    'PATH_LCORE_MULTIPLIER',
+    # Lyrics API config fields are handled by the dedicated /api/setup/lyrics-api routes
+    'LYRICS_API_1_URL_TEMPLATE',
+    'LYRICS_API_1_ARTIST_PARAM',
+    'LYRICS_API_1_TITLE_PARAM',
+    'LYRICS_API_1_LYRICS_FIELD',
+    'LYRICS_API_1_APIKEY_PARAM',
+    'LYRICS_API_1_APIKEY_VALUE',
+    'LYRICS_API_1_TIMEOUT',
+    'LYRICS_API_2_URL_TEMPLATE',
+    'LYRICS_API_2_ARTIST_PARAM',
+    'LYRICS_API_2_TITLE_PARAM',
+    'LYRICS_API_2_LYRICS_FIELD',
+    'LYRICS_API_2_APIKEY_PARAM',
+    'LYRICS_API_2_APIKEY_VALUE',
+    'LYRICS_API_2_TIMEOUT',
+}
+
+TEST_CONFIG_KEYS = set(BASIC_SERVER_FIELDS + ['MUSIC_LIBRARIES'])
+
+
+def _normalize_config_value(key, value):
+    if isinstance(value, str) and hasattr(config, key):
+        default_value = getattr(config, key)
+        if isinstance(default_value, bool):
+            normalized = value.strip().lower()
+            if normalized in ('1', 'true', 'yes', 'on'):
+                return True
+            if normalized in ('0', 'false', 'no', 'off'):
+                return False
+        if key in ENUM_FIELD_OPTIONS:
+            stripped = value.strip()
+            for option in ENUM_FIELD_OPTIONS[key]:
+                if stripped.lower() == option.lower():
+                    return option
+            return stripped
+    return value
+
+
+def _merge_test_config(filtered_values):
+    test_config = {}
+    for key in TEST_CONFIG_KEYS:
+        if key in filtered_values:
+            value = filtered_values[key]
+            if key in SECRET_FIELDS and value == '********':
+                test_config[key] = getattr(config, key, '')
+            else:
+                test_config[key] = _normalize_config_value(key, value)
+        else:
+            test_config[key] = getattr(config, key, '')
+    if 'MEDIASERVER_TYPE' in test_config and isinstance(test_config['MEDIASERVER_TYPE'], str):
+        test_config['MEDIASERVER_TYPE'] = test_config['MEDIASERVER_TYPE'].lower()
+    return test_config
+
+
+def _patch_config_for_test(test_config):
+    original_config = {}
+    for key, value in test_config.items():
+        original_config[key] = getattr(config, key, None)
+        setattr(config, key, value)
+    return original_config
+
+
+def _restore_config(original_config):
+    for key, value in original_config.items():
+        setattr(config, key, value)
+
+
+def _test_media_server_connection(filtered_values):
+    test_config = _merge_test_config(filtered_values)
+    original_config = _patch_config_for_test(test_config)
+    try:
+        media_type = test_config.get('MEDIASERVER_TYPE', 'jellyfin')
+        result = mediaserver.test_connection() or {}
+        if not result.get('ok'):
+            raise AudioMuseError(
+                ERR_CONFIG_MEDIASERVER_CREDENTIALS
+                if result.get('auth_failed')
+                else ERR_MEDIASERVER_UNREACHABLE,
+                result.get('error')
+                or f"Could not reach {media_type.capitalize()}; check the URL and credentials.",
+            )
+        return {
+            'type': media_type,
+            'probe_count': result.get('sample_count') or 0,
+        }
+    except AudioMuseError:
+        raise
+    except ValueError as exc:
+        raise AudioMuseError(
+            ERR_CONFIG_MEDIASERVER_CREDENTIALS, str(exc), cause=exc
+        ) from exc
+    except Exception as exc:
+        raise AudioMuseError(
+            error_manager.classify(exc, ERR_MEDIASERVER_UNREACHABLE), str(exc), cause=exc
+        ) from exc
+    finally:
+        _restore_config(original_config)
+
+
+def _list_provider_libraries(filtered_values):
+    """List the music libraries a provider exposes, given in-flight wizard values.
+
+    Merges form values with the currently stored config (same fallback logic as
+    the test-connection flow, so secret placeholders use the saved value), then
+    calls ``mediaserver.list_libraries()``. Returns ``{libraries, unsupported}``.
+    """
+    test_config = _merge_test_config(filtered_values)
+    original_config = _patch_config_for_test(test_config)
+    try:
+        media_type = (test_config.get('MEDIASERVER_TYPE') or '').strip().lower() or 'jellyfin'
+        return mediaserver.list_libraries(provider_type=media_type)
+    finally:
+        _restore_config(original_config)
+
+
+def should_show_advanced(name):
+    if name in HIDDEN_ADVANCED_FIELDS:
+        return False
+    if name.startswith('POSTGRES_') or name.startswith('REDIS_'):
+        return False
+    if re.match(r'.*_STATS$', name):
+        return False
+    if re.match(r'.*_PATH$', name):
+        return False
+    return True
+
+
+def _get_allowed_setup_keys():
+    allowed_keys = set()
+    for f in setup_manager.get_all_fields(config):
+        if f['name'] in BASIC_FIELDS or should_show_advanced(f['name']):
+            allowed_keys.add(f['name'])
+    # Always allow the lyrics API config fields (hidden from advanced section
+    # but still user-editable via the dedicated Lyrics API section).
+    allowed_keys.update(LYRICS_API_CONFIG_FIELDS)
+    return allowed_keys
+
+
+def _has_admin_user():
+    """Return True if at least one admin exists in audiomuse_users."""
+    try:
+        from app_auth import count_admin_users
+
+        return count_admin_users() > 0
+    except Exception as exc:
+        app.logger.error(
+            'Failed to determine whether an admin exists during setup page render: %s',
+            exc,
+            exc_info=True,
+        )
+        return False
+
+
+@app.route('/setup')
+def setup_page():
+    """
+    Setup wizard UI page.
+    ---
+    tags:
+      - Setup
+    summary: HTML setup wizard for first-time configuration (server, lyrics, AI provider, etc.).
+    responses:
+      200:
+        description: HTML page rendered.
+    """
+    from config import LYRICS_ENABLED
+
+    return render_template(
+        'setup.html',
+        title='AudioMuse-AI - Setup Wizard',
+        active='setup',
+        lyrics_enabled=LYRICS_ENABLED,
+    )
+
+
+@app.route('/api/setup', methods=['GET', 'POST'])
+def setup_api():
+    """
+    Setup wizard API.
+    ---
+    tags:
+      - Setup
+    summary: GET returns the configurable field catalog; POST persists wizard values to the DB.
+    description: |
+      The GET response separates fields into `basic` and `advanced` lists,
+      hides values for inactive media-server types, and masks any field whose
+      name is in SECRET_FIELDS or ends with `_API_KEY`.
+
+      The POST body should contain `{key: value}` pairs for the keys returned
+      by GET. Empty strings on secret fields keep the previously stored value;
+      a literal `********` placeholder also preserves the stored value.
+    requestBody:
+      required: false
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    responses:
+      200:
+        description: Field catalog (GET) or save acknowledgement (POST).
+        content:
+          application/json:
+            schema:
+              type: object
+      400:
+        description: Validation error in submitted values.
+      500:
+        description: Database error while loading or saving config.
+    """
+    if request.method == 'GET':
+        all_fields = setup_manager.get_all_fields(config)
+        # Determine which media server fields belong to non-active types
+        # so their values are hidden from the UI.
+        active_server_type = config.MEDIASERVER_TYPE.strip().lower()
+        inactive_server_fields = set()
+        for stype, sfields in config.MEDIASERVER_FIELDS_BY_TYPE.items():
+            if stype != active_server_type:
+                inactive_server_fields.update(sfields)
+
+        basic_fields = []
+        advanced_fields = []
+        for f in all_fields:
+            if f['name'] in SECRET_FIELDS or f['name'].endswith('_API_KEY'):
+                f['secret'] = True
+                f['has_value'] = bool(f.get('value')) and f['name'] not in inactive_server_fields
+                f['value'] = ''
+            else:
+                f['secret'] = False
+                f['has_value'] = bool(f.get('overridden', False))
+
+            # Blank out values for non-active server fields
+            if f['name'] in inactive_server_fields:
+                f['value'] = ''
+                f['has_value'] = False
+                f['overridden'] = False
+
+            if f['name'] in ENUM_FIELD_OPTIONS:
+                f['options'] = list(ENUM_FIELD_OPTIONS[f['name']])
+
+            if f['name'] in BASIC_FIELDS:
+                basic_fields.append(f)
+            elif f['name'] == 'MUSIC_LIBRARIES':
+                # Rendered as a checkbox list next to the provider section,
+                # not as a free-text advanced field.
+                continue
+            elif should_show_advanced(f['name']):
+                advanced_fields.append(f)
+
+        music_libraries_value = config.MUSIC_LIBRARIES or ''
+
+        # Build lyrics API field dict: {name: {value, has_value, secret}}
+        lyrics_api_raw = setup_manager.get_raw_overrides(ensure_table=False)
+        lyrics_api_data = {}
+        for fname in LYRICS_API_CONFIG_FIELDS:
+            raw_val = lyrics_api_raw.get(fname) or str(getattr(config, fname, '') or '')
+            is_secret = fname in SECRET_FIELDS
+            if is_secret:
+                lyrics_api_data[fname] = {'has_value': bool(raw_val), 'value': '', 'secret': True}
+            else:
+                lyrics_api_data[fname] = {
+                    'has_value': bool(raw_val),
+                    'value': raw_val,
+                    'secret': False,
+                }
+
+        return jsonify(
+            {
+                'basic_fields': basic_fields,
+                'advanced_fields': advanced_fields,
+                'music_libraries': music_libraries_value,
+                'lyrics_api_fields': lyrics_api_data,
+                'setup_saved': not check_setup_needed(),
+                'has_admin_user': _has_admin_user(),
+            }
+        )
+
+    data = request.get_json(silent=True) or {}
+    config_values = data.get('config')
+    if not isinstance(config_values, dict):
+        return jsonify({'error': 'Missing config data'}), 400
+
+    allowed_setup_keys = _get_allowed_setup_keys()
+    filtered_values = {}
+    for key, value in config_values.items():
+        if not isinstance(key, str) or not key.isupper() or key not in allowed_setup_keys:
+            continue
+        filtered_values[key] = _normalize_config_value(key, value)
+
+    is_test_connection = bool(data.get('test_connection', False))
+    if not filtered_values and not is_test_connection:
+        return jsonify({'error': 'No valid configuration values were provided'}), 400
+
+    if not is_test_connection:
+        for key, value in filtered_values.items():
+            if (key in SECRET_FIELDS or key.endswith('_API_KEY')) and value == '********':
+                return jsonify(
+                    {
+                        'error': 'Placeholder secret values are not accepted on save. Enter the real secret or leave the field blank.'
+                    }
+                ), 400
+
+        # A blank secret means "keep the stored value" so re-saving the wizard
+        # (e.g. to add an API token) never wipes an already-configured
+        # password/token. Drop blanks before they reach the DB.
+        for key in list(filtered_values.keys()):
+            if key in BLANK_KEEP_EXCLUDED_SECRETS:
+                continue
+            if key in SECRET_FIELDS or key.endswith('_API_KEY'):
+                value = filtered_values[key]
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    del filtered_values[key]
+
+        # Validate any Lyrics API URL templates before persisting them.
+        for slot in (1, 2):
+            url_key = f'LYRICS_API_{slot}_URL_TEMPLATE'
+            if url_key in filtered_values:
+                url_val = str(filtered_values[url_key] or '').strip()
+                if url_val:
+                    is_safe, reason = validate_outbound_url(url_val)
+                    if not is_safe:
+                        return jsonify(
+                            {'error': f'Lyrics API slot {slot} URL is not allowed: {reason}'}
+                        ), 400
+
+    try:
+        if is_test_connection:
+            result = _test_media_server_connection(filtered_values)
+            return jsonify(
+                {
+                    'status': 'ok',
+                    'test_connection': True,
+                    'media_server': result['type'],
+                    'probe_count': result['probe_count'],
+                }
+            ), 200
+
+        new_server_type = filtered_values.get('MEDIASERVER_TYPE', config.MEDIASERVER_TYPE)
+        if isinstance(new_server_type, str):
+            new_server_type = new_server_type.strip().lower()
+        obsolete_fields = config.MEDIASERVER_OBSOLETE_FIELDS_BY_TYPE.get(new_server_type, [])
+
+        auth_val = filtered_values.get('AUTH_ENABLED')
+        auth_being_disabled = auth_val is False or (
+            isinstance(auth_val, str) and auth_val.strip().lower() in ('false', '0', 'no', 'off')
+        )
+
+        # The setup form collects the install-time admin via AUDIOMUSE_USER /
+        # AUDIOMUSE_PASSWORD, but we store admins in audiomuse_users, not in
+        # app_config. Pop them so they are never written to app_config.
+        new_admin_user = filtered_values.pop('AUDIOMUSE_USER', None)
+        new_admin_password = filtered_values.pop('AUDIOMUSE_PASSWORD', None)
+        if isinstance(new_admin_user, str):
+            new_admin_user = new_admin_user.strip()
+        if new_admin_password == '********':
+            new_admin_password = None
+
+        # Once an admin exists in audiomuse_users, the setup wizard is no
+        # longer allowed to touch admin credentials - users must be managed
+        # from the Users page. Silently drop any admin fields the form
+        # submitted; they were hidden in the UI but defense-in-depth.
+        if _has_admin_user():
+            new_admin_user = None
+            new_admin_password = None
+
+        # --- Pre-validate: simulate the post-save config state BEFORE touching the DB ---
+        simulated = types.SimpleNamespace()
+        for _name in vars(config):
+            if _name.isupper() and not _name.startswith('_'):
+                setattr(simulated, _name, getattr(config, _name))
+        for key in obsolete_fields:
+            setattr(simulated, key, '')
+        for key, value in filtered_values.items():
+            setattr(simulated, key, value)
+
+        if not setup_manager._is_valid_server_config(simulated):
+            return jsonify({'error': 'Cannot save: media server configuration is incomplete.'}), 400
+
+        # If auth will remain enabled we need an admin after the save. That
+        # admin must either already exist in audiomuse_users or be provided
+        # via the form (new_admin_user + new_admin_password).
+        from app_auth import count_admin_users, upsert_admin_user
+        from database import get_db
+
+        auth_will_be_enabled = not auth_being_disabled
+        if isinstance(simulated.AUTH_ENABLED, str):
+            auth_will_be_enabled = simulated.AUTH_ENABLED.strip().lower() == 'true'
+        else:
+            auth_will_be_enabled = bool(simulated.AUTH_ENABLED)
+        if auth_will_be_enabled:
+            try:
+                existing_admins = count_admin_users()
+            except Exception as exc:
+                app.logger.exception('Failed to count admin users during setup save')
+                err, status = error_manager.error_response(
+                    error_manager.classify(exc, ERR_DB_QUERY)
+                )
+                return jsonify(err), status
+            provided_admin = bool(new_admin_user and new_admin_password)
+            if existing_admins <= 0 and not provided_admin:
+                return jsonify(
+                    {'error': 'Cannot save: auth is enabled but no admin account was provided.'}
+                ), 400
+
+        # Validation passed - apply changes to the database
+        if obsolete_fields:
+            setup_manager.delete_config_values(obsolete_fields)
+        if auth_being_disabled:
+            setup_manager.delete_config_values(['API_TOKEN', 'JWT_SECRET'])
+            # Wipe all user accounts so disabling auth fully resets user
+            # state. Re-enabling auth requires re-creating them.
+            try:
+                db = get_db()
+                with db.cursor() as cur:
+                    cur.execute("DELETE FROM audiomuse_users")
+                db.commit()
+            except Exception as exc:
+                app.logger.error(
+                    'Failed to clear audiomuse_users on auth disable: %s', exc, exc_info=True
+                )
+        elif new_admin_user and new_admin_password:
+            try:
+                if count_admin_users() > 0:
+                    return jsonify({'error': 'Cannot save: an admin account already exists.'}), 400
+            except Exception as exc:
+                app.logger.error(
+                    'Unable to verify existing admin accounts before setup save: %s',
+                    exc,
+                    exc_info=True,
+                )
+                return jsonify(
+                    {
+                        'error': 'Unable to verify existing admin accounts. Check the server log and try again later.'
+                    }
+                ), 500
+            ok, err = upsert_admin_user(new_admin_user, new_admin_password)
+            if not ok:
+                return jsonify({'error': err or 'Failed to save admin account.'}), 400
+
+        # Media-server settings go to the music_servers registry, their ONLY
+        # persistent home; everything else still lands in app_config. The
+        # simulated post-save state (registry projection semantics) is what got
+        # validated above, so the split cannot diverge from it.
+        media_values = {
+            key: value for key, value in filtered_values.items()
+            if key in config.MEDIASERVER_CONFIG_KEYS
+        }
+        if media_values or new_server_type:
+            from tasks.mediaserver import registry as ms_registry
+
+            default_creds = {}
+            for field in config.MEDIASERVER_FIELDS_BY_TYPE.get(new_server_type, []):
+                cred_key = config.MEDIASERVER_CRED_KEY_BY_FIELD.get(field)
+                if cred_key:
+                    default_creds[cred_key] = str(
+                        media_values.get(field, getattr(config, field, '') or '')
+                    )
+            ms_registry.save_default_server_settings(
+                new_server_type,
+                default_creds,
+                music_libraries=media_values.get(
+                    'MUSIC_LIBRARIES', config.MUSIC_LIBRARIES or ''
+                ),
+            )
+
+        setup_manager.save_config_values(filtered_values)
+        config.refresh_config()
+
+        restart_manager.publish_restart_request()
+        restart_requested = True
+    except AudioMuseError as ae:
+        app.logger.error('Setup media server check failed: %s', ae, exc_info=ae.cause)
+        return jsonify(ae.to_dict()), error_manager.http_status_for_code(ae.code)
+    except Exception as exc:
+        app.logger.error('Setup save failed: %s', exc, exc_info=True)
+        if is_test_connection:
+            return jsonify(
+                {'error': 'Unable to get top player song. Check the server log for details.'}
+            ), 500
+        return jsonify(
+            {'error': 'Unable to save configuration. Check the server log for details.'}
+        ), 500
+
+    response = make_response(
+        jsonify(
+            {
+                'status': 'ok',
+                'saved_keys': list(filtered_values.keys()),
+                'restart_requested': restart_requested,
+            }
+        ),
+        200,
+    )
+
+    @after_this_request
+    def schedule_restart(response):
+        if restart_requested:
+            restart_manager.schedule_flask_restart()
+        return response
+
+    if config.AUTH_ENABLED:
+        response.delete_cookie('audiomuse_jwt', samesite='Strict', path='/')
+    return response
+
+
+@app.route('/api/setup/providers/libraries', methods=['POST'])
+def setup_provider_libraries_api():
+    """
+    List a media-server provider's libraries.
+    ---
+    tags:
+      - Setup
+    summary: Probe the configured media server with the in-flight form values and list its libraries.
+    description: |
+      Uses the in-flight form values (same shape as the test-connection
+      endpoint) so the wizard can populate the library checkbox list as soon
+      as the user has typed credentials. Secret placeholders (`********`)
+      fall back to the currently stored value.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              config:
+                type: object
+                additionalProperties: true
+                description: Subset of UPPERCASE setup keys (server URL, token, etc.).
+    responses:
+      200:
+        description: Library list (or `unsupported=true` for media servers that don't expose libraries).
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                libraries:
+                  type: array
+                  items:
+                    type: object
+                unsupported:
+                  type: boolean
+      400:
+        description: Missing config payload.
+      500:
+        description: Provider probe failed.
+    """
+    data = request.get_json(silent=True) or {}
+    config_values = data.get('config') or {}
+    if not isinstance(config_values, dict):
+        return jsonify({'error': 'Missing config data'}), 400
+
+    allowed_setup_keys = _get_allowed_setup_keys()
+    filtered_values = {}
+    for key, value in config_values.items():
+        if not isinstance(key, str) or not key.isupper() or key not in allowed_setup_keys:
+            continue
+        filtered_values[key] = _normalize_config_value(key, value)
+
+    try:
+        result = _list_provider_libraries(filtered_values)
+    except Exception as exc:
+        app.logger.error('setup_provider_libraries_api failed: %s', exc, exc_info=True)
+        return jsonify(
+            {'error': 'Unable to list libraries. Check the server log for details.'}
+        ), 500
+
+    return jsonify(
+        {
+            'libraries': result.get('libraries', []),
+            'unsupported': bool(result.get('unsupported', False)),
+        }
+    ), 200
+
+
+@app.route('/api/setup/plex/pin', methods=['POST'])
+def setup_plex_pin_create():
+    """
+    Start Plex account linking (plex.tv/link).
+    ---
+    tags:
+      - Setup
+    summary: Create a Plex PIN so the user can link their account and auto-fill the token.
+    description: |
+      Proxies ``POST https://plex.tv/api/v2/pins`` (plex.tv sends no CORS
+      headers, so the browser cannot call it directly). Returns the short
+      ``code`` the user types at plex.tv/link and the ``id`` used to poll for
+      the resulting token. The browser supplies a stable
+      ``X-Plex-Client-Identifier`` as ``client_id``; the same value must be
+      used when polling.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [client_id]
+            properties:
+              client_id:
+                type: string
+    responses:
+      200:
+        description: PIN created.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type: integer
+                code:
+                  type: string
+      400:
+        description: Missing client_id.
+      502:
+        description: Could not reach plex.tv.
+    """
+    data = request.get_json(silent=True) or {}
+    client_id = str(data.get('client_id') or '').strip()
+    if not client_id:
+        return jsonify({'error': 'client_id is required'}), 400
+
+    try:
+        resp = requests.post(
+            PLEX_PIN_API_BASE,
+            headers=_plex_pin_headers(client_id),
+            data={'strong': 'false'},
+            timeout=PLEX_PIN_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        app.logger.exception('Plex PIN creation failed')
+        return jsonify({'error': 'Unable to reach Plex to start linking. Check the server log.'}), 502
+
+    pin_id = payload.get('id')
+    code = payload.get('code')
+    if not pin_id or not code:
+        return jsonify({'error': 'Plex did not return a linking code.'}), 502
+    return jsonify({'id': pin_id, 'code': code}), 200
+
+
+@app.route('/api/setup/plex/pin/<pin_id>', methods=['GET'])
+def setup_plex_pin_poll(pin_id):
+    """
+    Poll a Plex PIN for the linked account token.
+    ---
+    tags:
+      - Setup
+    summary: Check whether the user has finished linking at plex.tv/link and return the token.
+    description: |
+      Proxies ``GET https://plex.tv/api/v2/pins/<id>`` using the same
+      ``client_id`` (``X-Plex-Client-Identifier``) that created the PIN.
+      ``token`` is ``null`` until the user has entered the code and accepted.
+    parameters:
+      - in: path
+        name: pin_id
+        required: true
+        schema:
+          type: integer
+      - in: query
+        name: client_id
+        required: true
+        schema:
+          type: string
+    responses:
+      200:
+        description: Link status; ``token`` is null until linking completes.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token:
+                  type: string
+                  nullable: true
+      400:
+        description: Missing client_id or non-numeric PIN id.
+      502:
+        description: Could not reach plex.tv.
+    """
+    client_id = str(request.args.get('client_id') or '').strip()
+    if not client_id:
+        return jsonify({'error': 'client_id is required'}), 400
+    # PIN ids are numeric; reject anything else so it can't alter the plex.tv path.
+    if not str(pin_id).isdigit():
+        return jsonify({'error': 'Invalid PIN id'}), 400
+
+    try:
+        resp = requests.get(
+            f'{PLEX_PIN_API_BASE}/{pin_id}',
+            headers=_plex_pin_headers(client_id),
+            timeout=PLEX_PIN_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        app.logger.exception('Plex PIN poll failed')
+        return jsonify({'error': 'Unable to reach Plex while checking link status.'}), 502
+
+    # The browser polls this URL repeatedly; no-store stops it serving a stale
+    # "token is still null" response from cache once linking completes.
+    poll_response = jsonify({'token': payload.get('authToken')})
+    poll_response.headers['Cache-Control'] = 'no-store'
+    return poll_response, 200
+
+
+@app.route('/api/setup/lyrics-api/analyze', methods=['POST'])
+def setup_lyrics_api_analyze():
+    """
+    Probe a third-party lyrics API URL.
+    ---
+    tags:
+      - Setup
+    summary: Call a sample lyrics-API URL, detect its query params, and return the JSON response so the wizard can map fields.
+    description: |
+      SSRF-guarded: only `http`/`https` URLs targeting public hosts are
+      allowed. The endpoint returns auto-detected guesses for the artist,
+      title, and api-key parameter names plus the parsed response body so
+      the user can pick the lyrics field.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [example_url]
+            properties:
+              example_url:
+                type: string
+                example: "https://api.example.com/lyrics?artist=RHCP&track=By+the+Way"
+    responses:
+      200:
+        description: Parsed sample response and detected parameter roles.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                params:
+                  type: object
+                guesses:
+                  type: object
+                  properties:
+                    artist_param:
+                      type: string
+                    title_param:
+                      type: string
+                    apikey_param:
+                      type: string
+                    lyrics_field:
+                      type: string
+                json_obj:
+                  type: object
+                raw_json:
+                  type: string
+                error:
+                  type: string
+      400:
+        description: Missing/invalid URL or SSRF guard rejected the destination.
+      500:
+        description: Network error or non-JSON response.
+    """
+    import urllib.parse
+    import urllib.request
+    import json as _json
+    import ssl
+
+    data = request.get_json(silent=True) or {}
+    example_url = str(data.get('example_url') or '').strip()
+    if not example_url:
+        return jsonify({'error': 'example_url is required'}), 400
+
+    # Validate scheme and destination safety (SSRF guard)
+    is_safe_url, unsafe_reason = validate_outbound_url(example_url)
+    if not is_safe_url:
+        return jsonify({'error': unsafe_reason}), 400
+
+    # Parse query params
+    try:
+        parsed = urllib.parse.urlparse(example_url)
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        flat_params = {k: v[0] if len(v) == 1 else ','.join(v) for k, v in qs.items()}
+    except Exception:
+        return jsonify({'error': 'Invalid URL'}), 400
+
+    # Auto-detect likely roles for each query param
+    _ARTIST = {'artist', 'artist_name', 'artistname', 'ar', 'singer', 'performer', 'band'}
+    _TITLE = {
+        'track',
+        'track_name',
+        'trackname',
+        'title',
+        'song',
+        'song_name',
+        't',
+        'name',
+        's',
+        'q',
+    }
+    _APIKEY = {
+        'apikey',
+        'api_key',
+        'key',
+        'token',
+        'access_token',
+        'api_token',
+        'usertoken',
+        'user_token',
+    }
+    guesses = {
+        'artist_param': None,
+        'title_param': None,
+        'apikey_param': None,
+        'lyrics_field': None,
+        'path_roles': {},
+    }
+    for pname in flat_params:
+        plow = pname.lower().replace('-', '_')
+        if plow in _ARTIST and not guesses['artist_param']:
+            guesses['artist_param'] = pname
+        elif plow in _TITLE and not guesses['title_param']:
+            guesses['title_param'] = pname
+        elif plow in _APIKEY and not guesses['apikey_param']:
+            guesses['apikey_param'] = pname
+
+    # Detect dynamic path segments for path-based APIs. We surface every non-empty path segment
+    # except obvious API-prefix or verb tokens (e.g. ``api``, ``v1``, ``get``, ``search``,
+    # ``lyrics``) so short artist/title segments without spaces are still presented for role
+    # assignment in the wizard. If the query string already provides both artist and title, we
+    # don't need any path roles at all and drop the segments entirely to avoid confusing the
+    # user with stray dropdowns.
+    _PATH_PREFIX_RE = re.compile(r'^(?:api|v\d+|api[-_]?v\d+)$', re.IGNORECASE)
+    _PATH_VERBS = {
+        'get',
+        'search',
+        'lookup',
+        'find',
+        'fetch',
+        'query',
+        'lyrics',
+        'lyric',
+        'song',
+        'songs',
+        'track',
+        'tracks',
+        'artist',
+        'artists',
+        'album',
+        'albums',
+        'public',
+        'rest',
+    }
+    path_parts = [p for p in parsed.path.split('/') if p]
+    path_segments = []
+    if not (guesses['artist_param'] and guesses['title_param']):
+        for idx, part in enumerate(path_parts):
+            decoded = urllib.parse.unquote_plus(part)
+            if _PATH_PREFIX_RE.match(decoded):
+                continue
+            if decoded.lower() in _PATH_VERBS:
+                continue
+            path_segments.append({'index': idx, 'value': decoded})
+
+    # For path-based APIs without artist/title query params, the convention is
+    # ``/.../<artist>/<title>`` -- guess the last two surfaced segments accordingly.
+    if not guesses['artist_param'] and not guesses['title_param'] and len(path_segments) >= 2:
+        guesses['path_roles'][path_segments[-2]['index']] = 'artist'
+        guesses['path_roles'][path_segments[-1]['index']] = 'title'
+    elif not guesses['title_param'] and not guesses['artist_param'] and len(path_segments) == 1:
+        guesses['path_roles'][path_segments[-1]['index']] = 'title'
+
+    # Call the URL
+    http_error = None
+    raw_text = None
+    json_obj = None
+    elapsed_ms = None
+    try:
+        req = urllib.request.Request(example_url, headers={'Accept': 'application/json'})
+        try:
+            ctx = ssl.create_default_context()
+        except Exception:
+            ctx = None
+        import time as _time
+
+        _t0 = _time.monotonic()
+        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+            raw_bytes = resp.read(512 * 1024)
+        elapsed_ms = (_time.monotonic() - _t0) * 1000
+        raw_text = raw_bytes.decode('utf-8', errors='replace')
+    except Exception:
+        app.logger.exception("Lyrics API analyze request failed")
+        http_error = 'request_failed'
+
+    if raw_text:
+        try:
+            json_obj = _json.loads(raw_text)
+        except Exception:
+            pass
+
+    # Auto-detect lyrics field by common names + string length heuristic
+    _LYRICS_NAMES = {
+        'lyrics',
+        'plainlyrics',
+        'syncedlyrics',
+        'lyric',
+        'lyricbody',
+        'text',
+        'words',
+        'content',
+        'translation',
+    }
+    if isinstance(json_obj, dict):
+
+        def _find_lyrics(obj, prefix=''):
+            if guesses['lyrics_field'] or not isinstance(obj, dict):
+                return
+            for k, v in obj.items():
+                path = (prefix + '.' + k) if prefix else k
+                if (
+                    k.lower().replace('_', '').replace('-', '') in _LYRICS_NAMES
+                    and isinstance(v, str)
+                    and len(v) > 20
+                ):
+                    guesses['lyrics_field'] = path
+                    return
+                elif isinstance(v, dict):
+                    _find_lyrics(v, path)
+
+        _find_lyrics(json_obj)
+
+    display_raw = (raw_text or '')[:16384] + ('...' if raw_text and len(raw_text) > 16384 else '')
+    return jsonify(
+        {
+            'params': flat_params,
+            'path_segments': path_segments,
+            'guesses': guesses,
+            'json_obj': json_obj,
+            'raw_json': display_raw,
+            'elapsed_ms': round(elapsed_ms) if elapsed_ms is not None else None,
+            'error': 'Failed to fetch or parse the API response.' if http_error else None,
+        }
+    ), 200

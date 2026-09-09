@@ -4,28 +4,80 @@ document.addEventListener('DOMContentLoaded', function() {
     const mainContent = document.querySelector('.main-content');
 
     // The menu is now positioned off-screen by default via CSS.
-    // This script just handles the open/close classes.
+    // This script handles the open/close classes plus focus/ARIA state so the
+    // off-screen sidebar isn't tabbable and screen readers know its state.
+
+    const focusFirstInSidebar = () => {
+        const first = sidebar.querySelector('a, button');
+        if (first) first.focus();
+    };
+
+    // Keep the toggle's aria-expanded in sync and make the off-screen sidebar
+    // unreachable (inert removes it from tab order + a11y tree; aria-hidden is a
+    // fallback for engines without inert support).
+    const setSidebarA11y = (isOpen) => {
+        if (menuToggle) menuToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+        if (isOpen) {
+            sidebar.removeAttribute('inert');
+            sidebar.removeAttribute('aria-hidden');
+        } else {
+            sidebar.setAttribute('inert', '');
+            sidebar.setAttribute('aria-hidden', 'true');
+        }
+    };
+
+    // Fixed elements attach to the LAYOUT viewport: under pinch-zoom the
+    // visual viewport pans away from it and the open menu's bottom edge
+    // appears mid-screen. While open, pin the sidebar to the visual viewport.
+    const syncSidebarToVisualViewport = () => {
+        if (!window.visualViewport) return;
+        if (!sidebar.classList.contains('open')) {
+            sidebar.style.top = '';
+            sidebar.style.left = '';
+            sidebar.style.height = '';
+            return;
+        }
+        const vv = window.visualViewport;
+        sidebar.style.top = vv.offsetTop + 'px';
+        sidebar.style.left = vv.offsetLeft + 'px';
+        sidebar.style.height = vv.height + 'px';
+    };
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', syncSidebarToVisualViewport);
+        window.visualViewport.addEventListener('scroll', syncSidebarToVisualViewport);
+    }
 
     // Function to open the menu
-    const openMenu = () => {
+    const openMenu = ({ focus = true } = {}) => {
         sidebar.classList.add('open');
         mainContent.classList.add('sidebar-open');
         document.documentElement.classList.add('sidebar-open');
         localStorage.setItem('menuOpen', 'true');
+        setSidebarA11y(true);
+        syncSidebarToVisualViewport();
+        if (focus) focusFirstInSidebar();
     };
 
     // Function to close the menu
-    const closeMenu = () => {
+    const closeMenu = ({ returnFocus = false } = {}) => {
         sidebar.classList.remove('open');
         mainContent.classList.remove('sidebar-open');
         document.documentElement.classList.remove('sidebar-open');
         localStorage.setItem('menuOpen', 'false');
+        setSidebarA11y(false);
+        syncSidebarToVisualViewport();
+        if (returnFocus && menuToggle) menuToggle.focus();
     };
 
-    // Sync classes if menu was opened by FOUC prevention script
+    // Sync classes if menu was opened by FOUC prevention script (don't steal
+    // focus on load); otherwise mark the closed sidebar inert.
     if (document.documentElement.classList.contains('sidebar-open')) {
         sidebar.classList.add('open');
         mainContent.classList.add('sidebar-open');
+        setSidebarA11y(true);
+        syncSidebarToVisualViewport();
+    } else {
+        setSidebarA11y(false);
     }
 
     // Event listener for the menu toggle button
@@ -48,15 +100,23 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 
-    // Display App Version from meta tag
-    const versionMeta = document.querySelector('meta[name="app-version"]');
-    if (versionMeta && versionMeta.content) {
-        const appVersion = versionMeta.content;
-        const versionElement = document.createElement('div');
-        versionElement.className = 'app-version'; // For styling
-        versionElement.textContent = `AudioMuse-AI - Version ${appVersion}`;
-        sidebar.appendChild(versionElement);
-    }
+    // Escape closes the menu and returns focus to the toggle
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && sidebar.classList.contains('open')) {
+            closeMenu({ returnFocus: true });
+        }
+    });
+
+    // --- Submenu accordion toggle ---
+    document.querySelectorAll('.has-submenu > .submenu-toggle').forEach(toggle => {
+        toggle.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const parent = toggle.closest('.has-submenu');
+            const isOpen = parent.classList.toggle('open');
+            toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+        });
+    });
 
     /* --- Dark Mode Logic --- */
     const darkModeToggle = document.getElementById('dark-mode-toggle');
@@ -109,18 +169,4 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
-    // Logout button (only present when auth is enabled)
-    const logoutBtn = document.getElementById('logout-btn');
-    if (logoutBtn) {
-        logoutBtn.addEventListener('click', async (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            try {
-                await fetch('/logout', { method: 'POST' });
-            } catch (_) {
-                // Ignore network errors — proceed to redirect anyway
-            }
-            window.location.href = '/login';
-        });
-    }
 });

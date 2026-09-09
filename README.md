@@ -1,7 +1,15 @@
 ![GitHub license](https://img.shields.io/github/license/neptunehub/AudioMuse-AI.svg)
 ![Latest Tag](https://img.shields.io/github/v/tag/neptunehub/AudioMuse-AI?label=latest-tag)
-![Media Server Support: Jellyfin 10.11.3, Navidrome 0.58.0, LMS v3.69.0, Lyrion 9.0.2, Emby 4.9.1.80](https://img.shields.io/badge/Media%20Server-Jellyfin%2010.11.3%2C%20Navidrome%200.58.0%2C%20LMS%20v3.69.0%2C%20Lyrion%209.0.2%2C%20Emby%204.9.1.80-blue?style=flat-square&logo=server&logoColor=white)
+![Media Server Support: Navidrome 0.62.0, Jellyfin 12.0, LMS v3.69.0, Lyrion 9.0.2, Emby 4.9.1.80, Plex 1.43.2](https://img.shields.io/badge/Media%20Server-Navidrome%200.62.0%2C%20Jellyfin%2012.0%2C%20LMS%20v3.69.0%2C%20Lyrion%209.0.2%2C%20Emby%204.9.1.80%2C%20Plex%201.43.2-blue?style=flat-square&logo=server&logoColor=white)
+<a href="https://www.bestpractices.dev/projects/13329"><img src="https://www.bestpractices.dev/projects/13329/badge"></a>
 
+<p align="center">
+<strong>⭐ Leave a star on this project:</strong> One shines alone; together, they make it visible and keep it alive.
+</p>
+
+<p align="center">
+💛 <a href="https://liberapay.com/NeptuneHub/donate">Donate</a> to shape AudioMuse-AI future by supporting AI licenses, homelab infrastructure, and continuous development.
+</p>
 
 # **AudioMuse-AI - Where Music Takes Shape** 
 
@@ -9,62 +17,74 @@
   <img src="screenshot/AM-AI-MAP.png?raw=true" alt="AudioMuse-AI Logo" width="480">
 </p>
 
+AudioMuse-AI is an opensource and self-hosted tool that uses sonic analysis to rediscover forgotten songs in your music library and generate groove-aware playlists that also capture the meaning behind each track, without relying on metadata or external APIs.
 
-AudioMuse-AI is an open-source, Dockerized environment that brings **automatic playlist generation** to your self-hosted music library. Using tools such as [Librosa](https://github.com/librosa/librosa) and [ONNX](https://onnx.ai/), it performs **sonic analysis** on your audio files locally, allowing you to curate playlists for any mood or occasion without relying on external APIs.
+You can run it locally with Docker Compose or Podman, deploy it at scale in a Kubernetes cluster (**AMD64** and **ARM64** supported), or use native applications available for **macOS, Windows, and Linux**. It integrates with major self-hosted music servers including [Navidrome](https://www.navidrome.org/), [Jellyfin](https://jellyfin.org), [LMS](https://github.com/epoupon/lms/tree/master), [Lyrion](https://lyrion.org/), [Emby](https://emby.media), and [Plex](https://www.plex.tv/), with more integrations planned.
 
-Deploy it easily on your local machine with Docker Compose or Podman, or scale it in a Kubernetes cluster (supports **AMD64** and **ARM64**). It integrates with the main music servers' APIs such as [Jellyfin](https://jellyfin.org), [Navidrome](https://www.navidrome.org/), [LMS](https://github.com/epoupon/lms/tree/master), [Lyrion](https://lyrion.org/), and [Emby](https://emby.media). More integrations may be added in the future.
+> **Prefer not to self-host?** [Elestio](https://elest.io/open-source/audiomuse-ai) offers AudioMuse-AI as a managed cloud service, and their [YouTube video](https://www.youtube.com/watch?v=Ow89q6gQ1mM) is a good introduction to the project and its features.
 
 AudioMuse-AI lets you explore your music library in innovative ways, just **start with an initial analysis**, and you’ll unlock features like:
+* **Multiple Music Servers** (from `v3.0.0`): connect several media servers - any mix of Navidrome, Jellyfin, LMS, Lyrion, Emby and Plex - to a **single AudioMuse-AI deployment**. Built-in duplicate detection recognizes the same song across servers, so each track is **analyzed only once** and every server shares the result.
 * **Clustering**: Automatically groups sonically similar songs, creating genre-defying playlists based on the music's actual sound.
-* **Instant Playlists**: Simply tell the AI what you want to hear—like "high-tempo, low-energy music" and it will instantly generate a playlist for you.
+* **Instant Playlists**: Simply tell the AI what you want to hear-like "high-tempo, low-energy music" and it will instantly generate a playlist for you.
 * **Music Map**: Discover your music collection visually with a vibrant, genre-based 2D map.
 * **Playlist from Similar Songs**: Pick a track you love, and AudioMuse-AI will find all the songs in your library that share its sonic signature, creating a new discovery playlist.
 * **Song Paths**: Create a seamless listening journey between two songs. AudioMuse-AI finds the perfect tracks to bridge the sonic gap.
 * **Sonic Fingerprint**: Generates playlists based on your listening habits, finding tracks similar to what you've been playing most often.
 * **Song Alchemy**: Mix your ideal vibe, mark tracks as "ADD" or "SUBTRACT" to get a curated playlist and a 2D preview. Export the final selection directly to your media server.
 * **Text Search**: search your song with simple text that can contains mood, instruments and genre like calm piano songs.
+* **Lyrics Search**: search your library by theme, story or meaning, like love songs, not just the sound.
 
-More information like [ARCHITECTURE](docs/ARCHITECTURE.md), [ALGORITHM DESCRIPTION](docs/ALGORITHM.md), [DEPLOYMENT STRATEGY](docs/DEPLOYMENT.md), [FAQ](docs/FAQ.md), [GPU DEPLOYMENT](docs/GPU.md), [HARDWARE REQUIREMENTS](docs/HARDWARE.md), [CONFIGURATION PARAMETERS](docs/PARAMETERS.md) [AUTHENTICATION](docs/AUTH.md) and can be found in the [docs folder](docs).
+> **Lyrics language support:** the Lyrics Search feature works only with the **72 languages** listed below.
+>
+> <details>
+> <summary>Show the 72 supported languages</summary>
+>
+> Afrikaans, Albanian, Arabic, Armenian, Azerbaijani, Basque, Belarusian, Bengali, Bulgarian, Burmese, Catalan, Chinese, Croatian, Czech, Danish, Dutch, English, Estonian, Finnish, French, Galician, Georgian, German, Greek, Gujarati, Haitian Creole, Hebrew, Hindi, Hungarian, Icelandic, Indonesian, Italian, Japanese, Javanese, Kannada, Kazakh, Khmer, Korean, Lao, Latvian, Lithuanian, Macedonian, Malay, Malayalam, Marathi, Mongolian, Nepali, Norwegian, Persian, Polish, Portuguese, Punjabi, Romanian, Russian, Serbian, Sinhala, Slovak, Slovenian, Somali, Spanish, Swahili, Swedish, Tagalog, Tamil, Telugu, Thai, Turkish, Ukrainian, Urdu, Vietnamese, Welsh, Yoruba.
+>
+> </details>
 
-**The full list or AudioMuse-AI related repository are:** 
+More information can be found in the [docs folder](docs): [ARCHITECTURE](docs/ARCHITECTURE.md), [ALGORITHM DESCRIPTION](docs/ALGORITHM.md), [MULTIPLE MUSIC SERVERS](docs/MULTI_SERVER.md), [DEPLOYMENT STRATEGY](docs/DEPLOYMENT.md), [NAVIDROME SETUP](docs/NAVIDROME.md), [GPU DEPLOYMENT](docs/GPU.md), [CONFIGURATION PARAMETERS](docs/PARAMETERS.md), [AUTHENTICATION](docs/AUTH.md), [PLUGINS](docs/PLUGIN.md), [ERROR CODES](docs/ERROR_CODES.md) and [FAQ](docs/FAQ.md).
+
+**The full list of AudioMuse-AI related repository are:** 
   > * [AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI): the core application, it run Flask and Worker containers to actually run all the feature;
   > * [AudioMuse-AI Helm Chart](https://github.com/NeptuneHub/AudioMuse-AI-helm): helm chart for easy installation on Kubernetes;
-  > * [AudioMuse-AI Plugin for Jellyfin](https://github.com/NeptuneHub/audiomuse-ai-plugin): Jellyfin Plugin;
   > * [AudioMuse-AI Plugin for Navidrome](https://github.com/NeptuneHub/AudioMuse-AI-NV-plugin): Navidrome Plugin;
+  > * [AudioMuse-AI Plugin for Jellyfin](https://github.com/NeptuneHub/audiomuse-ai-plugin): Jellyfin Plugin;
+  > * [lyrion-audiomuseai-plugin](https://github.com/JameZUK/lyrion-audiomuseai-plugin): Unofficial Lyrion Plugin by [JameZUK](https://github.com/JameZUK);
   > * [AudioMuse-AI MusicServer](https://github.com/NeptuneHub/AudioMuse-AI-MusicServer): Open Subosnic like Music Sever with integrated sonic functionality.
 
 And now just some **NEWS:**
-> * **Version 0.9.0** introduce the new DCLAP model, for a faster analysis. **IMPORTANT**: it need to start from a clean db and a new analysis. Learn more on the release note.
-> * **Version 0.8.13** introduce the authentication layer. It start initially disabled by default. Learn more on the release note.
+> * **Version 3.0.0** added multiple music server support on a single deployment, with duplicate detection so a song shared by more servers is analyzed only once.
+> * **Version 2.6.0** added support for third party plugin. Give a look to the [plugin documentation](docs/PLUGIN.md) to know how to develop one and to the [official 3rd party catalog](https://github.com/NeptuneHub/AudioMuse-AI-plugins). The plugin system requires a persistent volume mounted on both the Flask and worker containers, otherwise installed plugins are lost whenever the containers restart; the deployment example has been updated accordingly.
+> * **Version 2.5.0** added Plex Music Server support.
 
 ## Disclaimer
 
-**Important:** Despite the similar name, this project (**AudioMuse-AI**) is an independent, community-driven effort. It has no official connection to the website audiomuse.ai.
+> [!IMPORTANT]
+> Despite the similar name, this project (**AudioMuse-AI**) is an independent, community-driven effort. It has no official connection to the website audiomuse.ai.
 
 We are **not affiliated with, endorsed by, or sponsored by** the owners of `audiomuse.ai`.
 
 ## **Table of Contents**
 
-- [Quick Start Deployment](#quick-start-deployment)
+- [Quick Start Deployment (Containerized)](#quick-start-deployment-containerized)
+- [Native Deployment](#native-deployment)
 - [Hardware Requirements](#hardware-requirements)
 - [Docker Image Tagging Strategy](#docker-image-tagging-strategy)
-- [Key Technologies](#key-technologies)
 - [How To Contribute](#how-to-contribute)
+- [Code Mirror](#code-mirror)
 - [Star History](#star-history)
 
-## Quick Start Deployment
+## Quick Start Deployment (Containerized)
 
-Get AudioMuse-AI running in minutes with Docker Compose. 
+Get AudioMuse-AI running in minutes with Docker Compose. For more deployment examples see the [DEPLOYMENT](docs/DEPLOYMENT.md) page.
 
-If you need more deployment example take a look at [DEPLOYMENT](docs/DEPLOYMENT.md) page.
-
-For a full list of configuration parameter take a look at [PARAMETERS](docs/PARAMETERS.md) page.
-
-For the architecture design of AudioMuse-AI, take a look to the [ARCHITECTURE](docs/ARCHITECTURE.md) page.
+From `v1.0.0`, only PostgreSQL, Redis and `TZ` are configured via environment variables. Everything else is managed through the browser Setup Wizard and persisted in the database (legacy environment variables are imported automatically on first startup). The Setup Wizard is the landing page of a clean installation and stays available under Administration > Setup Wizard.
 
 **Prerequisites:**
 * Docker and Docker Compose installed
-* A running media server (Jellyfin, Navidrome, Lyrion, or Emby)
+* A running media server (Navidrome, Jellyfin, Lyrion, Emby, or Plex)
 * See [Hardware Requirements](#hardware-requirements)
 
 **Steps:**
@@ -74,93 +94,113 @@ For the architecture design of AudioMuse-AI, take a look to the [ARCHITECTURE](d
    cp deployment/.env.example deployment/.env
    ```
 
-2. **Edit `.env` with your media server credentials:**
-   
-   **For Jellyfin:**
+   You can customize the setup by editing `deployment/.env` before startup. As a minimum, it is suggested to change the default database user and password, but you can also override other PostgreSQL and Redis connection parameters if needed:
+
    ```env
-   MEDIASERVER_TYPE=jellyfin
-   JELLYFIN_URL=http://your-jellyfin-server:8096
-   JELLYFIN_USER_ID=your-user-id
-   JELLYFIN_TOKEN=your-api-token
-   ```
-   
-   **For Navidrome:**
-   ```env
-   MEDIASERVER_TYPE=navidrome
-   NAVIDROME_URL=http://your-navidrome-server:4533
-   NAVIDROME_USER=your-username
-   NAVIDROME_PASSWORD=your-password
-   ```
-   
-   **For Lyrion:**
-   ```env
-   MEDIASERVER_TYPE=lyrion
-   LYRION_URL=http://your-lyrion-server:9000
+   POSTGRES_PASSWORD=your-secure-password
    ```
 
-   **For Emby:**
-   ```env
-   MEDIASERVER_TYPE=emby
-   EMBY_URL=http://your-emby-server:8096
-   EMBY_USER_ID=your-user-id
-   EMBY_TOKEN=your-api-token
-   ```
-
-3. **Start the services:**
+2. **Start the services:**
    ```bash
    docker compose -f deployment/docker-compose.yaml up -d
    ```
-> Remember to get the correct version for your Music Server.
 
-> docker-compose.yaml is for Jellyfin.
-> You also have docker-compose-navidrome.yaml, docker-compose-lyrion.yaml, dokcer-compose-emby.yaml
+3. **Access the application:**
+   - Web UI: `http://localhost:8000`
+   - Interactive API documentation (Swagger UI): `http://localhost:8000/apidocs/`
+     (when authentication is enabled, log in via the Web UI first - `/apidocs/`
+     is gated by the same JWT cookie as the rest of the app.)
 
-> Other example are for advanced deployment.
-4. **Access the application:**
-   Open your browser at `http://localhost:8000`
-
-5. **Run your first analysis:**
+4. **Run your first analysis:**
    - Navigate to "Analysis and Clustering" page
    - Click "Start Analysis" to scan your library
    - Wait for completion, then explore features like clustering and music map
 
-**Stopping the services:**
+5. **Stopping the services:**
 ```bash
 docker compose -f deployment/docker-compose.yaml down
 ```
+> [!IMPORTANT]
+> AudioMuse-AI is designed to work with PostgreSQL v15 as in the deployment example. Different versions could cause errors.
 
-> NOTE: by default AudioMuse-AI is deployed WITHOUT authentication layer and its suited only for LOCAL deployment. If you want to configure it have a look to the  [AUTHENTICATION](docs/AUTH.md) docs. If you enable the Authentication Layer, you need to be sure that any plugin used support and use the AudioMuse-AI API TOKEN
+## Native Deployment
+
+Prefer not to use Docker? We ship native packages for **macOS, Linux and Windows**, attached to each [release](https://github.com/NeptuneHub/AudioMuse-AI/releases). Each bundles the whole stack (embedded PostgreSQL, Redis, web UI and workers), so you don't need Docker or an external database. Once started, open **http://127.0.0.1:8000**.
+
+> The apps are not signed, so your OS may warn you on first launch, see the per-platform notes below for how to allow them.
+
+<details>
+<summary><b>macOS</b> - Apple Silicon, <code>AudioMuse-AI-arm64.zip</code> (from <code>v2.1.2</code>)</summary>
+
+- Unzip and move `AudioMuse-AI.app` to `/Applications`.
+- Remove the quarantine flag (the app is unsigned), either way:
+  - **Terminal:** `xattr -dr com.apple.quarantine /Applications/AudioMuse-AI.app`, then double-click - the icon appears in your menu bar.
+  - **No Terminal:** double-click and dismiss the warning, then System Settings → Privacy & Security → "Open Anyway", authenticate, and launch again.
+- Runs only on Apple Silicon (ARM) on recent macOS (tested on macOS 15.3.1, Mac Mini M4 / 16 GB).
+
+**Files:** data (database, Redis, temp audio) in `~/Library/AudioMuse-AI`, log at `~/Library/Logs/AudioMuse-AI/audiomuse.log`
+</details>
+
+<details>
+<summary><b>Linux</b> - x86_64 / arm64, <code>.deb</code> or <code>.rpm</code> (from <code>v2.1.3</code>)</summary>
+  
+- **Install as root** (writes to `/opt` and the system app/service dirs):
+  - Debian/Ubuntu: `sudo dpkg -i AudioMuse-AI-<arch>-linux.deb` (where `<arch>` is `x86_64` or `aarch64`)
+  - Fedora/RHEL: `sudo rpm -i AudioMuse-AI-<arch>-linux.rpm` (where `<arch>` is `x86_64` or `aarch64`)
+- **Run as your normal user** (never with `sudo`/root - it stores data in your home and won't start as root):
+  - `audiomuse-ai start` (stop with `audiomuse-ai stop`), or auto-start on login with `systemctl --user enable --now audiomuse-ai`.
+- Verified on **Debian 12 (bookworm)** (glibc 2.36). The `.rpm` is the same payload, expected to work on recent Fedora / RHEL 9, but too old for RHEL/Rocky/Alma 8 (glibc 2.28). Feedback on RPM-based distros is welcome.
+
+**Files** (under the launching user's home): data (database, Redis, temp audio) in `~/.local/share/AudioMuse-AI`, log at `~/.local/state/AudioMuse-AI/logs/audiomuse.log` (newest entries first)
+</details>
+
+<details>
+<summary><b>Windows</b> - x86_64, <code>AudioMuse-AI-amd64-windows.zip</code> (from <code>v2.1.4</code>)</summary>
+
+- Unzip the portable archive anywhere.
+- From a terminal you can start with `AudioMuse-AI.exe start` and stop with `AudioMuse-AI.exe stop`.
+- Runs only on x86_64 (Intel/AMD) on Windows 10/11.
+
+**Files:** data (database, Redis, temp audio) in `%LOCALAPPDATA%\AudioMuse-AI`, log at `%LOCALAPPDATA%\AudioMuse-AI\logs\audiomuse.log` (newest entries first)
+</details>
+
+> [!IMPORTANT]
+> Before updating a native version, first stop any running instance.
 
 ## **Hardware Requirements**
-
 AudioMuse-AI has been tested on:
 * **Intel**: HP Mini PC with Intel i5-6500, 16 GB RAM and NVMe SSD
 * **ARM**: Raspberry Pi 5, 8 GB RAM and NVMe SSD / Mac Mini M4 16GB / Amphere based VM with 4core 8GB ram
 
-Suggested requirements:
+**Minimum requirements:**
 * CPU: 4-core Intel with AVX2 support (usually produced in 2015 or later) or ARM
-* 8 GB RAM
-* NVME SSD storage
-
-You can check the [Tested Hardware and Configuration](docs/HARDWARE.md) notes to see which hardware has already been validated.
+* RAM: 8 GB RAM
+* DISK: NVME SSD storage
 
 For more information about the GPU deployment requirements have a look to the [GPU](docs/GPU.md) page.
+
+> [!IMPORTANT]
+> If you use virtualization (e.g. Proxmox), make sure to pass through the host CPU. QEMU's virtual CPU lacks AVX2 support, which will prevent AudioMuse-AI from starting.
 
 ## **Docker Image Tagging Strategy**
 
 Our GitHub Actions workflow automatically builds and publishes Docker images with the following tags:
 
 * **`:latest`**
-  Stable build from the **main** branch.
-  **Recommended for most users.**
-
-* **`:devel`**
-  Development build from the **devel** branch.
-  May be unstable — **for testing and development only.**
+  Last released image.
+  **Use it for automatic update.**
 
 * **`:X.Y.Z`** (e.g. `:1.0.0`, `:0.1.4-alpha`)
   Immutable images built from **Git release tags**.
-  **Ideal for reproducible or pinned deployments.**
+  **Recommended for most users. Pinned deployments: you decide when to update by changing the version manually.**
+
+* **`:devel`**
+  Build from main on each commit/pr merged. It's a less stable build.
+  **Recommended only for testing and early adopters.**
+
+* **`:pr-<NUMBER>`** (e.g. `:pr-661`)
+  Build generated for a specific open **pull request** (non-draft), to preview its changes before they are merged.
+  **For reviewing and testing that single PR**
 
 * **`-noavx2`** variants
   Experimental images for CPUs **without AVX2 support**, using legacy dependencies.
@@ -170,24 +210,8 @@ Our GitHub Actions workflow automatically builds and publishes Docker images wit
   Images that support the use of GPU for both Analysis and Clustering.
   **Not recommended** for old GPU.
 
-
-## **Key Technologies**
-
-AudioMuse AI is built upon a robust stack of open-source technologies:
-
-* [**Flask:**](https://flask.palletsprojects.com/) Provides the lightweight web interface for user interaction and API endpoints.  
-* [**Redis Queue (RQ):**](https://redis.io/glossary/redis-queue/) A simple Python library for queueing jobs and processing them in the background with Redis.
-* [**Supervisord:**](https://supervisord.org/) Supervisor is a client/server system that allows its users to monitor and control a number of processes on UNIX-like operating systems.
-* [**MusiCNN (Music Convolutional Neural Network)**](https://github.com/jordipons/musicnn) Open-source MusiCNN models exported directly to ONNX for feature extraction and mood prediction (used from v4.0.0, replaces Essentia-exported models).
-* [**Librosa**](https://github.com/librosa/librosa) Library for audio analysis, feature extraction, and music information retrieval. (used from version v0.6.0-beta)
-* [**LAION CLAP (Contrastive Language-Audio Pretraining)**](https://github.com/LAION-AI/CLAP) Neural network for audio-text matching, enabling natural language music search and text-based playlist generation.
-* [**Distilled CLAP (DCLAP)**](https://github.com/NeptuneHub/AudioMuse-AI-DCLAP) Distilled lightweight version of LAION CLAP.
-* [**ONNX**](https://onnx.ai/) Open Neural Network Exchange format and [ONNX Runtime](https://onnxruntime.ai/) for fast, portable, cross-platform model inference. **(Used from v0.7.0-beta, replaces TensorFlow)**
-* [**scikit-learn**](https://scikit-learn.org/) Utilized for machine learning algorithms:
-* [**voyager**](https://github.com/spotify/voyager) Approximate Nearest Neighbors used for the /similarity interface. Used from v0.6.3-beta
-* [**PostgreSQL:**](https://www.postgresql.org/) A powerful, open-source relational database used for persisting:  
-* [**Ollama**](https://ollama.com/) Enables self-hosting of various open-source Large Language Models (LLMs) for tasks like intelligent playlist naming.
-* [**Docker / OCI-compatible Containers**](https://www.docker.com/) – The entire application is packaged as a container, ensuring consistent and portable deployment across environments.
+> Versioning is Major.Minor.Patch release. Eventually (rare) model change that could require a new analysis could happen in Major and Minor release.
+> Read the [release note](https://github.com/NeptuneHub/AudioMuse-AI/releases) before any update especially for Major and Minor release.
 
 ## **How To Contribute**
 
@@ -195,6 +219,13 @@ Contributions, issues, and feature requests are welcome\!
 
 For more details on how to contribute please follow the [Contributing Guidelines](https://github.com/NeptuneHub/AudioMuse-AI/blob/main/CONTRIBUTING.md)
 
+## **Code Mirror**
+
+[AudioMuse-AI](https://github.com/NeptuneHub/AudioMuse-AI) repository code is mirrored here:
+- https://codeberg.org/NeptuneHub/AudioMuse-AI
+
+DO **NOT** USE MIRROR TO RAISE ISSUE, PR OTHER ACTION DIFFERENT FROM GET THE CODE
+
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=NeptuneHub/AudioMuse-AI&type=Timeline)](https://www.star-history.com/#NeptuneHub/AudioMuse-AI&Timeline)
+[![Star History Chart](https://api.star-history.com/chart?repos=NeptuneHub/AudioMuse-AI&type=timeline&legend=top-left&sealed_token=oboYMbCJkpe8KvUSebREbwjZryhBdJj-2_Jo8sL510B3MzPE7IqJ9f5Rdw2W4yrMc6fljMQOW8g7KfLln5azqiAP_7_V6rl2aeJwfjvKtETBcz2wgmwBvlNU9S2REZJhNDHUrZeUFZ7AwP9Izh_0DlJVEmPLUE34-To1JEk4rYnUKj2QSQvI-_h5pJXf)](https://www.star-history.com/?type=timeline&repos=NeptuneHub%2FAudioMuse-AI)

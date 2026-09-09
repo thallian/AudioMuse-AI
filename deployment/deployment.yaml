@@ -9,16 +9,6 @@ metadata:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: jellyfin-credentials
-  namespace: playlist
-type: Opaque
-stringData:
-  user_id: "YOUR-JF-USER-ID" # Your Jellyfin User ID for example 0e45c44b3e2e4da7a2be11a72a1c8575
-  api_token: "YOUR-JF-API-TOKEN" # Your Jellyfin API Token for example e0b8c325bc1b426c81922b90c0aa2ff1
----
-apiVersion: v1
-kind: Secret
-metadata:
   name: postgres-credentials
   namespace: playlist
 type: Opaque
@@ -28,38 +18,14 @@ stringData:
   POSTGRES_DB: "audiomusedb" # As used in app.py
 ---
 apiVersion: v1
-kind: Secret
-metadata:
-  name: gemini-api-credentials
-  namespace: playlist
-type: Opaque
-stringData:
-  GEMINI_API_KEY: "YOUR_GEMINI_API_KEY_HERE" # Replace with your actual Gemini API Key
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: audiomuse-ai-auth
-  namespace: playlist
-stringData:
-  AUDIOMUSE_USER: ""
-  AUDIOMUSE_PASSWORD: ""
-  API_TOKEN: ""
-  JWT_SECRET: ""
----
-
 kind: ConfigMap
 metadata:
   name: audiomuse-ai-config
   namespace: playlist
 data:
-  MEDIASERVER_TYPE: "jellyfin"
-  JELLYFIN_URL: "YOUR-JF-URL" # For example http://jellyfin.192.168.3.131.nip.io:8087
   POSTGRES_HOST: "postgres-service.playlist" # Database host
   POSTGRES_PORT: "5432" # Database port
   REDIS_URL: "redis://redis-service.playlist:6379/0"
-  CLAP_ENABLED: "true" # Enable CLAP text search (set to "false" for slower systems)
-  TEMP_DIR: "/app/temp_audio" # Updated to match code changes
   # Timezone applied inside containers. Default is UTC but you may set this in the ConfigMap or via deployment overrides
   TZ: "UTC"
 ---
@@ -86,6 +52,12 @@ spec:
       containers:
       - name: master
         image: redis:7-alpine # Lightweight Redis image
+        env:
+        - name: TZ
+          valueFrom:
+            configMapKeyRef:
+              name: audiomuse-ai-config
+              key: TZ
         resources:
           limits:
             cpu: 2000m
@@ -152,6 +124,12 @@ spec:
         imagePullPolicy: "IfNotPresent"
         ports:
         - containerPort: 5432
+        env:
+        - name: TZ
+          valueFrom:
+            configMapKeyRef:
+              name: audiomuse-ai-config
+              key: TZ
         envFrom:
         - secretRef:
             name: postgres-credentials
@@ -184,8 +162,28 @@ spec:
     targetPort: 5432
   type: ClusterIP # Internal service
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: audiomuse-ai-flask-headless
+  namespace: playlist
+  labels:
+    app: audiomuse-ai
+    component: flask
+spec:
+  # Headless governing service required by the flask StatefulSet. External access
+  # still goes through the audiomuse-ai-flask-service LoadBalancer below.
+  clusterIP: None
+  selector:
+    app: audiomuse-ai
+    component: flask
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: audiomuse-ai-flask
   namespace: playlist
@@ -193,6 +191,7 @@ metadata:
     app: audiomuse-ai
     component: flask
 spec:
+  serviceName: audiomuse-ai-flask-headless
   replicas: 1
   selector:
     matchLabels:
@@ -222,17 +221,6 @@ spec:
             configMapKeyRef:
               name: audiomuse-ai-config
               key: TZ
-        # --- Load Jellyfin Credentials from Secret ---
-        - name: JELLYFIN_USER_ID
-          valueFrom:
-            secretKeyRef:
-              name: jellyfin-credentials
-              key: user_id
-        - name: JELLYFIN_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: jellyfin-credentials
-              key: api_token
         # --- Load PostgreSQL Credentials from Secret ---
         - name: POSTGRES_USER
           valueFrom:
@@ -249,7 +237,7 @@ spec:
             secretKeyRef:
               name: postgres-credentials
               key: POSTGRES_DB
-        # --- Load non-sensitive DB parts and other config from ConfigMap ---
+        # --- Load non-sensitive DB parts from ConfigMap ---
         - name: POSTGRES_HOST
           valueFrom:
             configMapKeyRef:
@@ -260,18 +248,10 @@ spec:
             configMapKeyRef:
               name: audiomuse-ai-config
               key: POSTGRES_PORT
-        # --- Load Gemini API Key from Secret ---
-        - name: GEMINI_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: gemini-api-credentials
-              key: GEMINI_API_KEY
-        # --- Load all other environment variables from the ConfigMap ---
+        # --- Load minimal connection configuration from the ConfigMap ---
         envFrom:
         - configMapRef:
             name: audiomuse-ai-config
-        - secretRef:
-            name: audiomuse-ai-auth
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -280,9 +260,24 @@ spec:
         volumeMounts:
         - name: app-temp-audio
           mountPath: /app/temp_audio
+        - name: plugins-storage
+          mountPath: /app/plugin/installed
       volumes:
       - name: app-temp-audio
         emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: plugins-storage
+    spec:
+      # This flask pod's own plugins volume (code + pip deps). The database holds
+      # only the plugin registry plus a re-download URL, so a fresh pod re-downloads
+      # and reinstalls (logged as a warning). ReadWriteOnce per pod, no RWX needed.
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: 2Gi
+      # storageClassName: "your-storage-class"
 ---
 apiVersion: v1
 kind: Service
@@ -302,8 +297,8 @@ spec:
     targetPort: 8000 # Container port (what the app listens on)
   type: LoadBalancer # Or NodePort/ClusterIP depending on your K3S setup
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: v1
+kind: Service
 metadata:
   name: audiomuse-ai-worker
   namespace: playlist
@@ -311,7 +306,29 @@ metadata:
     app: audiomuse-ai
     component: worker
 spec:
-  replicas: 3 # Scale as needed. Each replica runs both a high-priority and a default-priority worker process.
+  # Headless service required by the worker StatefulSet, so each worker pod keeps a
+  # stable identity and therefore reattaches to the same plugins PVC across restarts.
+  # Workers only make outbound connections (to redis and postgres); the port is a
+  # placeholder and nothing listens on it.
+  clusterIP: None
+  selector:
+    app: audiomuse-ai
+    component: worker
+  ports:
+  - name: none
+    port: 9999
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: audiomuse-ai-worker
+  namespace: playlist
+  labels:
+    app: audiomuse-ai
+    component: worker
+spec:
+  serviceName: audiomuse-ai-worker
+  replicas: 1 # Scale as needed. Each replica runs a high-priority and a default-priority worker process, and gets its own plugins PVC.
   selector:
     matchLabels:
       app: audiomuse-ai
@@ -338,17 +355,6 @@ spec:
             configMapKeyRef:
               name: audiomuse-ai-config
               key: TZ
-        # --- Load Jellyfin Credentials from Secret ---
-        - name: JELLYFIN_USER_ID
-          valueFrom:
-            secretKeyRef:
-              name: jellyfin-credentials
-              key: user_id
-        - name: JELLYFIN_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: jellyfin-credentials
-              key: api_token
         # --- Load PostgreSQL Credentials from Secret ---
         - name: POSTGRES_USER
           valueFrom:
@@ -365,7 +371,7 @@ spec:
             secretKeyRef:
               name: postgres-credentials
               key: POSTGRES_DB
-        # --- Load non-sensitive DB parts and other config from ConfigMap ---
+        # --- Load non-sensitive DB parts from ConfigMap ---
         - name: POSTGRES_HOST
           valueFrom:
             configMapKeyRef:
@@ -376,18 +382,10 @@ spec:
             configMapKeyRef:
               name: audiomuse-ai-config
               key: POSTGRES_PORT
-        # --- Load Gemini API Key from Secret ---
-        - name: GEMINI_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: gemini-api-credentials
-              key: GEMINI_API_KEY
-        # --- Load all other environment variables from the ConfigMap ---
+        # --- Load minimal connection configuration from the ConfigMap ---
         envFrom:
         - configMapRef:
             name: audiomuse-ai-config
-        - secretRef:
-            name: audiomuse-ai-auth
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:
@@ -396,6 +394,22 @@ spec:
         volumeMounts:
         - name: app-temp-audio
           mountPath: /app/temp_audio
+        - name: plugins-storage
+          mountPath: /app/plugin/installed
       volumes:
       - name: app-temp-audio
         emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: plugins-storage
+    spec:
+      # One plugins PVC per worker pod: each worker installs its plugins (code + pip
+      # deps) into its own volume and reuses it across restarts. The database holds
+      # only the registry plus a re-download URL, so a fresh pod re-downloads and
+      # reinstalls (logged as a warning). ReadWriteOnce per pod, no RWX needed.
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: 2Gi
+      # storageClassName: "your-storage-class"

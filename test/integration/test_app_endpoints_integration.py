@@ -1,0 +1,188 @@
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""Endpoint tests against a real seeded Postgres database.
+
+Spins up an ephemeral Postgres (or a supplied DSN), seeds the score and
+embedding tables, and drives the score and embedding lookup endpoints through
+their real DB queries.
+
+Main Features:
+* Seeded lookups return rows and missing ids return 404.
+* Injection-style item ids are handled safely via parameterized SQL.
+"""
+
+import os
+import sys
+import tempfile
+import types
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pytest
+from flask import Flask
+
+_REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..'))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+try:
+    import psycopg2
+except Exception:  # pragma: no cover - psycopg2 is in test/requirements.txt
+    psycopg2 = None
+
+
+_SCORE_DDL = (
+    "CREATE TABLE score (item_id TEXT PRIMARY KEY, title TEXT, author TEXT, "
+    "album TEXT, album_artist TEXT, tempo REAL, key TEXT, scale TEXT, "
+    "mood_vector TEXT, energy REAL, other_features TEXT, year INTEGER, "
+    "rating INTEGER, file_path TEXT)"
+)
+_EMBEDDING_DDL = (
+    "CREATE TABLE embedding (item_id TEXT PRIMARY KEY, embedding BYTEA, "
+    "FOREIGN KEY (item_id) REFERENCES score (item_id) ON DELETE CASCADE)"
+)
+
+_INJECTION_ID = "x'; DROP TABLE score; --"
+
+
+@pytest.fixture(scope='session')
+def pg_dsn():
+    if psycopg2 is None:
+        pytest.skip("psycopg2 not importable")
+    dsn = os.environ.get('AUDIOMUSE_TEST_DATABASE_URL')
+    if dsn:
+        try:
+            psycopg2.connect(dsn).close()
+        except Exception as e:
+            pytest.skip(f"AUDIOMUSE_TEST_DATABASE_URL not reachable: {e}")
+        yield dsn
+        return
+    try:
+        import pgserver
+    except Exception:
+        pytest.skip(
+            "No test database. Set AUDIOMUSE_TEST_DATABASE_URL to a disposable "
+            "DB, or `pip install pgserver` for an ephemeral local instance."
+        )
+    data_dir = tempfile.mkdtemp(prefix='audiomuse_pg_')
+    server = pgserver.get_server(data_dir)
+    try:
+        yield server.get_uri()
+    finally:
+        server.cleanup()
+
+
+@pytest.fixture
+def endpoints_db(pg_dsn):
+    conn = psycopg2.connect(pg_dsn)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS embedding")
+        cur.execute("DROP TABLE IF EXISTS score CASCADE")
+        cur.execute(_SCORE_DDL)
+        cur.execute(_EMBEDDING_DDL)
+        cur.execute(
+            "INSERT INTO score (item_id, title, author) VALUES (%s, %s, %s)",
+            ('track-1', 'Hello', 'Adele'),
+        )
+        vec = np.array([0.1, 0.2, 0.3], dtype=np.float32).tobytes()
+        cur.execute(
+            "INSERT INTO embedding (item_id, embedding) VALUES (%s, %s)",
+            ('track-1', psycopg2.Binary(vec)),
+        )
+    yield conn
+    conn.close()
+
+
+def _import_app_external():
+    if 'app_external' in sys.modules:
+        return sys.modules['app_external']
+    fake_vm = types.ModuleType('tasks.ivf_manager')
+    fake_vm.search_tracks_unified = MagicMock(return_value=[])
+    stubs = {'tasks.ivf_manager': fake_vm}
+    if 'tasks' not in sys.modules:
+        stubs['tasks'] = types.ModuleType('tasks')
+    with patch.dict(sys.modules, stubs):
+        import app_external
+    return app_external
+
+
+def _external_client(ext):
+    app = Flask(__name__)
+    app.register_blueprint(ext.external_bp)
+    app.config['TESTING'] = True
+    return app.test_client()
+
+
+def _table_exists(conn, name):
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (f'public.{name}',))
+        return cur.fetchone()[0] is not None
+
+
+def _score_count(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM score")
+        return cur.fetchone()[0]
+
+
+@pytest.mark.integration
+class TestScoreEndpointRealDb:
+    def test_seeded_id_returns_row(self, endpoints_db, monkeypatch):
+        import app_helper
+
+        ext = _import_app_external()
+        monkeypatch.setattr(app_helper, 'get_db', lambda: endpoints_db)
+        resp = _external_client(ext).get('/get_score', query_string={'id': 'track-1'})
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body['item_id'] == 'track-1'
+        assert body['title'] == 'Hello'
+        assert body['author'] == 'Adele'
+
+    def test_missing_id_returns_404(self, endpoints_db, monkeypatch):
+        import app_helper
+
+        ext = _import_app_external()
+        monkeypatch.setattr(app_helper, 'get_db', lambda: endpoints_db)
+        resp = _external_client(ext).get('/get_score', query_string={'id': 'does-not-exist'})
+        assert resp.status_code == 404
+
+    def test_injection_id_is_safe(self, endpoints_db, monkeypatch):
+        import app_helper
+
+        ext = _import_app_external()
+        monkeypatch.setattr(app_helper, 'get_db', lambda: endpoints_db)
+        resp = _external_client(ext).get('/get_score', query_string={'id': _INJECTION_ID})
+        assert resp.status_code == 404
+        assert _table_exists(endpoints_db, 'score')
+        assert _score_count(endpoints_db) == 1
+
+
+@pytest.mark.integration
+class TestEmbeddingEndpointRealDb:
+    def test_seeded_id_returns_embedding(self, endpoints_db, monkeypatch):
+        import app_helper
+
+        ext = _import_app_external()
+        monkeypatch.setattr(app_helper, 'get_db', lambda: endpoints_db)
+        resp = _external_client(ext).get('/get_embedding', query_string={'id': 'track-1'})
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body['item_id'] == 'track-1'
+        assert isinstance(body['embedding'], list)
+        assert len(body['embedding']) == 3
+
+    def test_missing_id_returns_404(self, endpoints_db, monkeypatch):
+        import app_helper
+
+        ext = _import_app_external()
+        monkeypatch.setattr(app_helper, 'get_db', lambda: endpoints_db)
+        resp = _external_client(ext).get('/get_embedding', query_string={'id': 'does-not-exist'})
+        assert resp.status_code == 404

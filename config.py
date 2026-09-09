@@ -1,9 +1,33 @@
-#AudioMuse-AI/config.py
-import os
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
 
-class ConfigError(Exception):                                                                       
-    """Custom exception for configuration errors."""                                                
+"""Single source of truth for environment-variable-driven configuration.
+
+Reads every tunable from ``os.environ`` at import time and exposes it as a
+module-level constant with a baked-in default, so other modules import the
+resolved value instead of re-reading the environment or re-specifying defaults.
+
+Main Features:
+* Centralizes app/media-server/database/Redis/task and index defaults in one place.
+* Keeps the section and per-parameter comments that document each setting.
+* At import, ``_apply_db_overrides`` layers persisted setup-wizard values from the
+  DB over the env defaults (skipping Redis/Postgres/admin/precomputed keys).
+"""
+
+import os
+import tempfile
+
+
+class ConfigError(Exception):
+    """Custom exception for configuration errors."""
+
     pass
+
 
 def get_config(var_name, default=None):
     """
@@ -17,80 +41,247 @@ def get_config(var_name, default=None):
         try:
             with open(file_path, "r") as f:
                 return f.read().strip()
-        except Exception as e:                                                                     
+        except Exception as e:
             raise ConfigError(f"Failed to read config from file: {file_path}") from e
     else:
         return os.environ.get(var_name, default)
 
+
+# --- Task Status Constants ---
+TASK_STATUS_PENDING = 'PENDING'
+TASK_STATUS_STARTED = 'STARTED'
+TASK_STATUS_PROGRESS = 'PROGRESS'
+TASK_STATUS_SUCCESS = 'SUCCESS'
+TASK_STATUS_FAILURE = 'FAILURE'
+TASK_STATUS_REVOKED = 'REVOKED'
+
 # --- Media Server Type ---
-MEDIASERVER_TYPE = get_config("MEDIASERVER_TYPE", "jellyfin").lower() # Possible values: jellyfin, navidrome, lyrion, mpd, emby
+MEDIASERVER_TYPE = get_config(
+    "MEDIASERVER_TYPE", "jellyfin"
+).lower()  # Possible values: jellyfin, navidrome, lyrion, emby, plex
 
 # --- Jellyfin and DB Constants (Read from Environment Variables first) ---
 
 # JELLYFIN_USER_ID and JELLYFIN_TOKEN come from a Kubernetes Secret
-JELLYFIN_URL = get_config("JELLYFIN_URL", "http://your_jellyfin_url:8096") # Replace with your default URL
-JELLYFIN_USER_ID = get_config("JELLYFIN_USER_ID", "your_default_user_id")  # Replace with a suitable default or handle missing case
-JELLYFIN_TOKEN = get_config("JELLYFIN_TOKEN", "your_default_token")  # Replace with a suitable default or handle missing case
+JELLYFIN_URL = get_config("JELLYFIN_URL", "")  # Replace with your default URL
+JELLYFIN_USER_ID = get_config(
+    "JELLYFIN_USER_ID", ""
+)  # Replace with a suitable default or handle missing case
+JELLYFIN_TOKEN = get_config(
+    "JELLYFIN_TOKEN", ""
+)  # Replace with a suitable default or handle missing case
 
 # EMBY_USER_ID and JELLYFIN_TOKEN come from a Kubernetes Secret
-EMBY_URL = get_config("EMBY_URL", "http://embymediaserver:8096") # Replace with your default URL
-EMBY_USER_ID = get_config("EMBY_USER_ID", "your_default_user_id")  # Replace with a suitable default or handle missing case
-EMBY_TOKEN = get_config("EMBY_TOKEN", "your_default_token")  # Replace with a suitable default or handle missing case
+EMBY_URL = get_config("EMBY_URL", "")  # Replace with your default URL
+EMBY_USER_ID = get_config(
+    "EMBY_USER_ID", ""
+)  # Replace with a suitable default or handle missing case
+EMBY_TOKEN = get_config("EMBY_TOKEN", "")  # Replace with a suitable default or handle missing case
 
 
 # NEW: Allow specifying music libraries/folders for analysis across all media servers.
 # Comma-separated list of library/folder names or paths. If empty, all music libraries/folders are scanned.
-# For Lyrion: Use folder paths like "/music/myfolder"  
+# For Lyrion: Use folder paths like "/music/myfolder"
 # For Jellyfin/Navidrome: Use library/folder names
-MUSIC_LIBRARIES = get_config("MUSIC_LIBRARIES", "") 
-TEMP_DIR = "/app/temp_audio"  # Always use /app/temp_audio
-HEADERS = {"X-Emby-Token": JELLYFIN_TOKEN}
+MUSIC_LIBRARIES = get_config("MUSIC_LIBRARIES", "")
+# Maximum number of items to fetch during the connection probe.
+# Set to 0 to scan all top-played items, or a small positive integer to keep the probe fast.
+PROBE_TOP_PLAYED_LIMIT = int(get_config("PROBE_TOP_PLAYED_LIMIT", "1"))
+# Hard cap on the number of unmatched albums returned to the migration
+# wizard's step-4 review list. Real libraries can produce thousands of
+# unmatched groups (e.g. wrong path format) and the page becomes unusable
+# beyond a couple hundred entries. The full count is still surfaced as a
+# warning so the user knows the list is truncated.
+MIGRATION_UNMATCHED_ALBUMS_PAYLOAD_LIMIT = max(
+    1, int(get_config("MIGRATION_UNMATCHED_ALBUMS_PAYLOAD_LIMIT", "200"))
+)
+# Hard cap on the per-collision detail rows persisted into migration_session.state.
+# collision_details is display-only (it tells the user which albums to re-match),
+# so storing one entry per collision would let this single JSONB field grow with
+# the library and eventually breach PG's ~1 GB field cap on a heavily-duplicated
+# collection. The true total is preserved separately as collision_details_total.
+MIGRATION_MAX_COLLISION_DETAILS = int(get_config("MIGRATION_MAX_COLLISION_DETAILS", "1000"))
+TEMP_DIR = get_config("TEMP_DIR", "/app/temp_audio")
 
-if MEDIASERVER_TYPE == "jellyfin":
-    HEADERS = {"X-Emby-Token": JELLYFIN_TOKEN}
-elif MEDIASERVER_TYPE == "emby":
-    HEADERS = {"X-Emby-Token": EMBY_TOKEN}
-else:
-    HEADERS = {}
+
+def jellyfin_auth_header(token):
+    # Jellyfin 12.0 disables the legacy X-Emby-Token header by default; the
+    # Authorization: MediaBrowser scheme works on every supported version.
+    return {"Authorization": f'MediaBrowser Token="{token}"'} if token else {}
+
+
+def _compute_headers():
+    if MEDIASERVER_TYPE == "jellyfin":
+        return jellyfin_auth_header(JELLYFIN_TOKEN)
+    if MEDIASERVER_TYPE == "emby":
+        return {"X-Emby-Token": EMBY_TOKEN}
+    return {}
+
+
+HEADERS = _compute_headers()
 
 # --- Navidrome (Subsonic API) Constants ---
 # These are used only if MEDIASERVER_TYPE is "navidrome".
-NAVIDROME_URL = get_config("NAVIDROME_URL", "http://your_navidrome_url:4533")
-NAVIDROME_USER = get_config("NAVIDROME_USER", "your_navidrome_user")
-NAVIDROME_PASSWORD = get_config("NAVIDROME_PASSWORD", "your_navidrome_password") # Use the password directly
+NAVIDROME_URL = get_config("NAVIDROME_URL", "")
+NAVIDROME_USER = get_config("NAVIDROME_USER", "")
+NAVIDROME_PASSWORD = get_config("NAVIDROME_PASSWORD", "")  # Use the password directly
 
 # --- Lyrion (LMS) Constants ---
 # These are used only if MEDIASERVER_TYPE is "lyrion".
-LYRION_URL = get_config("LYRION_URL", "http://your_lyrion_url:9000")
+LYRION_URL = get_config("LYRION_URL", "")
 
-# --- MPD (Music Player Daemon) Constants ---
-# These are used only if MEDIASERVER_TYPE is "mpd".
-MPD_HOST = get_config("MPD_HOST", "localhost")
-MPD_PORT = int(get_config("MPD_PORT", "6600"))
-MPD_PASSWORD = get_config("MPD_PASSWORD", "")  # Optional password, leave empty if none
-MPD_MUSIC_DIRECTORY = get_config("MPD_MUSIC_DIRECTORY", "/var/lib/mpd/music")  # Path to MPD's music directory for file access
+# --- Plex Constants ---
+# These are used only if MEDIASERVER_TYPE is "plex".
+PLEX_URL = get_config("PLEX_URL", "")  # e.g. http://your-plex-server:32400
+PLEX_TOKEN = get_config("PLEX_TOKEN", "")  # X-Plex-Token for the Plex server
 
+MEDIASERVER_FIELDS_BY_TYPE = {
+    'jellyfin': ['JELLYFIN_URL', 'JELLYFIN_USER_ID', 'JELLYFIN_TOKEN'],
+    'navidrome': ['NAVIDROME_URL', 'NAVIDROME_USER', 'NAVIDROME_PASSWORD'],
+    'lyrion': ['LYRION_URL'],
+    'emby': ['EMBY_URL', 'EMBY_USER_ID', 'EMBY_TOKEN'],
+    'plex': ['PLEX_URL', 'PLEX_TOKEN'],
+}
+
+MEDIASERVER_OBSOLETE_FIELDS_BY_TYPE = {
+    media_type: [
+        field
+        for other_type, fields in MEDIASERVER_FIELDS_BY_TYPE.items()
+        if other_type != media_type
+        for field in fields
+    ]
+    for media_type in MEDIASERVER_FIELDS_BY_TYPE
+}
+
+# Maps each media-server config field to the key its provider backend reads out
+# of the per-server ``user_creds`` dict. Lets the multi-server registry build a
+# creds dict for the default server straight from these config globals, and lets
+# secondary servers store creds under the exact keys the backends expect. Note
+# navidrome/lyrion use 'user'/'password' while jellyfin/emby use 'user_id'/'token'.
+MEDIASERVER_CRED_KEY_BY_FIELD = {
+    'JELLYFIN_URL': 'url',
+    'JELLYFIN_USER_ID': 'user_id',
+    'JELLYFIN_TOKEN': 'token',
+    'EMBY_URL': 'url',
+    'EMBY_USER_ID': 'user_id',
+    'EMBY_TOKEN': 'token',
+    'NAVIDROME_URL': 'url',
+    'NAVIDROME_USER': 'user',
+    'NAVIDROME_PASSWORD': 'password',
+    'LYRION_URL': 'url',
+    'PLEX_URL': 'url',
+    'PLEX_TOKEN': 'token',
+}
+
+# The ONLY persistent home of these settings is the music_servers registry
+# (default row). They are never written to app_config: init_db migrates any
+# legacy app_config rows into the registry once and deletes them, the setup
+# wizard saves them to the registry, and _apply_db_overrides projects the
+# registry's default row onto these module globals at import/refresh so every
+# legacy read keeps working. Env vars only matter as first-boot seed material.
+MEDIASERVER_CONFIG_KEYS = frozenset(
+    {'MEDIASERVER_TYPE', 'MUSIC_LIBRARIES'} | set(MEDIASERVER_CRED_KEY_BY_FIELD)
+)
+
+# The content fingerprint is the catalogue standard, not an option: the canonical
+# item_id IS the 200-bit sign signature of each track's MusiCNN embedding, encoded
+# as a scheme-versioned fp_2<50hex> id (54 chars, similarity-preserving so
+# near-identical audio matches within a few bits), minted at analyze time with zero
+# extra downloads or binaries. The leading scheme digit is what lets a future
+# widening self-migrate at startup. Legacy rows are relabelled once at Flask startup
+# from their stored embeddings. Each media server's own track id (including the
+# single/default server) is kept in the track_server_map table and translated back
+# on output.
+# There are deliberately no feature flags for this behaviour.
+
+# app_config also hosts this small set of live application state keys. They are
+# not config overrides and must not appear in the setup UI, but startup pruning
+# must retain them while their consumers still exist.
+APP_CONFIG_RUNTIME_KEYS = {
+    'PLUGIN_REPOS',
+    'PLUGIN_CATALOG_CACHE',
+}
+
+SETUP_BOOTSTRAP_EXCLUDED_KEYS = {
+    'DATABASE_URL',
+    'POSTGRES_USER',
+    'POSTGRES_PASSWORD',
+    'POSTGRES_HOST',
+    'POSTGRES_PORT',
+    'POSTGRES_DB',
+    'REDIS_URL',
+    'MEDIASERVER_FIELDS_BY_TYPE',
+    'MEDIASERVER_OBSOLETE_FIELDS_BY_TYPE',
+    'MEDIASERVER_CRED_KEY_BY_FIELD',
+    'MEDIASERVER_CONFIG_KEYS',
+    'APP_VERSION',
+    'APP_CONFIG_RUNTIME_KEYS',
+    # Admin identity lives in audiomuse_users only. Never mirror it into
+    # app_config - stale rows there cause deleted admins to resurrect.
+    'AUDIOMUSE_USER',
+    'AUDIOMUSE_PASSWORD',
+    # Computed numpy/precomputed constants - persisting them through
+    # setup_manager would stringify the ndarray ("[1. 0. 0. ...]") and
+    # corrupt the value on reload (cast_value can't reverse str(ndarray)).
+    'LYRICS_INSTRUMENTAL_EMBEDDING',
+    'LYRICS_INSTRUMENTAL_AXIS_FILL',
+    # Catalogue-identity correctness constant, NOT a user preference: it must
+    # always track the code default so a tightened rule reaches every install.
+    # Excluded so it is never written to app_config, never overrides from the DB,
+    # and any stale row from an older version is pruned on the next boot.
+    'DURATION_TOLERANCE_SECONDS',
+}
 
 # --- General Constants (Read from Environment Variables where applicable) ---
-APP_VERSION = "v0.9.3"
+APP_VERSION = "v3.1.0"
 MAX_DISTANCE = float(get_config("MAX_DISTANCE", "0.5"))
 MAX_SONGS_PER_CLUSTER = int(get_config("MAX_SONGS_PER_CLUSTER", "0"))
-MAX_SONGS_PER_ARTIST = int(get_config("MAX_SONGS_PER_ARTIST", "3")) # Max songs per artist in similarity results and clustering
+MAX_SONGS_PER_ARTIST = int(
+    get_config("MAX_SONGS_PER_ARTIST", "3")
+)  # Max songs per artist in similarity results and clustering
 # New: Default behavior for eliminating duplicates in similarity search. If param not passed to API, this is the default.
-SIMILARITY_ELIMINATE_DUPLICATES_DEFAULT = get_config("SIMILARITY_ELIMINATE_DUPLICATES_DEFAULT", "True").lower() == 'true'
+SIMILARITY_ELIMINATE_DUPLICATES_DEFAULT = (
+    get_config("SIMILARITY_ELIMINATE_DUPLICATES_DEFAULT", "True").lower() == 'true'
+)
 # Default behavior for radius similarity mode. Can be toggled via environment variable.
 SIMILARITY_RADIUS_DEFAULT = get_config("SIMILARITY_RADIUS_DEFAULT", "True").lower() == 'true'
-NUM_RECENT_ALBUMS = int(get_config("NUM_RECENT_ALBUMS", "0")) # Convert to int
-TOP_N_PLAYLISTS = int(get_config("TOP_N_PLAYLISTS", "8")) # *** NEW: Default for Top N diverse playlists ***
-MIN_PLAYLIST_SIZE_FOR_TOP_N = int(get_config("MIN_PLAYLIST_SIZE_FOR_TOP_N", "20")) # Min songs for a playlist to be considered in the first pass of Top-N selection.
+# Optional radius-walk bucket-skip instrumentation (hidden debug flag, not a wizard param)
+RADIUS_INSTRUMENTATION = get_config("RADIUS_INSTRUMENTATION", "False").lower() == 'true'
+NUM_RECENT_ALBUMS = int(get_config("NUM_RECENT_ALBUMS", "0"))  # Convert to int
+TOP_N_CLUSTERING_PLAYLIST = int(
+    get_config(
+        "TOP_N_CLUSTERING_PLAYLIST",
+        get_config("MIN_CLUSTERING_TOP", get_config("TOP_N_PLAYLISTS", "10")),
+    )
+)  # Exact final cap. MIN_CLUSTERING_TOP/TOP_N_PLAYLISTS are legacy env fallbacks.
+MIN_PLAYLIST_SIZE_FOR_TOP_N = int(
+    get_config("MIN_PLAYLIST_SIZE_FOR_TOP_N", "20")
+)  # Min songs for a playlist to be considered in the first pass of Top-N selection.
+PLAYLIST_NAME_HISTORY_ROUNDS = int(
+    get_config("PLAYLIST_NAME_HISTORY_ROUNDS", "2")
+)  # AI naming avoids playlist names from this many previous clustering rounds (per server).
 
 # --- Algorithm Choose Constants (Read from Environment Variables) ---
-CLUSTER_ALGORITHM = get_config("CLUSTER_ALGORITHM", "kmeans") # accepted dbscan, kmeans, gmm, or spectral
-AI_MODEL_PROVIDER = get_config("AI_MODEL_PROVIDER", "NONE").upper() # Accepted: OLLAMA, OPENAI, GEMINI, MISTRAL, NONE
+CLUSTER_ALGORITHM = get_config(
+    "CLUSTER_ALGORITHM", "kmeans"
+)  # accepted dbscan, kmeans, gmm, or spectral
+AI_MODEL_PROVIDER = get_config(
+    "AI_MODEL_PROVIDER", "NONE"
+).upper()  # Accepted: OLLAMA, OPENAI, GEMINI, MISTRAL, NONE
 ENABLE_CLUSTERING_EMBEDDINGS = get_config("ENABLE_CLUSTERING_EMBEDDINGS", "True").lower() == "true"
 
 # --- GPU Acceleration for Clustering (Optional, requires NVIDIA GPU and RAPIDS cuML) ---
 USE_GPU_CLUSTERING = get_config("USE_GPU_CLUSTERING", "False").lower() == "true"
+
+# --- Clustering Cleanup Behavior ---
+# When True (default), existing '_automatic' playlists are deleted before new clusters are created.
+# Set to False to preserve old automatic playlists when running clustering.
+CLUSTERING_CLEANING = get_config("CLUSTERING_CLEANING", "True").lower() == "true"
+
+# When True, AI playlist naming also avoids names used in previous clustering runs
+# (playlist_name_history + existing playlists on the server).
+# Default False: only names created within the current run are avoided.
+CLUSTER_NAMING_AI_HISTORY = get_config("CLUSTER_NAMING_AI_HISTORY", "False").lower() == "true"
 
 # --- DBSCAN Only Constants (Ranges for Evolutionary Approach) ---
 # Default ranges for DBSCAN parameters
@@ -105,14 +296,20 @@ DBSCAN_MIN_SAMPLES_MAX = int(get_config("DBSCAN_MIN_SAMPLES_MAX", "20"))
 NUM_CLUSTERS_MIN = int(get_config("NUM_CLUSTERS_MIN", "40"))
 NUM_CLUSTERS_MAX = int(get_config("NUM_CLUSTERS_MAX", "100"))
 # New for MiniBatchKMeans
-USE_MINIBATCH_KMEANS = get_config("USE_MINIBATCH_KMEANS", "False").lower() == "true" # Enable MiniBatchKMeans
-MINIBATCH_KMEANS_PROCESSING_BATCH_SIZE = int(get_config("MINIBATCH_KMEANS_PROCESSING_BATCH_SIZE", "1000")) # Internal batch size for MiniBatchKMeans partial_fit
+USE_MINIBATCH_KMEANS = (
+    get_config("USE_MINIBATCH_KMEANS", "False").lower() == "true"
+)  # Enable MiniBatchKMeans
+MINIBATCH_KMEANS_PROCESSING_BATCH_SIZE = int(
+    get_config("MINIBATCH_KMEANS_PROCESSING_BATCH_SIZE", "1000")
+)  # Internal batch size for MiniBatchKMeans partial_fit
 
 # --- GMM Only Constants (Ranges for Evolutionary Approach) ---
 # Default ranges for GMM parameters
 GMM_N_COMPONENTS_MIN = int(get_config("GMM_N_COMPONENTS_MIN", "40"))
 GMM_N_COMPONENTS_MAX = int(get_config("GMM_N_COMPONENTS_MAX", "100"))
-GMM_COVARIANCE_TYPE = get_config("GMM_COVARIANCE_TYPE", "full") # 'full', 'tied', 'diag', 'spherical'
+GMM_COVARIANCE_TYPE = get_config(
+    "GMM_COVARIANCE_TYPE", "diag"
+)  # 'full', 'tied', 'diag', 'spherical'; diag is orders of magnitude faster on high-dim embeddings and statistically sounder at this scale
 
 # --- SpectralClustering Only Constants (Ranges for Evolutionary Approach) ---
 SPECTRAL_N_CLUSTERS_MIN = int(get_config("SPECTRAL_N_CLUSTERS_MIN", "40"))
@@ -121,48 +318,118 @@ SPECTRAL_N_NEIGHBORS = int(get_config("SPECTRAL_N_NEIGHBORS", "20"))
 
 # --- PCA Constants (Ranges for Evolutionary Approach) ---
 # Default ranges for PCA components
-PCA_COMPONENTS_MIN = int(get_config("PCA_COMPONENTS_MIN", "0")) # 0 to disable PCA
-PCA_COMPONENTS_MAX = int(get_config("PCA_COMPONENTS_MAX", "199")) # Max components for PCA 8 for score vectore, 199 for embeding
+PCA_COMPONENTS_MIN = int(get_config("PCA_COMPONENTS_MIN", "0"))  # 0 to disable PCA
+PCA_COMPONENTS_MAX = int(
+    get_config("PCA_COMPONENTS_MAX", "199")
+)  # Max components for PCA 8 for score vector, 199 for embedding
 
 # --- Clustering Runs for Diversity (New Constant) ---
-CLUSTERING_RUNS = int(get_config("CLUSTERING_RUNS", "1000")) # Default to 100 runs for evolutionary search
-MAX_QUEUED_ANALYSIS_JOBS = int(get_config("MAX_QUEUED_ANALYSIS_JOBS", "25")) # Max album analysis jobs to keep in RQ queue (reduced from 100 to prevent resource exhaustion)
+CLUSTERING_RUNS = int(
+    get_config("CLUSTERING_RUNS", "1000")
+)  # Default to 100 runs for evolutionary search
+
+# --- Per-server auto-calibration of clustering parameters and sampling percentile ---
+CLUSTERING_AUTO_CALIBRATION = (
+    get_config("CLUSTERING_AUTO_CALIBRATION", "True").lower() == "true"
+)  # Automatic parameter discovery per server; False = always use the configured defaults as-is
+CLUSTERING_MAX_PLAYLIST_SONGS = int(
+    get_config("CLUSTERING_MAX_PLAYLIST_SONGS", "200")
+)  # Calibration tries to keep playlists at or under this many songs (soft goal; big beats empty)
+CLUSTERING_CALIBRATION_MAX_TRIES = int(
+    get_config("CLUSTERING_CALIBRATION_MAX_TRIES", "3")
+)  # Quick single-iteration probes per server before the real run
+CLUSTERING_SUBSET_SONGS = int(
+    get_config("CLUSTERING_SUBSET_SONGS", "10000")
+)  # Exact per-iteration sample cap; all per-genre quotas are calculated before selecting tracks, and smaller libraries contribute every clusterable song
+CLUSTERING_EARLY_STOP_BATCHES = int(
+    get_config("CLUSTERING_EARLY_STOP_BATCHES", "3")
+)  # Stop enqueuing new batches after this many consecutive batches without a better result; in-flight batches still drain
+MAX_QUEUED_ANALYSIS_JOBS = int(
+    get_config("MAX_QUEUED_ANALYSIS_JOBS", "25")
+)  # Max album analysis jobs to keep in RQ queue (reduced from 100 to prevent resource exhaustion)
 
 # --- Batching Constants for Clustering Runs ---
-ITERATIONS_PER_BATCH_JOB = int(get_config("ITERATIONS_PER_BATCH_JOB", "20")) # Number of clustering iterations per RQ batch job
-MAX_CONCURRENT_BATCH_JOBS = int(get_config("MAX_CONCURRENT_BATCH_JOBS", "10")) # Max number of batch jobs to run concurrently
-DB_FETCH_CHUNK_SIZE = int(get_config("DB_FETCH_CHUNK_SIZE", "1000")) # Chunk size for fetching full track data from DB in batch jobs
+ITERATIONS_PER_BATCH_JOB = int(
+    get_config("ITERATIONS_PER_BATCH_JOB", "20")
+)  # Number of clustering iterations per RQ batch job
+MAX_CONCURRENT_BATCH_JOBS = int(
+    get_config("MAX_CONCURRENT_BATCH_JOBS", "10")
+)  # Max number of batch jobs to run concurrently
+DB_FETCH_CHUNK_SIZE = int(
+    get_config("DB_FETCH_CHUNK_SIZE", "1000")
+)  # Chunk size for fetching full track data from DB in batch jobs
 
 # IMPORTANT: Lower MAX_QUEUED_ANALYSIS_JOBS if experiencing resource exhaustion or server crashes
 # Recommended values: 10-25 for servers with limited resources, 50-100 for powerful servers
 
 # --- Clustering Batch Timeout and Failure Recovery ---
-CLUSTERING_BATCH_TIMEOUT_MINUTES = int(get_config("CLUSTERING_BATCH_TIMEOUT_MINUTES", "60")) # Max time a batch can run before being considered failed
-CLUSTERING_MAX_FAILED_BATCHES = int(get_config("CLUSTERING_MAX_FAILED_BATCHES", "10")) # Max number of failed batches before stopping
-CLUSTERING_BATCH_CHECK_INTERVAL_SECONDS = int(get_config("CLUSTERING_BATCH_CHECK_INTERVAL_SECONDS", "30")) # How often to check batch status
+CLUSTERING_BATCH_TIMEOUT_MINUTES = int(
+    get_config("CLUSTERING_BATCH_TIMEOUT_MINUTES", "60")
+)  # Max time a batch can run before being considered failed
+CLUSTERING_MAX_FAILED_BATCHES = int(
+    get_config("CLUSTERING_MAX_FAILED_BATCHES", "10")
+)  # Max number of failed batches before stopping
+CLUSTERING_BATCH_CHECK_INTERVAL_SECONDS = int(
+    get_config("CLUSTERING_BATCH_CHECK_INTERVAL_SECONDS", "30")
+)  # How often to check batch status
 
 # --- Batching Constants for Analysis ---
-REBUILD_INDEX_BATCH_SIZE = int(get_config("REBUILD_INDEX_BATCH_SIZE", "1000")) # Rebuild Voyager index after this many albums are analyzed.
-AUDIO_LOAD_TIMEOUT = int(get_config("AUDIO_LOAD_TIMEOUT", "600")) # Timeout in seconds for loading a single audio file.
+REBUILD_INDEX_BATCH_SIZE = int(
+    get_config("REBUILD_INDEX_BATCH_SIZE", "1000")
+)  # Rebuild IVF index after this many albums are analyzed.
+AUDIO_LOAD_TIMEOUT = int(
+    get_config("AUDIO_LOAD_TIMEOUT", "600")
+)  # Timeout in seconds for loading a single audio file.
+ANALYSIS_MONITOR_DB_INTERVAL = int(
+    get_config("ANALYSIS_MONITOR_DB_INTERVAL", "10")
+)  # Min seconds between DB child-status reconciliations in the analysis monitor (0 = every poll; active jobs drain via RQ every poll regardless).
 
 # --- Guided Evolutionary Clustering Constants ---
-TOP_N_ELITES = int(get_config("CLUSTERING_TOP_N_ELITES", "10")) # Number of best solutions to keep as elites
-EXPLOITATION_START_FRACTION = float(get_config("CLUSTERING_EXPLOITATION_START_FRACTION", "0.2")) # Fraction of runs before starting to use elites (e.g., 0.2 means after 20% of runs)
-EXPLOITATION_PROBABILITY_CONFIG = float(get_config("CLUSTERING_EXPLOITATION_PROBABILITY", "0.7")) # Probability of mutating an elite vs. random generation, once exploitation starts
-MUTATION_INT_ABS_DELTA = int(get_config("CLUSTERING_MUTATION_INT_ABS_DELTA", "3")) # Max absolute change for integer parameter mutation
-MUTATION_FLOAT_ABS_DELTA = float(get_config("CLUSTERING_MUTATION_FLOAT_ABS_DELTA", "0.05")) # Max absolute change for float parameter mutation (e.g., for DBSCAN eps)
-MUTATION_KMEANS_COORD_FRACTION = float(get_config("CLUSTERING_MUTATION_KMEANS_COORD_FRACTION", "0.05")) # Fractional change for KMeans centroid coordinates based on data range
+TOP_N_ELITES = int(
+    get_config("CLUSTERING_TOP_N_ELITES", "10")
+)  # Number of best solutions to keep as elites
+EXPLOITATION_START_FRACTION = float(
+    get_config("CLUSTERING_EXPLOITATION_START_FRACTION", "0.2")
+)  # Fraction of runs before starting to use elites (e.g., 0.2 means after 20% of runs)
+EXPLOITATION_PROBABILITY_CONFIG = float(
+    get_config("CLUSTERING_EXPLOITATION_PROBABILITY", "0.7")
+)  # Probability of mutating an elite vs. random generation, once exploitation starts
+MUTATION_INT_ABS_DELTA = int(
+    get_config("CLUSTERING_MUTATION_INT_ABS_DELTA", "3")
+)  # Max absolute change for integer parameter mutation
+MUTATION_FLOAT_ABS_DELTA = float(
+    get_config("CLUSTERING_MUTATION_FLOAT_ABS_DELTA", "0.05")
+)  # Max absolute change for float parameter mutation (e.g., for DBSCAN eps)
+MUTATION_KMEANS_COORD_FRACTION = float(
+    get_config("CLUSTERING_MUTATION_KMEANS_COORD_FRACTION", "0.05")
+)  # Fractional change for KMeans centroid coordinates based on data range
 
 # --- Scoring Weights for Enhanced Diversity Score ---
-SCORE_WEIGHT_DIVERSITY = float(get_config("SCORE_WEIGHT_DIVERSITY", "2.0")) # Weight for the base diversity (inter-playlist mood diversity)
-SCORE_WEIGHT_PURITY = float(get_config("SCORE_WEIGHT_PURITY", "1.0"))    # Weight for playlist purity (intra-playlist mood consistency)
-SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY = float(get_config("SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY", "0.0")) # New: Weight for inter-playlist other feature diversity
-SCORE_WEIGHT_OTHER_FEATURE_PURITY = float(get_config("SCORE_WEIGHT_OTHER_FEATURE_PURITY", "0.0"))       # New: Weight for intra-playlist other feature consistency
+SCORE_WEIGHT_DIVERSITY = float(
+    get_config("SCORE_WEIGHT_DIVERSITY", "2.0")
+)  # Weight for the base diversity (inter-playlist mood diversity)
+SCORE_WEIGHT_PURITY = float(
+    get_config("SCORE_WEIGHT_PURITY", "1.0")
+)  # Weight for playlist purity (intra-playlist mood consistency)
+SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY = float(
+    get_config("SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY", "0.0")
+)  # New: Weight for inter-playlist other feature diversity
+SCORE_WEIGHT_OTHER_FEATURE_PURITY = float(
+    get_config("SCORE_WEIGHT_OTHER_FEATURE_PURITY", "0.0")
+)  # New: Weight for intra-playlist other feature consistency
 # --- Weights for Internal Validation Metrics ---
-SCORE_WEIGHT_SILHOUETTE = float(get_config("SCORE_WEIGHT_SILHOUETTE", "0.0")) # ex 0.6 - Weight for Silhouette Score - This metric measures how similar an object is to its own cluster compared to other clusters.
-SCORE_WEIGHT_DAVIES_BOULDIN = float(get_config("SCORE_WEIGHT_DAVIES_BOULDIN", "0.0")) # Set to 0 to effectively disable - This index quantifies the average similarity between each cluster and its most similar one
-SCORE_WEIGHT_CALINSKI_HARABASZ = float(get_config("SCORE_WEIGHT_CALINSKI_HARABASZ", "0.0")) # Set to 0 to effectively disable - This metric focuses on the ratio of between-cluster dispersion to within-cluster dispersion
-TOP_K_MOODS_FOR_PURITY_CALCULATION = int(get_config("TOP_K_MOODS_FOR_PURITY_CALCULATION", "3")) # Number of centroid's top moods to consider for purity
+SCORE_WEIGHT_SILHOUETTE = float(
+    get_config("SCORE_WEIGHT_SILHOUETTE", "0.0")
+)  # ex 0.6 - Weight for Silhouette Score - This metric measures how similar an object is to its own cluster compared to other clusters.
+SCORE_WEIGHT_DAVIES_BOULDIN = float(
+    get_config("SCORE_WEIGHT_DAVIES_BOULDIN", "0.0")
+)  # Set to 0 to effectively disable - This index quantifies the average similarity between each cluster and its most similar one
+SCORE_WEIGHT_CALINSKI_HARABASZ = float(
+    get_config("SCORE_WEIGHT_CALINSKI_HARABASZ", "0.0")
+)  # Set to 0 to effectively disable - This metric focuses on the ratio of between-cluster dispersion to within-cluster dispersion
+TOP_K_MOODS_FOR_PURITY_CALCULATION = int(
+    get_config("TOP_K_MOODS_FOR_PURITY_CALCULATION", "3")
+)  # Number of centroid's top moods to consider for purity
 
 # --- Statistics for Raw Score Scaling (Mood Diversity and Purity) ---
 # These are based on observed typical ranges for the raw scores.
@@ -172,15 +439,17 @@ LN_MOOD_DIVERSITY_STATS = {
     "min": float(get_config("LN_MOOD_DIVERSITY_MIN", "-0.1863")),
     "max": float(get_config("LN_MOOD_DIVERSITY_MAX", "1.5518")),
     "mean": float(get_config("LN_MOOD_DIVERSITY_MEAN", "0.9995")),
-    "sd": float(get_config("LN_MOOD_DIVERSITY_SD", "0.3541"))
+    "sd": float(get_config("LN_MOOD_DIVERSITY_SD", "0.3541")),
 }
 
 # Constants for Log-Transformed and Standardized Mood Diversity WHEN EMBEDDINGS ARE USED
-LN_MOOD_DIVERSITY_EMBEDING_STATS = { # Corrected spelling to "EMBEDING"
+LN_MOOD_DIVERSITY_EMBEDING_STATS = {  # Corrected spelling to "EMBEDING"
     "min": float(get_config("LN_MOOD_DIVERSITY_EMBEDDING_MIN", "-0.174")),
     "max": float(get_config("LN_MOOD_DIVERSITY_EMBEDDING_MAX", "0.570")),
     "mean": float(get_config("LN_MOOD_DIVERSITY_EMBEDDING_MEAN", "-0.101")),
-    "sd": float(get_config("LN_MOOD_DIVERSITY_EMBEDDING_SD", "0.245")) # Kept env var name consistent for now
+    "sd": float(
+        get_config("LN_MOOD_DIVERSITY_EMBEDDING_SD", "0.245")
+    ),  # Kept env var name consistent for now
 }
 
 # Constants for Log-Transformed and Standardized Mood Purity
@@ -188,55 +457,65 @@ LN_MOOD_PURITY_STATS = {
     "min": float(get_config("LN_MOOD_PURITY_MIN", "0.6981")),
     "max": float(get_config("LN_MOOD_PURITY_MAX", "7.2848")),
     "mean": float(get_config("LN_MOOD_PURITY_MEAN", "5.8679")),
-    "sd": float(get_config("LN_MOOD_PURITY_SD", "1.1557"))
+    "sd": float(get_config("LN_MOOD_PURITY_SD", "1.1557")),
 }
 
 # Constants for Log-Transformed and Standardized Mood Purity WHEN EMBEDDINGS ARE USED
-LN_MOOD_PURITY_EMBEDING_STATS = { # Note: User provided "EMBEDING" spelling
+LN_MOOD_PURITY_EMBEDING_STATS = {  # Note: User provided "EMBEDING" spelling
     "min": float(get_config("LN_MOOD_PURITY_EMBEDDING_MIN", "-0.494")),
     "max": float(get_config("LN_MOOD_PURITY_EMBEDDING_MAX", "2.583")),
     "mean": float(get_config("LN_MOOD_PURITY_EMBEDDING_MEAN", "0.673")),
-    "sd": float(get_config("LN_MOOD_PURITY_EMBEDDING_SD", "1.063"))
+    "sd": float(get_config("LN_MOOD_PURITY_EMBEDDING_SD", "1.063")),
 }
 
 # --- Statistics for Log-Transformed and Standardized "Other Features" Scores ---
 # IMPORTANT: Replace these placeholder values with actual statistics derived from your data.
 # These are used for Z-score standardization of the "other features" diversity and purity.
 LN_OTHER_FEATURES_DIVERSITY_STATS = {
-    "min": float(get_config("LN_OTHER_FEAT_DIV_MIN", "-0.19")), # Placeholder
-    "max": float(get_config("LN_OTHER_FEAT_DIV_MAX", "2.06")), # Placeholder
-    "mean": float(get_config("LN_OTHER_FEAT_DIV_MEAN", "1.5")), # Placeholder
-    "sd": float(get_config("LN_OTHER_FEAT_DIV_SD", "0.46"))      # Placeholder
+    "min": float(get_config("LN_OTHER_FEAT_DIV_MIN", "-0.19")),  # Placeholder
+    "max": float(get_config("LN_OTHER_FEAT_DIV_MAX", "2.06")),  # Placeholder
+    "mean": float(get_config("LN_OTHER_FEAT_DIV_MEAN", "1.5")),  # Placeholder
+    "sd": float(get_config("LN_OTHER_FEAT_DIV_SD", "0.46")),  # Placeholder
 }
 
 LN_OTHER_FEATURES_PURITY_STATS = {
-    "min": float(get_config("LN_OTHER_FEAT_PUR_MIN", "8.67")),   # Updated value
-    "max": float(get_config("LN_OTHER_FEAT_PUR_MAX", "8.95")),   # Updated value
+    "min": float(get_config("LN_OTHER_FEAT_PUR_MIN", "8.67")),  # Updated value
+    "max": float(get_config("LN_OTHER_FEAT_PUR_MAX", "8.95")),  # Updated value
     "mean": float(get_config("LN_OTHER_FEAT_PUR_MEAN", "8.84")),  # Updated value
-    "sd": float(get_config("LN_OTHER_FEAT_PUR_SD", "0.07"))     # Updated value
+    "sd": float(get_config("LN_OTHER_FEAT_PUR_SD", "0.07")),  # Updated value
 }
 
 # Threshold for considering an "other feature" predominant in a playlist for purity calculation
-OTHER_FEATURE_PREDOMINANCE_THRESHOLD_FOR_PURITY = float(get_config("OTHER_FEATURE_PREDOMINANCE_THRESHOLD_FOR_PURITY", "0.3"))
+OTHER_FEATURE_PREDOMINANCE_THRESHOLD_FOR_PURITY = float(
+    get_config("OTHER_FEATURE_PREDOMINANCE_THRESHOLD_FOR_PURITY", "0.3")
+)
 
 # --- AI Playlist Naming ---
 # USE_AI_PLAYLIST_NAMING is replaced by AI_MODEL_PROVIDER
-OLLAMA_SERVER_URL = get_config("OLLAMA_SERVER_URL", "http://192.168.3.211:11434/api/generate") # URL for your Ollama instance
-OLLAMA_MODEL_NAME = get_config("OLLAMA_MODEL_NAME", "llama3.1:8b") # Ollama model to use
+OLLAMA_SERVER_URL = get_config(
+    "OLLAMA_SERVER_URL", "http://localhost:11434/api/generate"
+)  # URL for your Ollama instance
+OLLAMA_MODEL_NAME = get_config("OLLAMA_MODEL_NAME", "qwen3.5:9b")  # Ollama model to use
 
 # Maximum number of songs to include in AI naming prompts (to avoid token limit issues)
 # Large playlists will use only the first N songs for naming
 MAX_SONGS_IN_AI_PROMPT = int(get_config("MAX_SONGS_IN_AI_PROMPT", "25"))
 
 # OpenAI API (also used for OpenRouter) - uses same API standard as Ollama
-OPENAI_SERVER_URL = get_config("OPENAI_SERVER_URL", get_config("OLLAMA_SERVER_URL", "http://192.168.3.211:11434/api/generate"))
+OPENAI_SERVER_URL = get_config(
+    "OPENAI_SERVER_URL", get_config("OLLAMA_SERVER_URL", "http://localhost:11434/api/generate")
+)
 OPENAI_MODEL_NAME = get_config("OPENAI_MODEL_NAME", get_config("OLLAMA_MODEL_NAME", "llama3.1:8b"))
-OPENAI_API_KEY = get_config("OPENAI_API_KEY", "no-key-needed") # Set to "no-key-needed" for Ollama, or your actual API key for OpenAI/OpenRouter
+OPENAI_API_KEY = get_config(
+    "OPENAI_API_KEY", "no-key-needed"
+)  # Set to "no-key-needed" for Ollama, or your actual API key for OpenAI/OpenRouter
 
-GEMINI_API_KEY = get_config("GEMINI_API_KEY", "YOUR-GEMINI-API-KEY-HERE") # Default API key
-GEMINI_MODEL_NAME = get_config("GEMINI_MODEL_NAME", "gemini-2.5-pro") # Default Gemini model gemini-2.5-pro, alternative gemini-2.5-flash
+GEMINI_API_KEY = get_config("GEMINI_API_KEY", "")  # Default API key
+GEMINI_MODEL_NAME = get_config(
+    "GEMINI_MODEL_NAME", "gemini-2.5-pro"
+)  # Default Gemini model gemini-2.5-pro, alternative gemini-2.5-flash
 
-MISTRAL_API_KEY = get_config("MISTRAL_API_KEY", "YOUR-GEMINI-API-KEY-HERE")
+MISTRAL_API_KEY = get_config("MISTRAL_API_KEY", "")
 MISTRAL_MODEL_NAME = get_config("MISTRAL_MODEL_NAME", "ministral-3b-latest")
 
 # AI Request Timeout Configuration
@@ -244,12 +523,54 @@ MISTRAL_MODEL_NAME = get_config("MISTRAL_MODEL_NAME", "ministral-3b-latest")
 # For CPU-only Ollama instances or large models that take longer to generate responses, consider setting to 300-600 seconds.
 # Default: 120 seconds for Ollama (tool calling/instant playlist), 60 seconds for OpenAI/Mistral
 AI_REQUEST_TIMEOUT_SECONDS = int(get_config("AI_REQUEST_TIMEOUT_SECONDS", "300"))
+
+# Sampling temperature for the tool-calling (playlist planning) LLM request.
+# Qwen3-family models officially warn against greedy decoding, so this stays above 0.
+# It is well below the vendor's general-chat 0.7 because tool selection has to be
+# reproducible: measured on qwen3.5:9b over a 40-query benchmark, the same prompt run
+# twice picked a different tool set 7 times out of 40 at 0.7 and once out of 40 at 0.2,
+# with the same plan quality and no repetition loops (the structured-output grammar
+# bounds every array, so a loop cannot run away).
+AI_TOOLCALL_TEMPERATURE = float(get_config("AI_TOOLCALL_TEMPERATURE", "0.2"))
+
+# Remaining sampling knobs for the tool-calling request, shared by both Ollama paths
+# (native /api/chat and structured format=schema) so a plan does not depend on which
+# path served it.
+AI_TOOLCALL_TOP_P = float(get_config("AI_TOOLCALL_TOP_P", "0.8"))
+AI_TOOLCALL_TOP_K = int(get_config("AI_TOOLCALL_TOP_K", "20"))
+AI_TOOLCALL_MIN_P = float(get_config("AI_TOOLCALL_MIN_P", "0.0"))
+AI_TOOLCALL_NUM_PREDICT = int(get_config("AI_TOOLCALL_NUM_PREDICT", "1536"))
+
+# Maximum tool calls kept from one plan. Bounds both the planner cap and the
+# structured-output grammar, which must agree or the grammar allows a call the
+# planner would silently drop.
+AI_MAX_TOOL_CALLS = int(get_config("AI_MAX_TOOL_CALLS", "4"))
+
+# Playlist naming asks the model for several one-word candidates in a single call and
+# keeps the first one that passes validation. Resolving a rejected concept inside one
+# response is far cheaper than a second round trip, and it defuses the name-collision
+# rule that otherwise burns every retry once many playlists are already named.
+AI_NAMING_CANDIDATES = int(get_config("AI_NAMING_CANDIDATES", "10"))
+# Number of multi-candidate rounds before naming gives up on the AI and composes a name
+# locally. Each extra round re-prompts with every concept rejected so far.
+# Naming deliberately sends no output-token cap: thinking models spend tokens on thought
+# parts first, and a low cap makes them return nothing at all.
+AI_NAMING_MAX_ATTEMPTS = int(get_config("AI_NAMING_MAX_ATTEMPTS", "3"))
+
 REDIS_URL = get_config('REDIS_URL', 'redis://localhost:6379/0')
+
+# RQ worker tuning: restart-after-N-jobs (memory-leak guard) and log level.
+RQ_MAX_JOBS = int(get_config('RQ_MAX_JOBS', '50'))
+RQ_MAX_JOBS_HIGH = int(get_config('RQ_MAX_JOBS_HIGH', '100'))
+RQ_LOGGING_LEVEL = get_config('RQ_LOGGING_LEVEL', 'INFO').upper()
+# Seconds a 'started' RQ job's heartbeat may go stale before the janitor treats the
+# job as abandoned (worker died mid-run) and requeues it within its retry budget.
+RQ_JOB_ABANDONED_SECONDS = int(get_config('RQ_JOB_ABANDONED_SECONDS', '300'))
 
 # Construct DATABASE_URL from individual components for better security in K8s
 POSTGRES_USER = get_config("POSTGRES_USER", "audiomuse")
 POSTGRES_PASSWORD = get_config("POSTGRES_PASSWORD", "audiomusepassword")
-POSTGRES_HOST = get_config("POSTGRES_HOST", "postgres-service.playlist") # Default for K8s
+POSTGRES_HOST = get_config("POSTGRES_HOST", "postgres-service.playlist")  # Default for K8s
 POSTGRES_PORT = get_config("POSTGRES_PORT", "5432")
 POSTGRES_DB = get_config("POSTGRES_DB", "audiomusedb")
 
@@ -263,30 +584,242 @@ _pg_pass_esc = quote(POSTGRES_PASSWORD, safe='')
 # If DATABASE_URL is set in the environment, prefer it; otherwise build one using the escaped credentials
 DATABASE_URL = get_config(
     "DATABASE_URL",
-    f"postgresql://{_pg_user_esc}:{_pg_pass_esc}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    f"postgresql://{_pg_user_esc}:{_pg_pass_esc}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}",
 )
+
+DATABASE_TYPE = get_config("DATABASE_TYPE", "postgres").lower()
+QUEUE_TYPE = get_config("QUEUE_TYPE", "redis").lower()
+APP_DATA_DIR = get_config("APP_DATA_DIR", "")
+AUDIOMUSE_PLATFORM = get_config("AUDIOMUSE_PLATFORM", "").lower()
+AUDIOMUSE_CONTROL_SOCKET = get_config("AUDIOMUSE_CONTROL_SOCKET", "")
+AUDIOMUSE_CONTROL_HOST = get_config("AUDIOMUSE_CONTROL_HOST", "")
+AUDIOMUSE_CONTROL_PORT = get_config("AUDIOMUSE_CONTROL_PORT", "")
 
 # --- AI User for Chat SQL Execution ---
 AI_CHAT_DB_USER_NAME = get_config("AI_CHAT_DB_USER_NAME", "ai_user")
-AI_CHAT_DB_USER_PASSWORD = get_config("AI_CHAT_DB_USER_PASSWORD", "ChangeThisSecurePassword123!") # IMPORTANT: Change this default and use environment variables
+AI_CHAT_DB_USER_PASSWORD = get_config(
+    "AI_CHAT_DB_USER_PASSWORD", "ChangeThisSecurePassword123!"
+)  # IMPORTANT: Change this default and use environment variables
 
 # --- Classifier Constant ---
 MOOD_LABELS = [
-    'rock', 'pop', 'alternative', 'indie', 'electronic', 'female vocalists', 'dance', '00s', 'alternative rock', 'jazz',
-    'beautiful', 'metal', 'chillout', 'male vocalists', 'classic rock', 'soul', 'indie rock', 'Mellow', 'electronica', '80s',
-    'folk', '90s', 'chill', 'instrumental', 'punk', 'oldies', 'blues', 'hard rock', 'ambient', 'acoustic', 'experimental',
-    'female vocalist', 'guitar', 'Hip-Hop', '70s', 'party', 'country', 'easy listening', 'sexy', 'catchy', 'funk', 'electro',
-    'heavy metal', 'Progressive rock', '60s', 'rnb', 'indie pop', 'sad', 'House', 'happy'
+    'rock',
+    'pop',
+    'alternative',
+    'indie',
+    'electronic',
+    'female vocalists',
+    'dance',
+    '00s',
+    'alternative rock',
+    'jazz',
+    'beautiful',
+    'metal',
+    'chillout',
+    'male vocalists',
+    'classic rock',
+    'soul',
+    'indie rock',
+    'Mellow',
+    'electronica',
+    '80s',
+    'folk',
+    '90s',
+    'chill',
+    'instrumental',
+    'punk',
+    'oldies',
+    'blues',
+    'hard rock',
+    'ambient',
+    'acoustic',
+    'experimental',
+    'female vocalist',
+    'guitar',
+    'Hip-Hop',
+    '70s',
+    'party',
+    'country',
+    'easy listening',
+    'sexy',
+    'catchy',
+    'funk',
+    'electro',
+    'heavy metal',
+    'Progressive rock',
+    '60s',
+    'rnb',
+    'indie pop',
+    'sad',
+    'House',
+    'happy',
 ]
 
-TOP_N_MOODS = int(get_config("TOP_N_MOODS", "5"))  # Number of top moods to consider (configurable via env)
-TOP_N_OTHER_FEATURES = int(get_config("TOP_N_OTHER_FEATURES", "2")) # Number of top "other features" to consider for clustering vector
+TOP_N_MOODS = int(
+    get_config("TOP_N_MOODS", "5")
+)  # Number of top moods to consider (configurable via env)
 EMBEDDING_MODEL_PATH = get_config("EMBEDDING_MODEL_PATH", "/app/model/musicnn_embedding.onnx")
 PREDICTION_MODEL_PATH = get_config("PREDICTION_MODEL_PATH", "/app/model/musicnn_prediction.onnx")
 EMBEDDING_DIMENSION = 200
 
 # --- CLAP Model Constants (for text search) ---
 CLAP_ENABLED = get_config("CLAP_ENABLED", "true").lower() == "true"
+# Lyrics analysis feature toggle. When false, the lyrics step is skipped entirely.
+LYRICS_ENABLED = get_config("LYRICS_ENABLED", "true").lower() == "true"
+# When true, look up lyrics from user-configured external APIs before falling back to Whisper-small ASR.
+LYRICS_API_ENABLE = get_config("LYRICS_API_ENABLE", "true").lower() == "true"
+LYRICS_ASR_ENABLE = get_config("LYRICS_ASR_ENABLE", "true").lower() == "true"
+LYRICS_MUSICNN_SKIP = get_config("LYRICS_MUSICNN_SKIP", "true").lower() == "true"
+# Timeout (seconds) for fetching embedded lyrics from the configured media server
+# (Jellyfin / Emby / Navidrome / Lyrion). Increase if your server fetches lyrics
+# on-the-fly via plugins (e.g. Navidrome lyrics plugins) that may take several
+# seconds to respond. Set 0 to disable the lookup.
+MUSICSERVER_LYRICS_TIMEOUT = float(get_config("MUSICSERVER_LYRICS_TIMEOUT", "2.5"))
+# User-configurable lyrics API slots (up to 2).
+# Each slot stores: url_template, lyrics_field, artist_param, title_param, api_key_param, api_key_value
+# e.g. LYRICS_API_1_URL_TEMPLATE = "https://example.com/api/get?{artist_param}={artist}&{title_param}={title}"
+LYRICS_API_1_URL_TEMPLATE = get_config("LYRICS_API_1_URL_TEMPLATE", "")
+LYRICS_API_1_ARTIST_PARAM = get_config("LYRICS_API_1_ARTIST_PARAM", "artist_name")
+LYRICS_API_1_TITLE_PARAM = get_config("LYRICS_API_1_TITLE_PARAM", "track_name")
+LYRICS_API_1_LYRICS_FIELD = get_config("LYRICS_API_1_LYRICS_FIELD", "plainLyrics")
+LYRICS_API_1_APIKEY_PARAM = get_config("LYRICS_API_1_APIKEY_PARAM", "")
+LYRICS_API_1_APIKEY_VALUE = get_config("LYRICS_API_1_APIKEY_VALUE", "")
+LYRICS_API_1_TIMEOUT = float(get_config("LYRICS_API_1_TIMEOUT", "5.0"))
+LYRICS_API_2_URL_TEMPLATE = get_config("LYRICS_API_2_URL_TEMPLATE", "")
+LYRICS_API_2_ARTIST_PARAM = get_config("LYRICS_API_2_ARTIST_PARAM", "artist")
+LYRICS_API_2_TITLE_PARAM = get_config("LYRICS_API_2_TITLE_PARAM", "title")
+LYRICS_API_2_LYRICS_FIELD = get_config("LYRICS_API_2_LYRICS_FIELD", "lyrics")
+LYRICS_API_2_APIKEY_PARAM = get_config("LYRICS_API_2_APIKEY_PARAM", "")
+LYRICS_API_2_APIKEY_VALUE = get_config("LYRICS_API_2_APIKEY_VALUE", "")
+LYRICS_API_2_TIMEOUT = float(get_config("LYRICS_API_2_TIMEOUT", "5.0"))
+# Beam search width for the Whisper-small ASR decoder. 1 = pure greedy
+# (fastest, most error-prone), 2 = sweet spot (catches stuck-loop
+# attractors at ~2x greedy cost), 5 = Whisper-upstream default (max
+# quality, ~5x cost). Each extra beam adds one decoder.run per generated
+# token plus its own KV cache (~30-80 MB at a full 30 s chunk).
+LYRICS_ASR_BEAM_SIZE = int(get_config("LYRICS_ASR_BEAM_SIZE", "5"))
+LYRICS_ASR_MIN_AVG_LOGPROB = float(get_config("LYRICS_ASR_MIN_AVG_LOGPROB", "-1.0"))
+LYRICS_ASR_NON_ENGLISH_MIN_LOGPROB = float(
+    get_config("LYRICS_ASR_NON_ENGLISH_MIN_LOGPROB", "-0.85")
+)
+# Where the Whisper-small ONNX bundle (encoder + merged decoder +
+# tokenizer files) is extracted. Pre-bundled in the official Docker
+# image from lyrics_model_whisper.tar.gz (project release).
+LYRICS_WHISPER_MODEL_DIR = get_config(
+    "LYRICS_WHISPER_MODEL_DIR",
+    os.path.join(get_config("LYRICS_MODEL_DIR", "/app/model"), "whisper-small-onnx"),
+)
+LYRICS_MODEL_DIR = get_config("LYRICS_MODEL_DIR", "/app/model")
+LYRICS_MAX_SONGS_TO_ANALYZE = 1000
+LYRICS_SUPPORTED_AUDIO_EXTENSIONS = {
+    '.wav',
+    '.mp3',
+    '.m4a',
+    '.flac',
+    '.ogg',
+    '.opus',
+    '.aac',
+    '.aiff',
+    '.aif',
+    '.mp4',
+}
+# Minimum seconds of voiced audio Silero VAD must detect for a track to be
+# sent to Whisper. Below this, the song is treated as instrumental and the
+# instrumental embedding sentinel is used instead. Setting this very high
+# effectively disables Whisper transcription for most tracks.
+VAD_VOICE_RECOGNITION = int(get_config("VAD_VOICE_RECOGNITION", "25"))
+
+LYRICS_DEFAULT_SAMPLE_RATE = 16000
+LYRICS_DEFAULT_SEGMENT_DURATION = 60.0
+LYRICS_DEFAULT_TOPIC_EMBEDDING_MODEL = 'Alibaba-NLP/gte-multilingual-base'
+LYRICS_DEFAULT_TOPIC_EMBEDDING_CACHE_DIR = os.path.join(LYRICS_MODEL_DIR, 'gte-multilingual-base')
+# Dimension of the gte-multilingual-base sentence embedding stored in
+# lyrics_embedding.embedding and used to build the lyrics ivf index.
+LYRICS_EMBEDDING_DIMENSION = int(get_config("LYRICS_EMBEDDING_DIMENSION", "768"))
+
+# Minimum number of CHARACTERS (not words) a transcript must have for the
+# lyrics pipeline to compute an embedding. Below this, the song is treated
+# as having no usable lyrics and gets the instrumental sentinel. Char-based
+# instead of word-based so CJK / Thai / Lao scripts - which have no spaces
+# between words - aren't all collapsed to "1 word" by str.split() and
+# spuriously dropped. 250 chars ~ 50 English words at 5 chars/word average,
+# or ~150 CJK chars (roughly equivalent lyrical content).
+LYRICS_MIN_CHARS_FOR_EMBEDDING = int(get_config("LYRICS_MIN_CHARS_FOR_EMBEDDING", "250"))
+# Repetition gate for text-source lyrics (media server / external API). Pure
+# ad-lib or filler content ("woo woo woo...") compresses far more than real
+# lyrics, so a high zlib compression ratio flags it. Above this ratio the text
+# is dropped before embedding, preventing nonsensical content from polluting
+# embeddings (issue #543). Set deliberately high so genuinely chorus-heavy real
+# songs (~7-8) survive while extreme ad-lib repetition (~30-40+) is removed.
+# Set to 0 to disable the gate.
+LYRICS_TEXT_MAX_COMPRESSION_RATIO = float(get_config("LYRICS_TEXT_MAX_COMPRESSION_RATIO", "15.0"))
+# Minimum langdetect confidence (API / music-server lyrics) to accept the text as
+# real lyrics. Below this the lyrics are dropped to the instrumental sentinel rather
+# than let unidentifiable junk (garbled API responses, mojibake, filler) pollute the
+# embedding (issue #543). Embedding is multilingual now, so this is purely a quality
+# gate - no translation is performed.
+LYRICS_LANG_CONFIDENCE_MIN = float(get_config("LYRICS_LANG_CONFIDENCE_MIN", "0.70"))
+# Minimum fraction of letters that must be CJK script (Hangul / kana / Han) for the
+# lyrics to be treated as genuine CJK regardless of what langdetect reports. Code-mixed
+# K-pop / J-pop is frequently scored low-confidence by langdetect because of its
+# Latin-script bias; script presence is a far more reliable CJK signal, letting real
+# CJK lyrics bypass the confidence gate instead of being dropped (issue #553). Set 0
+# to disable.
+LYRICS_CJK_SCRIPT_MIN_RATIO = float(get_config("LYRICS_CJK_SCRIPT_MIN_RATIO", "0.10"))
+# Maximum number of tokens fed to the gte-multilingual-base embedding model per
+# track. The model supports up to 8192; lyrics are truncated here (default 512,
+# roughly a full song - ~500 tokens for English, fewer characters for CJK which
+# fragments into more tokens). Higher values embed more of long songs at extra
+# CPU cost. Changing this alters the embeddings, so re-embed (drop the lyrics
+# tables) afterwards for consistency.
+LYRICS_GTE_MAX_TOKENS = int(get_config("LYRICS_GTE_MAX_TOKENS", "512"))
+
+# Silero VAD tuning for the lyrics ASR pre-pass (16 kHz only). The retry floor is
+# a second, more permissive threshold tried only when the primary pass finds no
+# speech. Durations are in milliseconds.
+LYRICS_VAD_THRESHOLD = float(get_config("LYRICS_VAD_THRESHOLD", "0.2"))
+# Hysteresis floor; derived from the primary threshold when unset.
+LYRICS_VAD_NEG_THRESHOLD = (
+    float(os.environ["LYRICS_VAD_NEG_THRESHOLD"])
+    if "LYRICS_VAD_NEG_THRESHOLD" in os.environ
+    else max(0.01, LYRICS_VAD_THRESHOLD - 0.15)
+)
+LYRICS_VAD_RETRY_FLOOR = float(get_config("LYRICS_VAD_RETRY_FLOOR", "0.15"))
+LYRICS_VAD_MIN_SILENCE_MS = int(get_config("LYRICS_VAD_MIN_SILENCE_MS", "1000"))
+LYRICS_VAD_MIN_SPEECH_MS = int(get_config("LYRICS_VAD_MIN_SPEECH_MS", "250"))
+LYRICS_VAD_SPEECH_PAD_MS = int(get_config("LYRICS_VAD_SPEECH_PAD_MS", "400"))
+
+# --- SemGrove (Semantic + Groove) merged index weights ---
+# Controls how much each signal contributes to the merged cosine similarity.
+# Values are the squared scale factors so that:
+#   merged cosine = WEIGHT_LYRICS * cos(lyrics) + WEIGHT_AUDIO * cos(audio)
+# Both values must be in [0.0, 1.0]. They are baked into the index at build
+# time; changing them requires rebuilding the SemGrove index.
+SEM_GROVE_WEIGHT_LYRICS = float(get_config("SEM_GROVE_WEIGHT_LYRICS", "0.75"))
+SEM_GROVE_WEIGHT_AUDIO = float(get_config("SEM_GROVE_WEIGHT_AUDIO", "0.25"))
+
+# --- Sentinel vectors for tracks with no detectable lyrics ("instrumental") ---
+# These give us three things at once:
+#   1. analyze_lyrics() can still write a row, so future runs skip the track
+#      instead of re-attempting transcription every time.
+#   2. The vectors are non-zero so cosine similarity is always well-defined.
+#   3. Querying the index with the same sentinel lists every instrumental at
+#      the top, while real songs cannot match them: the embedding sentinel sits on
+#      a single basis axis (cosine to typical text embeddings is ~0), and the
+#      axis sentinel is uniformly negative, which a softmax-derived axis_vector
+#      can never produce.
+import numpy as _np
+
+LYRICS_INSTRUMENTAL_EMBEDDING = _np.zeros(LYRICS_EMBEDDING_DIMENSION, dtype=_np.float32)
+LYRICS_INSTRUMENTAL_EMBEDDING[0] = 1.0
+LYRICS_INSTRUMENTAL_EMBEDDING.flags.writeable = False
+
+# Fill value used for every entry of the instrumental axis_vector. Any negative
+# constant works because real axis_vectors come from softmax (always >= 0), so
+# they cannot occupy the negative orthant. Hardcoded so we never compute
+# sqrt() at runtime.
+LYRICS_INSTRUMENTAL_AXIS_FILL = -0.19245009  # = -1 / sqrt(27), precomputed
+
 # Split CLAP models: audio model for analysis, text model for search
 # Default points to the distilled student model (EfficientAT, epoch 36).
 # The companion external-data file (model_epoch_36.onnx.data) must sit next to it.
@@ -323,16 +856,24 @@ CLAP_PYTHON_MULTITHREADS = get_config("CLAP_PYTHON_MULTITHREADS", "False").lower
 #   Cons: May see gradual VRAM growth on some systems
 PER_SONG_MODEL_RELOAD = get_config("PER_SONG_MODEL_RELOAD", "true").lower() == "true"
 
+# Maximum number of spectrogram patches sent through the MusiCNN embedding
+# model in a single ONNX inference call. Running a whole track as one batch
+# (the previous behavior) makes the convolution activations peak at several
+# GB of RAM/VRAM on long tracks; small batches keep peak memory flat with no
+# measurable speed cost. Set to 0 to disable chunking (one whole-track batch).
+MUSICNN_BATCH_SIZE = int(get_config("MUSICNN_BATCH_SIZE", 8))
+
 # Category weights for CLAP query generation (affects random query sampling probabilities)
 # Higher weights favor categories where CLAP excels (Genre, Instrumentation)
 # Format: JSON string with category names as keys and float weights as values
 CLAP_CATEGORY_WEIGHTS_DEFAULT = {
-    "Genre_Style": 1.0,           # CLAP excels at genre detection
-    "Instrumentation_Vocal": 1.0, # CLAP excels at instrument detection
+    "Genre_Style": 1.0,  # CLAP excels at genre detection
+    "Instrumentation_Vocal": 1.0,  # CLAP excels at instrument detection
     "Emotion_Mood": 1.0,
-    "Voice_Type": 1.0
+    "Voice_Type": 1.0,
 }
 import json
+
 CLAP_CATEGORY_WEIGHTS = json.loads(
     get_config("CLAP_CATEGORY_WEIGHTS", json.dumps(CLAP_CATEGORY_WEIGHTS_DEFAULT))
 )
@@ -344,41 +885,93 @@ CLAP_TOP_QUERIES_COUNT = int(get_config("CLAP_TOP_QUERIES_COUNT", "1000"))
 # Model auto-unloads after this period of inactivity to free ~500MB RAM
 CLAP_TEXT_SEARCH_WARMUP_DURATION = int(get_config("CLAP_TEXT_SEARCH_WARMUP_DURATION", "300"))
 
-# --- MuLan (MuQ) Model Constants (for text search with ONNX Runtime) ---
-MULAN_ENABLED = get_config("MULAN_ENABLED", "false").lower() == "true"
-# MuLan ONNX model directory and file paths
-MULAN_MODEL_DIR = get_config("MULAN_MODEL_DIR", "/app/model/mulan")
-AUDIO_MODEL_PATH = os.path.join(MULAN_MODEL_DIR, "mulan_audio_encoder.onnx")
-TEXT_MODEL_PATH = os.path.join(MULAN_MODEL_DIR, "mulan_text_encoder.onnx")
-TOKENIZER_PATH = os.path.join(MULAN_MODEL_DIR, "tokenizer.json")
-# Note: .onnx.data files (external weights) are auto-loaded by ONNX Runtime from same directory
-MULAN_EMBEDDING_DIMENSION = int(get_config("MULAN_EMBEDDING_DIMENSION", "512"))
+# Duration (in seconds) to keep the gte-multilingual-base lyrics-search model
+# loaded after last use. Auto-unloads after this idle period to free RAM.
+LYRICS_GTE_WARMUP_DURATION = int(get_config("LYRICS_GTE_WARMUP_DURATION", "300"))
 
-# Category weights for MuLan query generation (affects random query sampling probabilities)
-MULAN_CATEGORY_WEIGHTS_DEFAULT = {
-    "Genre_Style": 1.0,
-    "Instrumentation_Vocal": 1.0,
-    "Emotion_Mood": 1.0,
-    "Voice_Type": 1.0
-}
-MULAN_CATEGORY_WEIGHTS = json.loads(
-    get_config("MULAN_CATEGORY_WEIGHTS", json.dumps(MULAN_CATEGORY_WEIGHTS_DEFAULT))
-)
+# --- IVF Index Constants ---
+INDEX_NAME = get_config(
+    "IVF_INDEX_NAME", "music_library"
+)  # The primary key for our index in the DB
+IVF_METRIC = get_config(
+    "IVF_METRIC", "angular"
+)  # Options: 'angular' (Cosine), 'euclidean', 'dot' (InnerProduct)
 
-# Number of random queries to generate for top query recommendations
-MULAN_TOP_QUERIES_COUNT = int(get_config("MULAN_TOP_QUERIES_COUNT", "1000"))
-
-# Duration (in seconds) to keep MuLan models loaded for text search after last use
-MULAN_TEXT_SEARCH_WARMUP_DURATION = int(get_config("MULAN_TEXT_SEARCH_WARMUP_DURATION", "300"))
-
-# --- Voyager Index Constants ---
-INDEX_NAME = get_config("VOYAGER_INDEX_NAME", "music_library") # The primary key for our index in the DB
-VOYAGER_METRIC = get_config("VOYAGER_METRIC", "angular") # Options: 'angular' (Cosine), 'euclidean', 'dot' (InnerProduct)
-VOYAGER_EF_CONSTRUCTION = int(get_config("VOYAGER_EF_CONSTRUCTION", "1024"))
-VOYAGER_M = int(get_config("VOYAGER_M", "64"))
-VOYAGER_QUERY_EF = int(get_config("VOYAGER_QUERY_EF", "1024"))
-VOYAGER_MAX_PART_SIZE_MB = int(get_config("VOYAGER_MAX_PART_SIZE_MB", "50"))  # Max part size (MB) for voyager index storage
-ARTIST_INDEX_MAX_PART_SIZE_MB = int(get_config("ARTIST_INDEX_MAX_PART_SIZE_MB", "50"))  # Max part size (MB) for artist index storage
+# --- Disk-Paged IVF Index Constants ---
+# The large per-song similarity indexes (audio, CLAP, lyrics, SemGrove)
+# are stored as an inverted-file (IVF) index whose cells live in Postgres rows. A
+# query reads only the nearest IVF_NPROBE cells, so the Flask container's resident
+# index memory is bounded by IVF_QUERY_CACHE_MB per index instead of growing with
+# the library size. Cell vectors are quantized per IVF_STORAGE_DTYPE (coarse
+# centroids stay float32, so cell selection / recall is unaffected).
+IVF_STORAGE_DTYPE = get_config(
+    "IVF_STORAGE_DTYPE", "i8"
+).lower()  # Stored cell-vector precision: 'i8' (int8; angular only, euclidean/dot auto-fall to f16), 'f16', or 'f32' (no quantization). Smaller = less RAM/IO; distances are computed directly in that dtype via NumKong with a NumPy fallback. Changing this takes effect on the next index rebuild.
+IVF_NLIST_MAX = int(
+    get_config("IVF_NLIST_MAX", "8192")
+)  # Upper cap on number of IVF cells (coarse centroids)
+IVF_TRAIN_POINTS_PER_CELL = int(
+    get_config("IVF_TRAIN_POINTS_PER_CELL", "50")
+)  # Target training vectors per cell; sample = this x nlist, capped at n_items (FAISS floor ~39)
+IVF_MAX_CELL_MB = int(
+    get_config("IVF_MAX_CELL_MB", "12")
+)  # Oversized cells are split so no single cell exceeds this
+IVF_MAX_PART_SIZE_MB = int(
+    get_config("IVF_MAX_PART_SIZE_MB", "50")
+)  # Hard cap (MB) on every stored BYTEA value (cells and directory parts)
+IVF_NPROBE = int(
+    get_config("IVF_NPROBE", "1024")
+)  # Cells probed per query (X): the dominant recall/latency knob
+IVF_RERANK_OVERFETCH = int(
+    get_config("IVF_RERANK_OVERFETCH", "4")
+)  # int8 is the coarse stage; the similarity query over-fetches this multiple of the candidate pool and re-ranks it with exact float32 (read from the source embedding table) so top-K ordering matches full precision. Higher = more exact tail recall, more per-query f32 reads.
+IVF_QUERY_CACHE_MB = int(
+    get_config("IVF_QUERY_CACHE_MB", "128")
+)  # Hard cap (Y) on the per-request vector cache, in MB
+IVF_READ_BATCH_CELLS = int(
+    get_config("IVF_READ_BATCH_CELLS", "16")
+)  # Cells fetched per DB round-trip during a query
+IVF_QUERY_PARALLEL_MIN_VECTORS = int(
+    get_config("IVF_QUERY_PARALLEL_MIN_VECTORS", "8192")
+)  # Only fan the per-cell distance scan across threads when a query's probed cells hold at least this many vectors; smaller queries stay serial
+INDEX_BUILD_WORKERS = int(
+    get_config("INDEX_BUILD_WORKERS", "0")
+)  # Worker PROCESSES for the CPU-bound parts of an index rebuild (the per-artist GMM fits, which are pure-Python EM and so cannot be threaded). 0 = auto (half the cores, capped at 8); 1 = fit in-process
+IVF_GLOBAL_CACHE_MB = int(
+    get_config("IVF_GLOBAL_CACHE_MB", "1024")
+)  # Hard cap (MB) on the process-wide cross-request decoded-cell cache shared by all indexes; 0 disables it
+IVF_PRELOAD_ALL = (
+    get_config("IVF_PRELOAD_ALL", "false").lower() == "true"
+)  # When true, stream every cell into the global cache at load time (in-memory IVF), still bounded by IVF_GLOBAL_CACHE_MB
+IVF_LAZY_LOAD_RETRY_SECONDS = int(
+    get_config("IVF_LAZY_LOAD_RETRY_SECONDS", "60")
+)  # Only the Flask process loads the indexes at startup; a worker task that queries one (the sonic fingerprint cron) loads it on first query. Minimum seconds between retries when that load finds no index in the database, so a library with no analysis yet is not re-queried per call
+IVF_GLOBAL_CACHE_IDLE_SECONDS = int(
+    get_config("IVF_GLOBAL_CACHE_IDLE_SECONDS", "300")
+)  # Drop the whole global cell cache after this many seconds with no access (frees idle RAM); 0 = never drop
+IVF_RESULT_CACHE_SECONDS = int(
+    get_config("IVF_RESULT_CACHE_SECONDS", "300")
+)  # TTL (s) for cached similar-song / max-distance results so repeated identical queries are instant; 0 = disable
+IVF_RESULT_CACHE_MAX = int(
+    get_config("IVF_RESULT_CACHE_MAX", "2048")
+)  # Max distinct cached query results per result cache
+IVF_MAX_DISTANCE_NPROBE = int(
+    get_config("IVF_MAX_DISTANCE_NPROBE", "256")
+)  # Farthest cells probed for the max-distance display value (reverse-IVF); 0 or >= nlist = exact full scan
+IVF_DISK_CACHE_ENABLED = (
+    get_config("IVF_DISK_CACHE_ENABLED", "true").lower() == "true"
+)  # Export each index's cells to a local file at load and serve queries via mmap (OS page cache), instead of reading from Postgres per query; false = read from Postgres
+IVF_DISK_CACHE_IDLE_SECONDS = int(
+    get_config("IVF_DISK_CACHE_IDLE_SECONDS", "300")
+)  # Drop the resident (RSS) pages of every disk-cache mmap after this many seconds with no query (MADV_DONTNEED; mapping stays, next query re-faults from disk); frees idle RAM; 0 = never drop
+# Local dir for the mmap cell files: native build data dir, else /app/ivf_cache in containers, else a temp dir
+if APP_DATA_DIR:
+    _ivf_disk_cache_default = os.path.join(APP_DATA_DIR, "ivf_cache")
+elif os.path.isdir("/app"):
+    _ivf_disk_cache_default = "/app/ivf_cache"
+else:
+    _ivf_disk_cache_default = os.path.join(tempfile.gettempdir(), "audiomuse_ivf_cache")
+IVF_DISK_CACHE_DIR = get_config("IVF_DISK_CACHE_DIR", "") or _ivf_disk_cache_default
 
 # --- Pathfinding Constants ---
 # The distance metric to use for pathfinding. Options: 'angular', 'euclidean'.
@@ -387,7 +980,7 @@ PATH_DISTANCE_METRIC = get_config("PATH_DISTANCE_METRIC", "angular").lower()
 PATH_DEFAULT_LENGTH = int(get_config("PATH_DEFAULT_LENGTH", "25"))
 # Number of random songs to sample for calculating the average jump distance.
 PATH_AVG_JUMP_SAMPLE_SIZE = int(get_config("PATH_AVG_JUMP_SAMPLE_SIZE", "200"))
-# Number of candidate songs to retrieve from Voyager for each step in the path.
+# Number of candidate songs to retrieve from IVF for each step in the path.
 PATH_CANDIDATES_PER_STEP = int(get_config("PATH_CANDIDATES_PER_STEP", "25"))
 # Multiplier for the core number of steps (Lcore) to generate more backbone centroids.
 PATH_LCORE_MULTIPLIER = int(get_config("PATH_LCORE_MULTIPLIER", "3"))
@@ -399,6 +992,10 @@ PATH_LCORE_MULTIPLIER = int(get_config("PATH_LCORE_MULTIPLIER", "3"))
 # in potentially shorter paths). Can be overridden via env var PATH_FIX_SIZE.
 PATH_FIX_SIZE = get_config("PATH_FIX_SIZE", "False").lower() == 'true'
 
+# Path to the JSON file containing mood centroids for the path-to-mood feature.
+MOOD_CENTROIDS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'mood_centroids_real_080_clap.json'
+)
 
 # --- Song Alchemy Defaults ---
 # Number of similar songs to return when creating the Alchemy result (default 100, max 200)
@@ -408,9 +1005,15 @@ ALCHEMY_MAX_N_RESULTS = int(get_config("ALCHEMY_MAX_N_RESULTS", "200"))
 ALCHEMY_TEMPERATURE = float(get_config("ALCHEMY_TEMPERATURE", "1.0"))
 # Minimum distance from the subtract-centroid to keep a candidate (metric-dependent).
 # For angular (cosine-derived) distances this is in [0,1] where higher means more distant.
-ALCHEMY_SUBTRACT_DISTANCE = float(get_config("ALCHEMY_SUBTRACT_DISTANCE", "0.2"))
 ALCHEMY_SUBTRACT_DISTANCE_ANGULAR = float(get_config("ALCHEMY_SUBTRACT_DISTANCE_ANGULAR", "0.2"))
-ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN = float(get_config("ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN", "5.0"))
+ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN = float(
+    get_config("ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN", "5.0")
+)
+
+# --- Song Alchemy Playlist Input ---
+ALCHEMY_PLAYLIST_MAX_SONGS = int(get_config("ALCHEMY_PLAYLIST_MAX_SONGS", "500"))
+ALCHEMY_PLAYLIST_MAX_CENTROIDS = int(get_config("ALCHEMY_PLAYLIST_MAX_CENTROIDS", "10"))
+ALCHEMY_MAX_ANCHOR_POINTS = int(get_config("ALCHEMY_MAX_ANCHOR_POINTS", "16"))
 
 
 # --- Other Feature Labels (computed via CLAP text-audio similarity) ---
@@ -422,37 +1025,152 @@ ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN = float(get_config("ALCHEMY_SUBTRACT_DISTANC
 ENERGY_MIN = float(get_config("ENERGY_MIN", "0.01"))
 ENERGY_MAX = float(get_config("ENERGY_MAX", "0.15"))
 
+# --- Plugin System ---
+# Master switch for the plugin subsystem (discovery, loading, admin UI).
+PLUGINS_ENABLED = get_config("PLUGINS_ENABLED", "true").lower() == "true"
+# Where installed plugin code and its pip dependencies live. The `plugins` DB table
+# keeps only metadata plus a re-download URL, not the zip, so mount this on a
+# persistent volume to keep plugins across restarts. If it is empty at boot the app
+# re-downloads each plugin from its source URL and reinstalls its deps (logged as a
+# warning). Native/standalone builds set APP_DATA_DIR; containers fall back to
+# <repo>/plugin/installed.
+if APP_DATA_DIR:
+    _plugins_dir_default = os.path.join(APP_DATA_DIR, "plugins")
+else:
+    _plugins_dir_default = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "plugin", "installed"
+    )
+PLUGINS_DIR = get_config("PLUGINS_DIR", "") or _plugins_dir_default
+# Default community catalog (a static Jellyfin-style manifest.json hosted on GitHub raw).
+PLUGIN_DEFAULT_REPO_URL = get_config(
+    "PLUGIN_DEFAULT_REPO_URL",
+    "https://raw.githubusercontent.com/NeptuneHub/AudioMuse-AI-plugins/main/manifest.json",
+)
+# Hard cap on a downloaded plugin package (MB) to bound the DB blob and extraction.
+PLUGIN_MAX_DOWNLOAD_MB = int(get_config("PLUGIN_MAX_DOWNLOAD_MB", "50"))
+# Allow pip-installing plugin requirements into PLUGINS_DIR/_lib (Docker/k8s only;
+# auto-disabled on frozen PyInstaller builds which cannot pip into the bundle).
+PLUGIN_ALLOW_PIP = get_config("PLUGIN_ALLOW_PIP", "true").lower() == "true"
+# Plugin catalog/manifest HTTP timeouts (seconds). PLUGIN_HTTP_FORCE_IPV4 (default true)
+# already avoids the broken-IPv6 stall, so CONNECT no longer needs to be tiny: a container's
+# egress to GitHub's CDN often needs several seconds to complete the TCP handshake even when
+# a browser on the same LAN connects instantly, so a 2s bound was rejecting working hosts.
+PLUGIN_HTTP_CONNECT_TIMEOUT = float(get_config("PLUGIN_HTTP_CONNECT_TIMEOUT", "10"))
+PLUGIN_HTTP_READ_TIMEOUT = float(get_config("PLUGIN_HTTP_READ_TIMEOUT", "20"))
+# Plugin downloads retry transient failures with exponential backoff before giving up.
+# GitHub's raw/Fastly and release CDNs drop connections, rate-limit with 429, and are
+# flaky over IPv6, so one click should not fail on the first hiccup. backoff_factor 0.5
+# with 4 retries waits ~0, 0.5, 1, 2, 4s between attempts.
+PLUGIN_HTTP_RETRIES = int(get_config("PLUGIN_HTTP_RETRIES", "4"))
+PLUGIN_HTTP_BACKOFF = float(get_config("PLUGIN_HTTP_BACKOFF", "0.5"))
+# raw.githubusercontent.com is often unreachable over IPv6 from a container whose pod
+# has an IPv6 address but no IPv6 egress (Errno 101 Network is unreachable). Default true
+# pins all outbound HTTP to IPv4 so the broken AAAA path is never tried; set this to false
+# only on an IPv6-only host.
+PLUGIN_HTTP_FORCE_IPV4 = get_config("PLUGIN_HTTP_FORCE_IPV4", "true").lower() == "true"
+# Concurrency for resolving per-plugin manifests when building the catalog.
+PLUGIN_CATALOG_FETCH_WORKERS = int(get_config("PLUGIN_CATALOG_FETCH_WORKERS", "8"))
+# How long (seconds) the catalog's latest-version map is reused to flag "update available"
+# on the Installed tab before a background refresh re-checks the repos. This is what lets
+# the Installed list show updates instantly instead of blocking on a live GitHub fetch.
+PLUGIN_CATALOG_CACHE_TTL = int(get_config("PLUGIN_CATALOG_CACHE_TTL", "900"))
+# The web process also refreshes the catalog cache on its own: once at startup and then
+# every this many seconds (default 1 hour), so update buttons appear even when nobody
+# opens the Catalog tab. Opening the Catalog tab or clicking Refresh also triggers it.
+PLUGIN_CATALOG_REFRESH_INTERVAL = int(get_config("PLUGIN_CATALOG_REFRESH_INTERVAL", "3600"))
+# How long plugin boot waits for the database to accept connections before giving
+# up (the RQ workers boot plugins before the Postgres pod is guaranteed ready; a
+# transient 'connection refused' would otherwise disable plugins until restart).
+PLUGIN_BOOT_DB_WAIT_SECONDS = int(get_config("PLUGIN_BOOT_DB_WAIT_SECONDS", "60"))
+PLUGIN_BOOT_DB_WAIT_INTERVAL = float(get_config("PLUGIN_BOOT_DB_WAIT_INTERVAL", "2"))
+
 # --- Tempo Normalization Range (BPM) ---
 TEMPO_MIN_BPM = float(get_config("TEMPO_MIN_BPM", "40.0"))
 TEMPO_MAX_BPM = float(get_config("TEMPO_MAX_BPM", "200.0"))
 OTHER_FEATURE_LABELS = ['danceable', 'aggressive', 'happy', 'party', 'relaxed', 'sad']
 
-# Redis cache key for CLAP text embeddings of OTHER_FEATURE_LABELS
-CLAP_OTHER_FEATURES_REDIS_KEY = get_config("CLAP_OTHER_FEATURES_REDIS_KEY", "audiomuse:clap_other_feature_text_embeddings")
+# Voice vocabulary used in MCP system prompts
+VOICE_VOCAB = ["female vocalists", "female vocalist", "male vocalists"]
+
+# Fallback genre list used when library context has no top genres
+AI_FALLBACK_GENRES = (
+    "rock, pop, metal, jazz, electronic, dance, alternative, indie, punk, blues, "
+    "hard rock, heavy metal, hip-hop, funk, country, soul"
+)
+
+# Redis cache key for CLAP text embeddings
+CLAP_OTHER_FEATURES_REDIS_KEY = get_config(
+    "CLAP_OTHER_FEATURES_REDIS_KEY", "audiomuse:clap_other_feature_text_embeddings"
+)
 
 # --- Sonic Fingerprint Constants ---
 SONIC_FINGERPRINT_TOP_N_SONGS = int(get_config("SONIC_FINGERPRINT_TOP_N_SONGS", "20"))
+# Max tracks a single album may contribute to the seed pool, so one large album
+# (e.g. a 100+ track DJ mix) cannot dominate the fingerprint - see issue #603.
+SONIC_FINGERPRINT_MAX_SONGS_PER_ALBUM = int(
+    get_config("SONIC_FINGERPRINT_MAX_SONGS_PER_ALBUM", "3")
+)
 SONIC_FINGERPRINT_NEIGHBORS = int(get_config("SONIC_FINGERPRINT_NEIGHBORS", "100"))
+SONIC_FINGERPRINT_CRON_PLAYLIST_NAME = get_config(
+    "SONIC_FINGERPRINT_CRON_PLAYLIST_NAME",
+    "Sonic Fingerprint by AudioMuse-AI",
+)
 
 # --- Database Cleaning Safety ---
-CLEANING_SAFETY_LIMIT = int(get_config("CLEANING_SAFETY_LIMIT", "100"))  # Max orphaned albums to delete in one run
+CLEANING_SAFETY_LIMIT = int(
+    get_config("CLEANING_SAFETY_LIMIT", "100")
+)  # Max unbound-on-every-server albums listed in the cleaning report
+# When true, cleaning also DELETES catalogue rows bound to no server (orphans); when false it only
+# unbinds each server's stale mappings and leaves the catalogue untouched. Default false; the cleaning
+# page has a per-run checkbox to enable it for a single run without changing this default.
+CLEANING_CATALOGUE = get_config("CLEANING_CATALOGUE", "False").lower() == "true"
+SWEEP_PRUNE_MIN_FETCH_RATIO = float(
+    get_config("SWEEP_PRUNE_MIN_FETCH_RATIO", "0.5")
+)  # A sweep/cleaning prune is refused when the server returns fewer than this fraction of the tracks it still has mapped, so a partial fetch cannot wipe the mappings. Lower it only to prune a library that legitimately shrank that much
 
 # --- Stratified Sampling Constants (New) ---
 # Genres for which to enforce equal representation during stratified sampling
 STRATIFIED_GENRES = [
-    'rock', 'pop', 'alternative', 'indie', 'electronic', 'jazz', 'metal', 'classic rock', 'soul',
-    'indie rock', 'electronica', 'folk', 'punk', 'blues', 'hard rock', 'ambient', 'acoustic',
-    'experimental', 'Hip-Hop', 'country', 'funk', 'electro', 'heavy metal', 'Progressive rock',
-    'rnb', 'indie pop', 'House'
+    'rock',
+    'pop',
+    'alternative',
+    'indie',
+    'electronic',
+    'jazz',
+    'metal',
+    'classic rock',
+    'soul',
+    'indie rock',
+    'electronica',
+    'folk',
+    'punk',
+    'blues',
+    'hard rock',
+    'ambient',
+    'acoustic',
+    'experimental',
+    'Hip-Hop',
+    'country',
+    'funk',
+    'electro',
+    'heavy metal',
+    'Progressive rock',
+    'rnb',
+    'indie pop',
+    'House',
 ]
 
 # Minimum number of songs to target per genre for stratified sampling.
 # This will be dynamically adjusted based on actual available songs.
-MIN_SONGS_PER_GENRE_FOR_STRATIFICATION = int(get_config("MIN_SONGS_PER_GENRE_FOR_STRATIFICATION", "100"))
+MIN_SONGS_PER_GENRE_FOR_STRATIFICATION = int(
+    get_config("MIN_SONGS_PER_GENRE_FOR_STRATIFICATION", "100")
+)
 
 # Percentile to use for determining the target number of songs per genre in stratified sampling.
 # E.g., 75 means the target will be based on the 75th percentile of song counts among stratified genres.
-STRATIFIED_SAMPLING_TARGET_PERCENTILE = int(get_config("STRATIFIED_SAMPLING_TARGET_PERCENTILE", "50"))
+STRATIFIED_SAMPLING_TARGET_PERCENTILE = int(
+    get_config("STRATIFIED_SAMPLING_TARGET_PERCENTILE", "50")
+)
 
 # Percentage of songs to change in the stratified sample between clustering runs (0.0 to 1.0)
 SAMPLING_PERCENTAGE_CHANGE_PER_RUN = float(get_config("SAMPLING_PERCENTAGE_CHANGE_PER_RUN", "0.2"))
@@ -461,9 +1179,63 @@ SAMPLING_PERCENTAGE_CHANGE_PER_RUN = float(get_config("SAMPLING_PERCENTAGE_CHANG
 # --- NEW: Duplicate Detection by Distance ---
 # Threshold for considering songs as duplicates based on their distance in the vector space.
 # This helps catch identical songs with slightly different metadata (e.g., from different albums).
-DUPLICATE_DISTANCE_THRESHOLD_COSINE = float(get_config("DUPLICATE_DISTANCE_THRESHOLD_COSINE", "0.01"))
-DUPLICATE_DISTANCE_THRESHOLD_EUCLIDEAN = float(get_config("DUPLICATE_DISTANCE_THRESHOLD_EUCLIDEAN", "0.15"))
+DUPLICATE_DISTANCE_THRESHOLD_COSINE = float(
+    get_config("DUPLICATE_DISTANCE_THRESHOLD_COSINE", "0.01")
+)
+DUPLICATE_DISTANCE_THRESHOLD_COSINE_LYRICS = float(
+    get_config("DUPLICATE_DISTANCE_THRESHOLD_COSINE_LYRICS", "0.05")
+)
+DUPLICATE_DISTANCE_THRESHOLD_EUCLIDEAN = float(
+    get_config("DUPLICATE_DISTANCE_THRESHOLD_EUCLIDEAN", "0.15")
+)
 DUPLICATE_DISTANCE_CHECK_LOOKBACK = int(get_config("DUPLICATE_DISTANCE_CHECK_LOOKBACK", "1"))
+# Max track-length difference (seconds) for two same-embedding tracks to count as the SAME
+# recording for catalogue identity. Tightened to 1s: two songs that merely sound alike but
+# differ in length by more than this are kept separate. Unknown duration = not the same.
+DURATION_TOLERANCE_SECONDS = float(get_config("DURATION_TOLERANCE_SECONDS", "1.0"))
+# Version of the fp_<n> content-id scheme. New ids are minted as fp_<this>, and the startup
+# migration relabels every older-version fp_ id up to it exactly once (fp_2 -> fp_3 added track
+# duration; fp_3 -> fp_4 re-verifies existing merges at the tightened DURATION_TOLERANCE_SECONDS,
+# splitting any group whose files now differ in length by more than it). To force a one-time
+# catalogue re-migration in the future, bump ONLY this number.
+CATALOGUE_ID_SCHEME_VERSION = int(get_config("CATALOGUE_ID_SCHEME_VERSION", "4"))
+
+# --- Chromaprint acoustic fingerprint (optional dedup confirmation) ---
+# Real Chromaprint (computed by the fpcalc binary) stored per file in the chromaprint table and
+# used as an EXTRA agreement check on top of the MusiCNN embedding + duration when deciding two
+# files are the same recording. If either file lacks a fingerprint the check is skipped and the
+# behaviour is identical to before, so legacy libraries roll in gradually as fingerprints backfill.
+# Path to the fpcalc binary: found on PATH inside Docker, set by the standalone launcher when bundled.
+FPCALC_BINARY = get_config("FPCALC", "fpcalc")
+# Compute and store a fingerprint for every newly analyzed track.
+CHROMAPRINT_COLLECTION_ENABLED = (
+    get_config("CHROMAPRINT_COLLECTION_ENABLED", "True").lower() == "true"
+)
+# Albums (per server) whose already-analyzed tracks get a fingerprint back-filled each analysis
+# run. Editable in the setup wizard (advanced section) and applied on the next analysis.
+CHROMAPRINT_BACKFILL_ALBUMS_PER_RUN = int(get_config("CHROMAPRINT_BACKFILL_ALBUMS_PER_RUN", "1000"))
+# Seconds between progress writes (and cancellation polls) inside the backfill loop. The loop
+# downloads and fingerprints one track at a time, so a 1000-album run is hours of work: without
+# a periodic write the task row's timestamp freezes, the UI looks hung at 99%, Cancel is ignored,
+# and the janitor sees a stale row it must not reap.
+CHROMAPRINT_BACKFILL_REPORT_SECONDS = int(get_config("CHROMAPRINT_BACKFILL_REPORT_SECONDS", "15"))
+# Use stored fingerprints in the duplicate/identity decision (skipped per-pair when either is absent).
+CHROMAPRINT_GATE_ENABLED = get_config("CHROMAPRINT_GATE_ENABLED", "True").lower() == "true"
+# Fraction of matching bits (best alignment) at or above which two fingerprints are the same recording.
+# High (0.95) = split aggressively: only near-identical audio merges, minimizing false "duplicate".
+CHROMAPRINT_MATCH_THRESHOLD = float(get_config("CHROMAPRINT_MATCH_THRESHOLD", "0.95"))
+# Max +/- frame offset searched when aligning two fingerprints of slightly different length.
+CHROMAPRINT_MAX_ALIGN_OFFSET = int(get_config("CHROMAPRINT_MAX_ALIGN_OFFSET", "12"))
+# Minimum overlapping frames required to trust a comparison; below this the check abstains.
+CHROMAPRINT_MIN_OVERLAP = int(get_config("CHROMAPRINT_MIN_OVERLAP", "40"))
+
+# --- Dashboard "Browse" listing view ---
+# Rows per page in the Song/Artist/Album browse view opened from the dashboard.
+DASHBOARD_BROWSE_PAGE_SIZE = int(get_config("DASHBOARD_BROWSE_PAGE_SIZE", "100"))
+# The deepest OFFSET a browse query may reach. Guards a 1M-row catalogue from a
+# pathological deep-page scan: past this the API stops paging and asks the user to
+# refine with search/filters (every query is always LIMIT-bounded regardless).
+DASHBOARD_BROWSE_MAX_OFFSET = int(get_config("DASHBOARD_BROWSE_MAX_OFFSET", "50000"))
 
 # --- Mood Similarity Filtering ---
 # Threshold for mood similarity filtering. Lower values = stricter filtering (more similar moods required).
@@ -484,6 +1256,11 @@ MOOD_SIMILARITY_ENABLE = get_config("MOOD_SIMILARITY_ENABLE", "False").lower() =
 #   proxy_set_header X-Forwarded-Proto https;
 #   proxy_set_header X-Forwarded-Prefix /audiomuseai;
 # }
+# The trailing slash on BOTH 'location /audiomuseai/' and 'proxy_pass .../' is
+# required: it makes nginx strip the subpath before forwarding. Without it the
+# full path reaches the app while X-Forwarded-Prefix is still sent, doubling the
+# prefix; the app now collapses that duplication (StripDuplicatedScriptName) so
+# it no longer loops to /audiomuseai/setup, but stripping at the proxy is correct.
 ENABLE_PROXY_FIX = get_config("ENABLE_PROXY_FIX", "False").lower() == "true"
 
 # --- Instant Playlist Optimization ---
@@ -491,6 +1268,23 @@ ENABLE_PROXY_FIX = get_config("ENABLE_PROXY_FIX", "False").lower() == "true"
 MAX_SONGS_PER_ARTIST_PLAYLIST = int(get_config("MAX_SONGS_PER_ARTIST_PLAYLIST", "5"))
 # Enable energy-arc shaping for playlist ordering (gentle start -> peak -> cool down)
 PLAYLIST_ENERGY_ARC = get_config("PLAYLIST_ENERGY_ARC", "False").lower() == "true"
+
+# --- Instant Playlist AI Brainstorm ---
+AI_BRAINSTORM_SOUND_DESCRIPTIONS_MAX = int(get_config("AI_BRAINSTORM_SOUND_DESCRIPTIONS_MAX", "3"))
+AI_BRAINSTORM_SEED_ARTISTS_MAX = int(get_config("AI_BRAINSTORM_SEED_ARTISTS_MAX", "4"))
+AI_BRAINSTORM_USE_ARTIST_SEEDS = (
+    get_config("AI_BRAINSTORM_USE_ARTIST_SEEDS", "true").lower() == "true"
+)
+AI_BRAINSTORM_SIMILAR_ARTISTS_PER_SEED = int(
+    get_config("AI_BRAINSTORM_SIMILAR_ARTISTS_PER_SEED", "8")
+)
+AI_BRAINSTORM_LYRIC_THEMES_MAX = int(get_config("AI_BRAINSTORM_LYRIC_THEMES_MAX", "2"))
+AI_BRAINSTORM_GENRE_SCORE_THRESHOLD = float(
+    get_config("AI_BRAINSTORM_GENRE_SCORE_THRESHOLD", "0.3")
+)
+AI_BRAINSTORM_POOL_FLOOR = int(get_config("AI_BRAINSTORM_POOL_FLOOR", "40"))
+AI_BRAINSTORM_RELAX_YEAR_PAD = int(get_config("AI_BRAINSTORM_RELAX_YEAR_PAD", "5"))
+
 # --- Authentication ---
 # Set all three to enable authentication. Leave any blank to disable (legacy mode).
 AUDIOMUSE_USER = get_config("AUDIOMUSE_USER", "")
@@ -500,3 +1294,85 @@ API_TOKEN = get_config("API_TOKEN", "")
 # JWT secret for signing session tokens. Auto-generated if not set (sessions lost on restart).
 # Note: the warning for missing JWT_SECRET is emitted in app.py after logging is configured
 JWT_SECRET = get_config("JWT_SECRET", "")
+
+# Enable or disable authentication independently of whether credentials are set.
+# Default is True to preserve the current secure behavior.
+AUTH_ENABLED = get_config("AUTH_ENABLED", "True").lower() == "true"
+
+# True once the database overrides and the default music server were projected
+# onto these globals. False means this process is running on env values only.
+# NOTE: every SetupManager read swallows connection failures (table check ->
+# False, overrides -> {}, default row -> None), so this flag is True even when
+# Postgres was unreachable and nothing actually arrived.
+DB_OVERRIDES_LOADED = False
+
+# True only when the music_servers default row was found and projected, which
+# proves the database was actually reached. This is the only reliable "the
+# projection is real" signal; MEDIASERVER_TYPE cannot serve because its env
+# default ('jellyfin') makes it non-empty on a blind env-only boot too.
+DB_DEFAULT_SERVER_PROJECTED = False
+
+
+# Reload this module from the current database and environment.
+def refresh_config():
+    import importlib
+    import sys
+
+    importlib.reload(sys.modules[__name__])
+
+
+def _apply_db_overrides():
+    global HEADERS, DB_OVERRIDES_LOADED, DB_DEFAULT_SERVER_PROJECTED
+    DB_OVERRIDES_LOADED = False
+    DB_DEFAULT_SERVER_PROJECTED = False
+    try:
+        from tasks.setup_manager import SetupManager
+
+        _setup_manager = SetupManager()
+        worker_mode = get_config('AUDIOMUSE_ROLE', '').lower() == 'worker'
+        if worker_mode:
+            if _setup_manager.config_table_exists():
+                _overrides = _setup_manager.get_raw_overrides(ensure_table=False)
+            else:
+                _overrides = {}
+        else:
+            _setup_manager.ensure_table()
+            _overrides = _setup_manager.get_raw_overrides()
+        _excluded_override_keys = globals().get('SETUP_BOOTSTRAP_EXCLUDED_KEYS', set())
+        for _key, _value in _overrides.items():
+            # Skip any keys that are explicitly excluded from overrides (Redis and Postgres)
+            if _key in _excluded_override_keys:
+                continue
+            # Read the value from the db and override the variable
+            if _key in globals():
+                globals()[_key] = _setup_manager.cast_value(globals()[_key], _value)
+
+        # Media-server settings live ONLY in the music_servers registry: project
+        # its default row onto the module globals so every legacy config read
+        # (providers, HEADERS, wizard display) sees the registry values. Legacy
+        # app_config rows may still have applied above on a not-yet-migrated
+        # install; the registry wins whenever its row exists.
+        _default_ms = _setup_manager.get_default_music_server()
+        if _default_ms:
+            globals()['MEDIASERVER_TYPE'] = (_default_ms.get('server_type') or '').lower()
+            globals()['MUSIC_LIBRARIES'] = _default_ms.get('music_libraries') or ''
+            _ms_creds = _default_ms.get('creds') or {}
+            for _field in MEDIASERVER_FIELDS_BY_TYPE.get(globals()['MEDIASERVER_TYPE'], []):
+                _cred_key = MEDIASERVER_CRED_KEY_BY_FIELD.get(_field)
+                if _cred_key:
+                    globals()[_field] = _ms_creds.get(_cred_key, '') or ''
+            DB_DEFAULT_SERVER_PROJECTED = True
+
+        HEADERS = _compute_headers()
+        DB_OVERRIDES_LOADED = True
+    except Exception:
+        # A dead database must never fail config import: the process keeps its
+        # env-only values and a later refresh_config() can still heal it.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Could not load config overrides from DB", exc_info=True
+        )
+
+
+_apply_db_overrides()

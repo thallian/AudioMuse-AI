@@ -1,0 +1,158 @@
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""Public entry point and lifecycle guard for the lyrics analysis package.
+
+Re-exports the lyrics transcription and embedding surface (analyze_lyrics,
+axis_columns, embed_query_text and the model loaders) while degrading
+gracefully when the feature is disabled or its optional dependencies are
+missing. It shields the rest of the app from import-time failures in the
+whisper_onnx, gte_onnx and silero_onnx submodules.
+
+Main Features:
+* Honors the LYRICS_ENABLED flag and swaps every export for a _disabled stub
+  that raises a clear RuntimeError instead of a bare ImportError.
+* Exposes is_lyrics_loaded / unload_lyrics_models to report and release the
+  loaded ONNX sessions, running gc plus comprehensive_memory_cleanup to free
+  roughly 2 GB of resident model memory.
+"""
+
+import logging as _logging
+
+try:
+    from config import LYRICS_ENABLED as _LYRICS_ENABLED
+except Exception:
+    _LYRICS_ENABLED = True
+
+_logger = _logging.getLogger(__name__)
+
+
+def _disabled(*_args, **_kwargs):
+    raise RuntimeError(
+        "Lyrics analysis is disabled (LYRICS_ENABLED=false) or its dependencies "
+        "are not installed in this image."
+    )
+
+
+if _LYRICS_ENABLED:
+    try:
+        from .lyrics_transcriber import (
+            MUSIC_ANALYSIS_AXES,
+            analyze_lyrics,
+            axis_columns,
+            embed_query_text,
+            load_topic_embedding_model,
+            load_asr_model,
+        )
+    except Exception as _exc:
+        _logger.warning(
+            "Lyrics module failed to load (%s); disabling lyrics features.",
+            _exc,
+        )
+        MUSIC_ANALYSIS_AXES = {}
+        analyze_lyrics = _disabled
+        axis_columns = _disabled
+        embed_query_text = _disabled
+        load_topic_embedding_model = _disabled
+        load_asr_model = _disabled
+else:
+    _logger.info("Lyrics features are disabled (LYRICS_ENABLED=false).")
+    MUSIC_ANALYSIS_AXES = {}
+    analyze_lyrics = _disabled
+    axis_columns = _disabled
+    embed_query_text = _disabled
+    load_topic_embedding_model = _disabled
+    load_asr_model = _disabled
+
+
+def _safe_call(label, fn):
+    try:
+        return fn()
+    except Exception as exc:
+        _logger.warning("Lyrics %s: %s", label, exc)
+        return None
+
+
+def is_lyrics_loaded() -> bool:
+    if not _LYRICS_ENABLED:
+        return False
+    try:
+        from ._asr_backend import get_asr_backend
+        from . import gte_onnx, silero_onnx
+
+        whisper_mod = get_asr_backend()
+    except Exception:
+        return False
+    for mod in (whisper_mod, gte_onnx, silero_onnx):
+        try:
+            if mod.is_loaded():
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def unload_lyrics_models() -> bool:
+    if not _LYRICS_ENABLED:
+        return False
+    released_any = False
+    try:
+        try:
+            from ._asr_backend import get_asr_backend
+
+            whisper_mod = get_asr_backend()
+            if whisper_mod.is_loaded():
+                released_any = bool(_safe_call('whisper.unload', whisper_mod.unload))
+        except Exception as exc:
+            _logger.warning("Lyrics whisper release failed: %s", exc)
+
+        try:
+            from . import gte_onnx
+
+            if gte_onnx.is_loaded():
+                _safe_call('gte_onnx.reset_session', gte_onnx.reset_session)
+                released_any = True
+        except Exception as exc:
+            _logger.warning("Lyrics gte_onnx release failed: %s", exc)
+
+        try:
+            from . import silero_onnx
+
+            if silero_onnx.is_loaded():
+                _safe_call('silero_onnx.reset_session', silero_onnx.reset_session)
+                released_any = True
+        except Exception as exc:
+            _logger.warning("Lyrics silero_onnx release failed: %s", exc)
+    finally:
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            from tasks.memory_utils import comprehensive_memory_cleanup
+
+            comprehensive_memory_cleanup(force_cuda=False, reset_onnx_pool=True)
+        except Exception as exc:
+            _logger.warning("Lyrics final memory cleanup failed: %s", exc)
+    if released_any:
+        _logger.info("Lyrics models unloaded (~2 GB freed)")
+    return released_any
+
+
+__all__ = [
+    'MUSIC_ANALYSIS_AXES',
+    'analyze_lyrics',
+    'axis_columns',
+    'embed_query_text',
+    'load_topic_embedding_model',
+    'load_asr_model',
+    'is_lyrics_loaded',
+    'unload_lyrics_models',
+]

@@ -1,661 +1,398 @@
-"""
-CLAP Text Search Manager
-Provides in-memory caching and fast text-based music search using CLAP embeddings.
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""Natural-language ("search by text") lookup over stored CLAP audio embeddings.
+
+Serves the text-to-song search feature: an in-process cache of CLAP audio
+embeddings plus their IVF index is loaded from the DB, and a query string is
+embedded with the CLAP text encoder (tasks.clap_analyzer) and matched against it.
+Manages its own warm-up and idle unload of the text model to bound worker RSS.
+
+Main Features:
+* build_and_store / load / refresh of the CLAP embedding cache and its IVF index.
+* search_by_text: embed the query and return ranked nearest songs.
+* warmup_text_search_model with an idle-unload timer, plus a persisted top-queries
+  table (ensure_text_search_queries_table) used to pre-warm popular searches.
 """
 
 import logging
-import numpy as np
-from typing import List, Dict, Optional
-from psycopg2.extras import DictCursor
-import config
+import sys
 import threading
 import time
 
+import numpy as np
+from psycopg2.extras import DictCursor
+from typing import List, Dict
+import config
+
 logger = logging.getLogger(__name__)
 
-# Global in-memory cache
-_CLAP_CACHE = {
-    'embeddings': None,  # NumPy array (N, 512)
-    'metadata': None,    # List of dicts with item_id, title, author
-    'item_ids': None,    # List of item_ids
-    'loaded': False
-}
+_CLAP_CACHE = {'loaded': False}
 
-# Top queries cache (precomputed at startup)
-_TOP_QUERIES_CACHE = {
-    'queries': [],
-    'ready': False,
-    'computing': False
-}
+_CLAP_INDEX_CACHE = {'index': None, 'id_map': None, 'reverse_id_map': None, 'loaded': False}
 
-# Warm cache timer for text search (keeps model loaded)
+_TOP_QUERIES_CACHE = {'queries': [], 'ready': False, 'computing': False}
+
 _WARM_CACHE_TIMER = {
-    'expiry_time': None,  # Unix timestamp when model should unload
-    'timer_thread': None,  # Background thread for unloading
-    'lock': threading.Lock(),
-    'duration_seconds': None  # Loaded from config on first use
+    'expiry_time': None,
+    'timer_thread': None,
+    'lock': threading.RLock(),
+    'duration_seconds': None,
 }
 
 
 def get_clap_cache_size() -> int:
-    """Return the number of embeddings in the CLAP cache."""
-    global _CLAP_CACHE
-    if _CLAP_CACHE['loaded'] and _CLAP_CACHE['embeddings'] is not None:
-        return len(_CLAP_CACHE['embeddings'])
+    if _CLAP_INDEX_CACHE['loaded'] and _CLAP_INDEX_CACHE['id_map'] is not None:
+        return len(_CLAP_INDEX_CACHE['id_map'])
     return 0
 
 
+def _fetch_clap_metadata(item_ids: list) -> Dict[str, Dict[str, str]]:
+    from .commons import fetch_track_metadata_map
+
+    return fetch_track_metadata_map(item_ids)
+
+
+def _load_clap_index_from_db() -> bool:
+    from app_helper import get_db
+    from config import CLAP_EMBEDDING_DIMENSION, IVF_METRIC
+    from .paged_ivf import load_index_auto
+
+    try:
+        loaded = load_index_auto(
+            get_db(),
+            'clap_index',
+            CLAP_EMBEDDING_DIMENSION,
+            IVF_METRIC,
+            label='CLAP',
+        )
+        if loaded is None:
+            return False
+        loaded_index, id_map, reverse_id_map = loaded
+
+        _CLAP_CACHE['loaded'] = True
+
+        _CLAP_INDEX_CACHE['index'] = loaded_index
+        _CLAP_INDEX_CACHE['id_map'] = id_map
+        _CLAP_INDEX_CACHE['reverse_id_map'] = reverse_id_map
+        _CLAP_INDEX_CACHE['loaded'] = True
+
+        logger.info(f"CLAP index loaded from database with {len(id_map)} items.")
+        return True
+    except Exception:
+        logger.exception("Failed to load CLAP index from DB")
+        return False
+
+
+def build_and_store_clap_index(db_conn=None):
+    from app_helper import get_db
+    from config import CLAP_EMBEDDING_DIMENSION, IVF_METRIC
+    from .index_build_helpers import build_and_store_index_streaming
+
+    if db_conn is None:
+        db_conn = get_db()
+
+    return build_and_store_index_streaming(
+        db_conn,
+        source_table="clap_embedding",
+        source_column="embedding",
+        dim=CLAP_EMBEDDING_DIMENSION,
+        target_table="clap_index_data",
+        index_name="clap_index",
+        metric=IVF_METRIC,
+        label="CLAP",
+    )
+
+
 def _unload_timer_worker():
-    """Background thread that unloads CLAP text model after timer expires."""
-    global _WARM_CACHE_TIMER
-    
     while True:
         with _WARM_CACHE_TIMER['lock']:
             expiry = _WARM_CACHE_TIMER['expiry_time']
-        
-        if expiry is None:
-            # Timer cancelled, exit thread
-            break
-        
-        time_remaining = expiry - time.time()
-        
-        if time_remaining <= 0:
-            # Timer expired - unload text model only
-            from .clap_analyzer import unload_clap_model, is_clap_text_loaded
-            
-            if is_clap_text_loaded():
-                logger.info("Warm cache timer expired - unloading CLAP text model")
-                unload_clap_model()
-            
-            with _WARM_CACHE_TIMER['lock']:
+            if expiry is None:
+                break
+            if expiry - time.time() <= 0:
+                from .clap_analyzer import unload_clap_model, is_clap_text_loaded
+
+                if is_clap_text_loaded():
+                    logger.info("Warm cache timer expired - unloading CLAP text model")
+                    unload_clap_model()
                 _WARM_CACHE_TIMER['expiry_time'] = None
                 _WARM_CACHE_TIMER['timer_thread'] = None
-            break
-        
-        # Sleep in 1-second chunks to check for cancellation
-        time.sleep(min(1.0, time_remaining))
+                break
+            time_remaining = expiry - time.time()
+
+        time.sleep(min(1.0, max(0.05, time_remaining)))
 
 
 def warmup_text_search_model():
-    """Preload CLAP text model (not audio model) and reset warmup timer.
-    
-    Returns:
-        dict: Status with 'loaded' (bool) and 'expiry_seconds' (int)
-    """
-    global _WARM_CACHE_TIMER
     from .clap_analyzer import initialize_clap_text_model, is_clap_text_loaded
-    
-    # Load duration from config on first use
+
     if _WARM_CACHE_TIMER['duration_seconds'] is None:
         _WARM_CACHE_TIMER['duration_seconds'] = config.CLAP_TEXT_SEARCH_WARMUP_DURATION
-    
-    # Load text model only (not audio model - saves 268MB)
-    if not is_clap_text_loaded():
-        logger.info("Warming up CLAP text model for text search (not loading audio model)...")
-        success = initialize_clap_text_model()
-        if not success:
-            return {'loaded': False, 'expiry_seconds': 0}
-    
-    # Reset timer
+
     with _WARM_CACHE_TIMER['lock']:
+        if not is_clap_text_loaded():
+            logger.info("Warming up CLAP text model for text search (not loading audio model)...")
+            success = initialize_clap_text_model()
+            if not success:
+                return {'loaded': False, 'expiry_seconds': 0}
+
         _WARM_CACHE_TIMER['expiry_time'] = time.time() + _WARM_CACHE_TIMER['duration_seconds']
-        
-        # Start timer thread if not already running
-        if _WARM_CACHE_TIMER['timer_thread'] is None or not _WARM_CACHE_TIMER['timer_thread'].is_alive():
+
+        if (
+            _WARM_CACHE_TIMER['timer_thread'] is None
+            or not _WARM_CACHE_TIMER['timer_thread'].is_alive()
+        ):
             thread = threading.Thread(target=_unload_timer_worker, daemon=True)
             thread.start()
             _WARM_CACHE_TIMER['timer_thread'] = thread
             logger.info(f"Started warm cache timer ({_WARM_CACHE_TIMER['duration_seconds']}s)")
         else:
             logger.debug(f"Reset warm cache timer ({_WARM_CACHE_TIMER['duration_seconds']}s)")
-    
-    return {
-        'loaded': True,
-        'expiry_seconds': _WARM_CACHE_TIMER['duration_seconds']
-    }
+
+    return {'loaded': True, 'expiry_seconds': _WARM_CACHE_TIMER['duration_seconds']}
 
 
 def get_warm_cache_status() -> Dict:
-    """Get current warm cache status.
-    
-    Returns:
-        dict: Status with 'active' (bool), 'seconds_remaining' (int)
-    """
-    global _WARM_CACHE_TIMER
     from .clap_analyzer import is_clap_model_loaded
-    
+
     with _WARM_CACHE_TIMER['lock']:
         expiry = _WARM_CACHE_TIMER['expiry_time']
-    
+
     if expiry is None or not is_clap_model_loaded():
         return {'active': False, 'seconds_remaining': 0}
-    
+
     remaining = max(0, int(expiry - time.time()))
     return {'active': True, 'seconds_remaining': remaining}
 
 
 def load_clap_cache_from_db():
-    """
-    Load all CLAP embeddings and metadata into memory for fast searching.
-    Returns True if successful, False otherwise.
-    """
-    global _CLAP_CACHE
-    
-    from app_helper import get_db
-    from config import CLAP_ENABLED, CLAP_EMBEDDING_DIMENSION
-    
+    from config import CLAP_ENABLED
+
     if not CLAP_ENABLED:
         logger.info("CLAP is disabled, skipping cache load.")
         return False
-    
-    try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=DictCursor)
-        
-        # Fetch all CLAP embeddings with metadata from score table
-        cur.execute("""
-            SELECT 
-                ce.item_id,
-                ce.embedding,
-                s.title,
-                s.author
-            FROM clap_embedding ce
-            JOIN score s ON ce.item_id = s.item_id
-            ORDER BY ce.item_id
-        """)
-        
-        rows = cur.fetchall()
-        cur.close()
-        
-        if not rows:
-            logger.warning("No CLAP embeddings found in database.")
-            _CLAP_CACHE['loaded'] = False
-            return False
-        
-        # Build cache structures
-        embeddings_list = []
-        metadata_list = []
-        item_ids_list = []
-        
-        for row in rows:
-            item_id = row['item_id']
-            embedding_blob = row['embedding']
-            title = row['title']
-            author = row['author']
-            
-            # Convert BYTEA to numpy array
-            embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-            
-            if embedding.shape[0] != CLAP_EMBEDDING_DIMENSION:
-                logger.warning(f"Skipping {item_id}: wrong dimension {embedding.shape[0]} (expected {CLAP_EMBEDDING_DIMENSION})")
-                continue
-            
-            embeddings_list.append(embedding)
-            metadata_list.append({
-                'item_id': item_id,
-                'title': title,
-                'author': author
-            })
-            item_ids_list.append(item_id)
-        
-        if not embeddings_list:
-            logger.error("No valid CLAP embeddings loaded.")
-            _CLAP_CACHE['loaded'] = False
-            return False
-        
-        # Convert to NumPy matrix for vectorized operations
-        _CLAP_CACHE['embeddings'] = np.vstack(embeddings_list)
-        _CLAP_CACHE['metadata'] = metadata_list
-        _CLAP_CACHE['item_ids'] = item_ids_list
-        _CLAP_CACHE['loaded'] = True
-        
-        logger.info(f"CLAP cache loaded: {len(metadata_list)} songs with 512-dim embeddings in memory")
+
+    if _load_clap_index_from_db():
+        logger.info("CLAP text cache loaded from persisted index.")
         return True
-        
-    except Exception as e:
-        logger.error(f"Failed to load CLAP cache: {e}")
-        import traceback
-        traceback.print_exc()
-        _CLAP_CACHE['loaded'] = False
-        return False
+
+    logger.error("Failed to load persisted CLAP index. CLAP text search will be unavailable.")
+    _CLAP_CACHE['loaded'] = False
+    _CLAP_INDEX_CACHE['index'] = None
+    _CLAP_INDEX_CACHE['id_map'] = None
+    _CLAP_INDEX_CACHE['reverse_id_map'] = None
+    _CLAP_INDEX_CACHE['loaded'] = False
+    return False
 
 
 def refresh_clap_cache():
-    """Force refresh of CLAP cache from database."""
-    global _CLAP_CACHE
     old_count = get_clap_cache_size()
     logger.info(f"Refreshing CLAP cache... (current: {old_count} songs)")
     result = load_clap_cache_from_db()
     new_count = get_clap_cache_size()
     if result:
-        logger.info(f"✓ CLAP cache refreshed: {old_count} → {new_count} songs ({new_count - old_count:+d})")
+        logger.info(
+            f"OK CLAP cache refreshed: {old_count} -> {new_count} songs ({new_count - old_count:+d})"
+        )
     else:
-        logger.error(f"✗ CLAP cache refresh failed! Still at {new_count} songs")
+        logger.error(f"X CLAP cache refresh failed! Still at {new_count} songs")
     return result
 
 
 def is_clap_cache_loaded() -> bool:
-    """Check if CLAP cache is loaded and ready."""
     return _CLAP_CACHE['loaded']
 
 
 def search_by_text(query_text: str, limit: int = 100) -> List[Dict]:
-    """
-    Search songs using natural language text query.
-    
-    Args:
-        query_text: Natural language description (e.g., "upbeat summer songs")
-        limit: Maximum number of results to return
-        
-    Returns:
-        List of dicts with item_id, title, author, similarity
-    """
     from .clap_analyzer import get_text_embedding
     from config import CLAP_ENABLED
-    
+
     if not CLAP_ENABLED:
         return []
-    
-    # Cache must be loaded at startup - no lazy loading
-    if not _CLAP_CACHE['loaded']:
-        logger.error("Cannot search: CLAP cache not loaded. Ensure Flask started successfully.")
+
+    if not _CLAP_INDEX_CACHE['loaded'] or _CLAP_INDEX_CACHE['index'] is None:
+        logger.error(
+            "Cannot search: persisted CLAP index not loaded. Ensure Flask startup loaded the CLAP index."
+        )
         return []
-    
+
     try:
-        # Auto-warmup: ensures model is loaded and resets timer
-        warmup_text_search_model()
-        
-        # Get text embedding (model is now guaranteed loaded)
-        text_embedding = get_text_embedding(query_text)
+        with _WARM_CACHE_TIMER['lock']:
+            warmup_text_search_model()
+
+            text_embedding = get_text_embedding(query_text)
         if text_embedding is None:
             logger.error(f"Failed to generate text embedding for: {query_text}")
             return []
-        
-        # Vectorized similarity computation (cosine similarity via dot product)
-        # Both embeddings are already normalized
-        similarities = _CLAP_CACHE['embeddings'] @ text_embedding
-        
-        # Over-fetch candidates to allow per-artist filtering.
-        # Formula matches voyager: n + max(20, n * 4) + 1
+
         from config import MAX_SONGS_PER_ARTIST
-        artist_cap = MAX_SONGS_PER_ARTIST if MAX_SONGS_PER_ARTIST and MAX_SONGS_PER_ARTIST > 0 else 0
+
+        artist_cap = (
+            MAX_SONGS_PER_ARTIST if MAX_SONGS_PER_ARTIST and MAX_SONGS_PER_ARTIST > 0 else 0
+        )
+        if limit >= 1000:
+            artist_cap = 0
         fetch_size = (limit + max(20, limit * 4) + 1) if artist_cap else limit
-        top_indices = np.argsort(similarities)[::-1][:fetch_size]
-        
-        results = []
-        artist_counts: dict = {}
-        for idx in top_indices:
-            if len(results) >= limit:
-                break
-            idx = int(idx)
-            similarity = float(similarities[idx])
-            metadata = _CLAP_CACHE['metadata'][idx]
-            author = metadata.get('author', '')
-            
-            # Enforce per-artist cap when enabled
-            if artist_cap and author:
-                author_norm = author.strip().lower()
-                if artist_counts.get(author_norm, 0) >= artist_cap:
+
+        if _CLAP_INDEX_CACHE['loaded'] and _CLAP_INDEX_CACHE['index'] is not None:
+            ivf_index = _CLAP_INDEX_CACHE['index']
+            id_map = _CLAP_INDEX_CACHE['id_map'] or {}
+            from .paged_ivf import begin_query
+
+            begin_query(ivf_index)
+            num_to_query = min(fetch_size, len(ivf_index))
+
+            if num_to_query <= 0:
+                logger.warning("CLAP index is loaded but contains no items.")
+                return []
+
+            neighbor_ids, distances = ivf_index.query(text_embedding, k=num_to_query)
+            candidate_item_ids = [id_map.get(int(vec_id)) for vec_id in neighbor_ids]
+            candidate_item_ids = [item_id for item_id in candidate_item_ids if item_id is not None]
+
+            metadata_map = _fetch_clap_metadata(candidate_item_ids)
+
+            results = []
+            artist_counts: dict = {}
+            seen: set = set()
+            for vec_id, distance in zip(neighbor_ids, distances):
+                if len(results) >= limit:
+                    break
+                item_id = id_map.get(int(vec_id))
+                # Two slots can name the same track (a migration merges duplicate
+                # recordings into one row), and their vectors are near-identical,
+                # so the same song would otherwise come back twice.
+                if item_id is None or item_id in seen:
                     continue
-                artist_counts[author_norm] = artist_counts.get(author_norm, 0) + 1
-            
-            results.append({
-                'item_id': metadata['item_id'],
-                'title': metadata['title'],
-                'author': metadata['author'],
-                'similarity': similarity
-            })
-        
-        logger.info(f"Text search '{query_text}': found {len(results)} results (artist cap: {artist_cap or 'disabled'})")
-        return results
-        
-    except Exception as e:
-        logger.error(f"Text search failed for '{query_text}': {e}")
-        import traceback
-        traceback.print_exc()
+                seen.add(item_id)
+
+                metadata = metadata_map.get(item_id, {'title': '', 'author': '', 'album': ''})
+                author = metadata.get('author', '')
+
+                if artist_cap and author:
+                    author_norm = author.strip().lower()
+                    if artist_counts.get(author_norm, 0) >= artist_cap:
+                        continue
+                    artist_counts[author_norm] = artist_counts.get(author_norm, 0) + 1
+
+                similarity = ivf_index.distance_to_similarity(distance)
+                results.append(
+                    {
+                        'item_id': item_id,
+                        'title': metadata.get('title', ''),
+                        'author': metadata.get('author', ''),
+                        'album': metadata.get('album', ''),
+                        'similarity': similarity,
+                    }
+                )
+
+            logger.info(
+                f"Text search '{query_text}': found {len(results)} results via CLAP index (artist cap: {artist_cap or 'disabled'})"
+            )
+            return results
+
+    except Exception:
+        logger.exception(f"Text search failed for '{query_text}'")
         return []
 
 
 def get_cache_stats() -> Dict:
-    """Get statistics about the CLAP cache."""
-    if not _CLAP_CACHE['loaded']:
-        return {
-            'loaded': False,
-            'song_count': 0,
-            'embedding_dimension': 0,
-            'memory_mb': 0
-        }
-    
-    embeddings_size = _CLAP_CACHE['embeddings'].nbytes if _CLAP_CACHE['embeddings'] is not None else 0
-    metadata_size = sum(len(str(m)) for m in _CLAP_CACHE['metadata']) if _CLAP_CACHE['metadata'] else 0
-    total_size_mb = (embeddings_size + metadata_size) / (1024 * 1024)
-    
+    if not _CLAP_INDEX_CACHE['loaded'] or _CLAP_INDEX_CACHE['index'] is None:
+        return {'loaded': False, 'song_count': 0, 'embedding_dimension': 0, 'memory_mb': 0}
+
+    index_obj = _CLAP_INDEX_CACHE['index']
+    index_size = sys.getsizeof(index_obj)
+    if isinstance(index_obj, np.ndarray):
+        index_size = index_obj.nbytes
+    elif hasattr(index_obj, 'embeddings') and isinstance(index_obj.embeddings, np.ndarray):
+        index_size = index_obj.embeddings.nbytes
+
+    id_map_size = (
+        sys.getsizeof(_CLAP_INDEX_CACHE['id_map']) if _CLAP_INDEX_CACHE['id_map'] is not None else 0
+    )
+    reverse_map_size = (
+        sys.getsizeof(_CLAP_INDEX_CACHE['reverse_id_map'])
+        if _CLAP_INDEX_CACHE['reverse_id_map'] is not None
+        else 0
+    )
+    total_size_mb = (index_size + id_map_size + reverse_map_size) / (1024 * 1024)
+    song_count = len(_CLAP_INDEX_CACHE['id_map']) if _CLAP_INDEX_CACHE['id_map'] is not None else 0
+
     return {
         'loaded': True,
-        'song_count': len(_CLAP_CACHE['metadata']) if _CLAP_CACHE['metadata'] else 0,
-        'embedding_dimension': _CLAP_CACHE['embeddings'].shape[1] if _CLAP_CACHE['embeddings'] is not None else 0,
-        'memory_mb': round(total_size_mb, 2)
+        'song_count': song_count,
+        'embedding_dimension': config.CLAP_EMBEDDING_DIMENSION,
+        'memory_mb': round(total_size_mb, 2),
     }
 
 
-def generate_top_queries(num_queries=None, top_n=50, return_scores=False):
-    """
-    Generate top N diverse queries by sampling from query.json.
-    Uses probabilistic category selection to ensure balanced representation.
-    Each query has exactly 3 terms from different categories.
-    Avoids mixing Instrumentation and Voice_Type in same query.
-    
-    Args:
-        num_queries: Number of random queries to generate (defaults to config.CLAP_TOP_QUERIES_COUNT)
-        top_n: Number of top queries to return
-        return_scores: If True, return list of dicts with 'query' and 'score' keys
-    
-    Returns:
-        List of query strings (or dicts if return_scores=True) sorted by score and diversity.
-    """
-    import json
-    import os
-    import random
-    from concurrent.futures import ThreadPoolExecutor
-    from collections import defaultdict
-    import multiprocessing
-    
-    # Use config default if not specified
-    if num_queries is None:
-        num_queries = config.CLAP_TOP_QUERIES_COUNT
-    
-    if not is_clap_cache_loaded():
-        logger.error("CLAP cache not loaded, cannot generate top queries")
-        return []
-    
-    # Load query.json
-    query_file = os.path.join(os.path.dirname(__file__), 'query.json')
-    with open(query_file, 'r') as f:
-        query_data = json.load(f)
-    
-    # Get category weights from config (optimized for CLAP's strengths)
-    category_weights = config.CLAP_CATEGORY_WEIGHTS
-    
-    # Generate random queries with smart category selection
-    def generate_random_query():
-        """Generate a query with exactly 3 terms from different categories using weighted sampling."""
-        # Weighted random sampling of 3 different categories
-        categories = list(query_data.keys())
-        weights = [category_weights.get(cat, 1.0) for cat in categories]
-        
-        # Sample 3 unique categories
-        selected_categories = []
-        available_categories = list(categories)
-        available_weights = list(weights)
-        
-        for _ in range(3):
-            if not available_categories:
-                break
-                
-            # Normalize weights
-            total_weight = sum(available_weights)
-            normalized_weights = [w / total_weight for w in available_weights]
-            
-            # Choose category
-            chosen_idx = random.choices(range(len(available_categories)), weights=normalized_weights)[0]
-            selected_categories.append(available_categories[chosen_idx])
-            
-            # Remove selected category from pool
-            available_categories.pop(chosen_idx)
-            available_weights.pop(chosen_idx)
-        
-        # Sample one term from each selected category
-        terms = [random.choice(query_data[cat]) for cat in selected_categories]
-        # Shuffle terms so category order varies
-        random.shuffle(terms)
-        return ' '.join(terms).lower()
-    
-    # Generate unique queries
-    queries = list(set([generate_random_query() for _ in range(num_queries)]))
-    logger.info(f"Generated {len(queries)} unique queries")
-    
-    # Compute embeddings in parallel using multithreading
-    from .clap_analyzer import get_text_embedding
-    
-    try:
-        # Use single core to prevent OOM on memory-constrained systems
-        # CLAP model is memory-intensive (3GB+), not urgent to run fast
-        num_cores = 1
-        
-        logger.info(f"Computing text embeddings for {len(queries)} queries using {num_cores} thread...")
-        
-        with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            query_embeddings = list(executor.map(get_text_embedding, queries))
-        
-        # Filter out any None results
-        valid_data = [(q, e) for q, e in zip(queries, query_embeddings) if e is not None]
-        if not valid_data:
-            logger.error("No valid embeddings generated")
-            return []
-        
-        queries = [q for q, _ in valid_data]
-        query_embeddings = np.vstack([e for _, e in valid_data])
-        
-        logger.info(f"Computed {len(query_embeddings)} text embeddings")
-        
-    except Exception as e:
-        logger.error(f"Failed to compute text embeddings: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
-    
-    # Now score ALL queries at once using vectorized matrix multiplication
-    song_embeddings = _CLAP_CACHE['embeddings']  # Shape: (N_songs, 512)
-    
-    logger.info(f"Scoring {len(queries)} queries against {len(song_embeddings)} songs using vectorized operations...")
-    
-    # Compute similarity matrix: (num_queries, N_songs)
-    # This is a single matrix multiplication - FAST!
-    similarity_matrix = np.dot(query_embeddings, song_embeddings.T)  # Shape: (500, N_songs)
-    
-    # For each query, get top 50 scores and sum them
-    top_k = 50
-    top_indices = np.argsort(similarity_matrix, axis=1)[:, ::-1][:, :top_k]  # Top 50 per query
-    
-    # Get the actual scores for top 50
-    row_indices = np.arange(len(queries))[:, None]
-    top_scores = similarity_matrix[row_indices, top_indices]  # Shape: (num_queries, 50)
-    
-    # Sum top 50 scores for each query
-    total_scores = np.sum(top_scores, axis=1)  # Shape: (num_queries,)
-    
-    logger.info(f"Computed scores for all queries in vectorized pass")
-    
-    # Now process term tracking in parallel
-    def analyze_query_terms(idx):
-        """Track which terms are used in a query."""
-        query = queries[idx]
-        terms_used = defaultdict(set)
-        # Split query into words for exact matching
-        query_words = set(query.lower().split())
-        for category, terms_list in query_data.items():
-            for term in terms_list:
-                # Check if term appears as complete words in query
-                term_words = set(term.lower().split())
-                if term_words.issubset(query_words):
-                    terms_used[category].add(term)
-        return (query, float(total_scores[idx]), dict(terms_used))
-    
-    # Use physical CPU cores for term analysis
-    num_cores = multiprocessing.cpu_count() // 2  # Physical cores
-    num_cores = max(1, num_cores)
-    # Use single core to prevent OOM on memory-constrained systems
-    num_cores = 1
-    
-    logger.info(f"Analyzing term diversity using {num_cores} thread...")
-    
-    with ThreadPoolExecutor(max_workers=num_cores) as executor:
-        scored_queries = list(executor.map(analyze_query_terms, range(len(queries))))
-    
-    # Sort by score
-    scored_queries.sort(key=lambda x: x[1], reverse=True)
-    
-    # Multi-pass selection to guarantee exactly top_n results
-    selected = []
-    term_usage_count = defaultdict(int)
-    category_usage_count = defaultdict(int)
-    
-    # Pass 1: Strict diversity (aim for first 40%)
-    target_pass1 = int(top_n * 0.4)
-    for query, score, terms_used in scored_queries:
-        if len(selected) >= target_pass1:
-            break
-        
-        # Calculate diversity penalty
-        term_penalty = 0
-        category_penalty = 0
-        
-        for category, terms_set in terms_used.items():
-            category_penalty += category_usage_count.get(category, 0) * 2
-            for term in terms_set:
-                term_penalty += term_usage_count.get(term, 0) * 5
-        
-        total_penalty = term_penalty + category_penalty
-        
-        # Skip if exact term appears more than once in pass 1
-        has_overused_term = False
-        for category, terms_set in terms_used.items():
-            for term in terms_set:
-                if term_usage_count.get(term, 0) >= 1:
-                    has_overused_term = True
-                    break
-            if has_overused_term:
-                break
-        
-        if has_overused_term:
-            continue
-        
-        selected.append(query)
-        
-        # Update usage counts
-        for category, terms_set in terms_used.items():
-            category_usage_count[category] += 1
-            for term in terms_set:
-                term_usage_count[term] += 1
-    
-    # Pass 2: Relaxed diversity (next 40%, allow terms up to 2x)
-    target_pass2 = int(top_n * 0.8)
-    for query, score, terms_used in scored_queries:
-        if len(selected) >= target_pass2:
-            break
-        
-        if query in selected:
-            continue
-        
-        # Allow terms to appear up to 2 times
-        has_overused_term = False
-        for category, terms_set in terms_used.items():
-            for term in terms_set:
-                if term_usage_count.get(term, 0) >= 2:
-                    has_overused_term = True
-                    break
-            if has_overused_term:
-                break
-        
-        if has_overused_term:
-            continue
-        
-        selected.append(query)
-        
-        # Update usage counts
-        for category, terms_set in terms_used.items():
-            category_usage_count[category] += 1
-            for term in terms_set:
-                term_usage_count[term] += 1
-    
-    # Pass 3: Fill remaining slots with highest scores (no restrictions)
-    for query, score, terms_used in scored_queries:
-        if len(selected) >= top_n:
-            break
-        
-        if query in selected:
-            continue
-        
-        selected.append(query)
-    
-    logger.info(f"Selected {len(selected)} diverse queries from {len(scored_queries)} candidates")
-    
-    # Return with or without scores
-    if return_scores:
-        # Return list of dicts with query and score
-        result = []
-        for query in selected:
-            # Find the score for this query
-            score = next((s for q, s, _ in scored_queries if q == query), 0.0)
-            result.append({'query': query, 'score': score})
-        return result
-    else:
-        return selected
-
-
 def ensure_text_search_queries_table():
-    """
-    Create text_search_queries table if it doesn't exist.
-    Called automatically at startup.
-    """
     from app_helper import get_db
-    
+
+    conn = None
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS text_search_queries (
-                    id SERIAL PRIMARY KEY,
-                    query_text TEXT NOT NULL,
-                    score REAL NOT NULL,
-                    rank INTEGER NOT NULL,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    UNIQUE(rank)
+            cur.execute("SELECT pg_advisory_lock(726354821)")
+            try:
+                cur.execute(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = %s)",
+                    ('text_search_queries',),
                 )
-            """)
+                if not cur.fetchone()[0]:
+                    cur.execute("""
+                        CREATE TABLE text_search_queries (
+                            id SERIAL PRIMARY KEY,
+                            query_text TEXT NOT NULL,
+                            score REAL NOT NULL,
+                            rank INTEGER NOT NULL,
+                            created_at TIMESTAMP DEFAULT NOW(),
+                            UNIQUE(rank)
+                        )
+                    """)
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(726354821)")
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_text_search_queries_rank 
+                CREATE INDEX IF NOT EXISTS idx_text_search_queries_rank
                 ON text_search_queries(rank)
             """)
             conn.commit()
             logger.info("Ensured text_search_queries table exists")
             return True
-    except Exception as e:
-        logger.error(f"Failed to create text_search_queries table: {e}")
+    except Exception:
+        logger.exception("Failed to create text_search_queries table")
         if conn:
             conn.rollback()
         return False
 
 
 def load_top_queries_from_db():
-    """
-    Load top queries from database into memory cache.
-    Returns True if queries were loaded, False otherwise.
-    On first startup (empty DB), this will return False and trigger generation.
-    """
-    global _TOP_QUERIES_CACHE
     from app_helper import get_db
-    
-    # Ensure table exists first
+
     ensure_text_search_queries_table()
-    
+
     try:
         conn = get_db()
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute("""
-                SELECT query_text, score, rank 
-                FROM text_search_queries 
+                SELECT query_text, score, rank
+                FROM text_search_queries
                 ORDER BY rank ASC
             """)
             rows = cur.fetchall()
-            
+
             if rows:
                 _TOP_QUERIES_CACHE['queries'] = [row['query_text'] for row in rows]
                 _TOP_QUERIES_CACHE['ready'] = True
                 logger.info(f"Loaded {len(rows)} top queries from database")
                 return True
             else:
-                # Insert default queries if table is empty
                 logger.info("No top queries found - inserting default queries")
                 default_queries = [
                     "female vocal romantic trap",
@@ -707,18 +444,20 @@ def load_top_queries_from_db():
                     "orchestra whispered romantic",
                     "belting mid-tempo progressive rock",
                     "autotuned pop mid-tempo",
-                    "pop energetic synthesizer"
+                    "pop energetic synthesizer",
                 ]
-                
+
                 for rank, query in enumerate(default_queries, start=1):
-                    cur.execute("""
+                    cur.execute(
+                        """
                         INSERT INTO text_search_queries (query_text, score, rank, created_at)
                         VALUES (%s, %s, %s, NOW())
-                    """, (query, 1.0, rank))
-                
+                    """,
+                        (query, 1.0, rank),
+                    )
+
                 conn.commit()
-                
-                # Load them into cache
+
                 _TOP_QUERIES_CACHE['queries'] = default_queries
                 _TOP_QUERIES_CACHE['ready'] = True
                 logger.info(f"Inserted and loaded {len(default_queries)} default queries")
@@ -728,93 +467,7 @@ def load_top_queries_from_db():
         return False
 
 
-def save_top_queries_to_db(queries: List[str], scores: List[float]):
-    """
-    Save top queries to database, replacing old ones atomically.
-    This ensures users get old queries until new ones are ready.
-    """
-    from app_helper import get_db
-    
-    # Safety check: don't delete existing queries if new list is empty
-    if not queries:
-        logger.warning("Refusing to save empty query list to database")
-        return False
-    
-    conn = None
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            # Delete old queries
-            cur.execute("DELETE FROM text_search_queries")
-            
-            # Insert new queries
-            for rank, (query, score) in enumerate(zip(queries, scores), start=1):
-                cur.execute("""
-                    INSERT INTO text_search_queries (query_text, score, rank, created_at)
-                    VALUES (%s, %s, %s, NOW())
-                """, (query, float(score), rank))
-            
-            conn.commit()
-            logger.info(f"Saved {len(queries)} top queries to database")
-            return True
-    except Exception as e:
-        logger.error(f"Failed to save top queries to database: {e}")
-        if conn:
-            conn.rollback()
-        return False
-
-
-def precompute_top_queries_background():
-    """
-    Precompute top queries in background thread.
-    Saves to database and updates in-memory cache.
-    Users get old queries from DB until new ones are ready.
-    """
-    global _TOP_QUERIES_CACHE
-    
-    if _TOP_QUERIES_CACHE['computing']:
-        logger.info("Top queries already being computed")
-        return
-    
-    _TOP_QUERIES_CACHE['computing'] = True
-    logger.info("Starting background computation of top queries...")
-    
-    try:
-        # Generate queries with scores (uses config.CLAP_TOP_QUERIES_COUNT)
-        scored_queries = generate_top_queries(top_n=50, return_scores=True)
-        
-        # Safety check: don't save empty query lists
-        if not scored_queries:
-            logger.warning("Query generation returned empty list - skipping save")
-            return
-        
-        queries = [q['query'] for q in scored_queries]
-        scores = [q['score'] for q in scored_queries]
-        
-        # Save to database needs Flask app context
-        from app import app
-        with app.app_context():
-            # Save to database first (atomic replacement)
-            if save_top_queries_to_db(queries, scores):
-                # Update in-memory cache
-                _TOP_QUERIES_CACHE['queries'] = queries
-                _TOP_QUERIES_CACHE['ready'] = True
-                logger.info(f"Top queries precomputed successfully: {len(queries)} queries ready")
-            else:
-                logger.error("Failed to save queries to database")
-    except Exception as e:
-        logger.error(f"Failed to precompute top queries: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        _TOP_QUERIES_CACHE['computing'] = False
-
-
 def get_cached_top_queries() -> List[str]:
-    """
-    Get precomputed top queries from cache.
-    Returns empty list if not ready yet.
-    """
     if _TOP_QUERIES_CACHE['ready']:
         return _TOP_QUERIES_CACHE['queries']
     return []

@@ -1,24 +1,94 @@
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""Flask blueprint for Song Alchemy: blend songs/artists into a playlist.
+
+Serves the `/alchemy` UI and its API, delegating the actual centroid-based
+blending to `tasks.song_alchemy.song_alchemy`. Also manages the persisted
+"anchors" and "radios" that let a saved blend be re-run on demand.
+
+Main Features:
+* Routes: `/alchemy` page, artist/playlist autocomplete, `/api/alchemy`, plus
+  CRUD for `/api/anchors` and `/api/radios` (with `/api/radios/run`). Every one
+  of them acts on the server selected in the sidebar - the radio run included,
+  since only the cron row is the all-servers batch path.
+* Serves and builds the 2D artist projection; wraps the playlist list in a
+  short-TTL in-process cache guarded by a lock.
+"""
+
 from flask import Blueprint, jsonify, request, render_template
 import logging
+import math
+import threading
+import time
 
 from tasks.song_alchemy import song_alchemy
+from app_helper import attach_song_features
+import app_server_context
 import config
 
 logger = logging.getLogger(__name__)
 
 alchemy_bp = Blueprint('alchemy_bp', __name__, template_folder='../templates')
 
+_PLAYLIST_CACHE = {}
+_PLAYLIST_CACHE_TTL = 30.0
+_PLAYLIST_CACHE_LOCK = threading.Lock()
+
 
 @alchemy_bp.route('/alchemy', methods=['GET'])
 def alchemy_page():
-    return render_template('alchemy.html', title = 'AudioMuse-AI - Song Alchemy', active='alchemy')
+    """
+    Song Alchemy UI page.
+    ---
+    tags:
+      - Alchemy
+    summary: HTML page for blending songs/artists into a centroid-based recommendation set.
+    responses:
+      200:
+        description: HTML page rendered.
+    """
+    return render_template('alchemy.html', title='AudioMuse-AI - Song Alchemy', active='alchemy')
 
 
 @alchemy_bp.route('/api/search_artists', methods=['GET'])
 def search_artists():
-    """Search for artists by name for autocomplete."""
+    """
+    Artist autocomplete.
+    ---
+    tags:
+      - Alchemy
+    summary: Search artists by partial name for autocomplete suggestions.
+    parameters:
+      - name: query
+        in: query
+        schema: { type: string }
+        description: Partial artist name.
+      - name: start
+        in: query
+        schema: { type: integer, default: 0 }
+        description: 0-based pagination start.
+      - name: end
+        in: query
+        schema: { type: integer }
+        description: Exclusive pagination end. Default returns 20 items.
+    responses:
+      200:
+        description: List of matching artists.
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+    """
     from tasks.artist_gmm_manager import search_artists_by_name
-    
+
     query = request.args.get('query', '')
 
     # Pagination: start / end (0-based). Defaults to first 20 results.
@@ -32,121 +102,878 @@ def search_artists():
     offset = start
 
     try:
-        results = search_artists_by_name(query, limit=limit, offset=offset)
+        server_id, include_legacy = app_server_context.selected_server_scope()
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
+    try:
+        results = search_artists_by_name(
+            query,
+            limit=limit,
+            offset=offset,
+            server_id=server_id,
+            include_legacy_default=include_legacy,
+        )
+        results = app_server_context.scope_artist_results(results)
         return jsonify(results)
-    except Exception as e:
+    except Exception:
         logger.exception("Artist search failed")
         return jsonify([]), 200  # Return empty list on error
 
 
+def _cached_all_playlists(server_id):
+    cache_key = server_id or '__default__'
+    now = time.monotonic()
+    cached = _PLAYLIST_CACHE.get(cache_key)
+    if cached is not None and (now - cached['ts']) < _PLAYLIST_CACHE_TTL:
+        return cached['data']
+    with _PLAYLIST_CACHE_LOCK:
+        now = time.monotonic()
+        cached = _PLAYLIST_CACHE.get(cache_key)
+        if cached is not None and (now - cached['ts']) < _PLAYLIST_CACHE_TTL:
+            return cached['data']
+        from tasks.mediaserver import get_all_playlists
+
+        data = get_all_playlists() or []
+        _PLAYLIST_CACHE[cache_key] = {'data': data, 'ts': now}
+        return data
+
+
+@alchemy_bp.route('/api/search_playlists', methods=['GET'])
+def search_playlists():
+    """
+    Playlist autocomplete.
+    ---
+    tags:
+      - Alchemy
+    summary: Search media-server playlists by partial name for autocomplete suggestions.
+    parameters:
+      - name: query
+        in: query
+        schema: { type: string }
+        description: Partial playlist name.
+    responses:
+      200:
+        description: List of matching playlists (id, name, count).
+    """
+    query = (request.args.get('query', '') or '').strip().lower()
+    try:
+        with app_server_context.use_request_server() as server_id:
+            playlists = _cached_all_playlists(server_id)
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
+    except Exception:
+        logger.exception("Playlist search failed")
+        return jsonify([]), 200
+
+    out = []
+    for p in playlists:
+        name = p.get('Name') or p.get('name') or ''
+        pid = p.get('Id') or p.get('id')
+        if not pid:
+            continue
+        if query and query not in name.lower():
+            continue
+        count = p.get('songCount') if p.get('songCount') is not None else p.get('ChildCount')
+        out.append({'id': str(pid), 'name': name, 'count': count})
+    return jsonify(out[:50])
+
+
 @alchemy_bp.route('/api/alchemy', methods=['POST'])
 def alchemy_api():
-    """POST payload: {"items": [{"id":"...","op":"ADD","type":"song/artist"}, ...], "n":100}
-    Expect at least one ADD item (song or artist); SUBTRACT items are optional.
+    """
+    Run a Song Alchemy blend.
+    ---
+    tags:
+      - Alchemy
+    summary: Combine ADD/SUBTRACT items into a centroid and return the nearest songs.
+    description: |
+      At least one ADD item (song or artist) is required. SUBTRACT items are
+      optional and pull the centroid away from those songs/artists.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              items:
+                type: array
+                items:
+                  type: object
+                  required: [id, op]
+                  properties:
+                    id:
+                      type: string
+                    op:
+                      type: string
+                      enum: [ADD, SUBTRACT]
+                    type:
+                      type: string
+                      enum: [song, artist, anchor, mood, playlist]
+                      default: song
+              n:
+                type: integer
+                description: Number of results to return. Defaults to ALCHEMY_DEFAULT_N_RESULTS.
+              temperature:
+                type: number
+                format: float
+                description: Softmax temperature for probabilistic sampling. Defaults to ALCHEMY_TEMPERATURE.
+              subtract_distance:
+                type: number
+                format: float
+                description: Optional override for the SUBTRACT exclusion radius.
+    responses:
+      200:
+        description: Recommendation results (each row contains the song and its centroid for save-as-anchor).
+      400:
+        description: Validation error (no ADD items, malformed payload).
+      500:
+        description: Internal error.
     """
     payload = request.get_json() or {}
+    try:
+        app_server_context.resolve_request_server_id(payload)
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
     items = payload.get('items', [])
-    n = payload.get('n', config.ALCHEMY_DEFAULT_N_RESULTS)
+    try:
+        n = int(payload.get('n', config.ALCHEMY_DEFAULT_N_RESULTS))
+    except (TypeError, ValueError):
+        n = config.ALCHEMY_DEFAULT_N_RESULTS
+    n = max(1, min(n, config.ALCHEMY_MAX_N_RESULTS))
     # Temperature parameter for probabilistic sampling (softmax temperature)
     temperature = payload.get('temperature', config.ALCHEMY_TEMPERATURE)
 
     # Separate items by operation
-    add_items = [{'type': i.get('type', 'song'), 'id': i['id']} for i in items if i.get('op', '').upper() == 'ADD' and i.get('id')]
-    subtract_items = [{'type': i.get('type', 'song'), 'id': i['id']} for i in items if i.get('op', '').upper() == 'SUBTRACT' and i.get('id')]
+    add_items = [
+        {'type': i.get('type', 'song'), 'id': i['id']}
+        for i in items
+        if i.get('op', '').upper() == 'ADD' and i.get('id')
+    ]
+    subtract_items = [
+        {'type': i.get('type', 'song'), 'id': i['id']}
+        for i in items
+        if i.get('op', '').upper() == 'SUBTRACT' and i.get('id')
+    ]
+
+    # Song seeds may arrive as the selected server's provider ids; canonicalize
+    # them before they reach the shared index (canonical ids pass through).
+    seed_ids = [
+        entry['id'] for entry in add_items + subtract_items
+        if entry.get('type', 'song') == 'song'
+    ]
+    resolved_seed_ids = app_server_context.resolve_input_item_ids(seed_ids, payload)
+    for entry in add_items + subtract_items:
+        if entry.get('type', 'song') == 'song':
+            entry['id'] = resolved_seed_ids.get(str(entry['id']), entry['id'])
+
+    # Artist IDs are provider-specific too. The shared artist index is keyed by
+    # normalized artist name, so resolve selected-server IDs before querying it.
+    for entry in add_items + subtract_items:
+        if entry.get('type') == 'artist':
+            entry['id'] = app_server_context.resolve_artist_identifier(entry['id'], payload)
 
     # Allow optional override for subtract distance (from frontend slider)
     subtract_distance = payload.get('subtract_distance')
     try:
-        results = song_alchemy(add_items=add_items, subtract_items=subtract_items, n_results=n, subtract_distance=subtract_distance, temperature=temperature)
-        # song_alchemy now returns a dict with results, filtered_out and centroid projections
+        with app_server_context.use_request_server(payload):
+            results = song_alchemy(
+                add_items=add_items,
+                subtract_items=subtract_items,
+                n_results=n,
+                subtract_distance=subtract_distance,
+                temperature=temperature,
+            )
+        attach_song_features(results.get('results'))
+        # Translate every song id in the response with ONE registry round-trip: the
+        # main results, the filtered_out set, and the song-type add/sub points all
+        # resolve to the selected server's provider ids from a single mapping (the
+        # rest of add/sub points are synthetic anchor/mood/artist/playlist markers).
+        result_rows = results.get('results') or []
+        filtered_rows = results.get('filtered_out') or []
+        song_points = [
+            point
+            for key in ('add_points', 'sub_points')
+            for point in (results.get(key) or [])
+            if point.get('type') == 'song'
+        ]
+        all_ids = [
+            row['item_id']
+            for row in (result_rows + filtered_rows + song_points)
+            if row.get('item_id')
+        ]
+        mapping = app_server_context.translate_ids_for_request(all_ids)
+
+        def _translate_song_rows(rows):
+            kept = []
+            for row in rows:
+                provider_id = mapping.get(str(row.get('item_id')))
+                if provider_id is None:
+                    continue
+                row['item_id'] = provider_id
+                kept.append(row)
+            return kept
+
+        results['results'] = _translate_song_rows(result_rows)[:n]
+        results['filtered_out'] = _translate_song_rows(filtered_rows)
+        for key in ('add_points', 'sub_points'):
+            kept_points = []
+            for point in results.get(key) or []:
+                if point.get('type') == 'song':
+                    provider_id = mapping.get(str(point.get('item_id')))
+                    if provider_id is None:
+                        continue
+                    point['item_id'] = provider_id
+                kept_points.append(point)
+            results[key] = kept_points
+        # Keep full centroid in response for client-side save action, but not in anchor list endpoint.
         return jsonify(results)
-    except ValueError as e:
+    except ValueError:
         # Log the validation error server-side but do not expose internal error text to clients
         logger.exception("Alchemy validation failure")
         return jsonify({"error": "Invalid request"}), 400
-    except Exception as e:
+    except Exception:
         logger.exception("Alchemy failure")
         return jsonify({"error": "Internal error"}), 500
 
 
+@alchemy_bp.route('/api/anchors', methods=['GET'])
+def list_anchors():
+    """
+    List saved alchemy anchors.
+    ---
+    tags:
+      - Alchemy
+    summary: Return id+name of every saved alchemy anchor (centroids omitted for size).
+    responses:
+      200:
+        description: Anchor list.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                anchors:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                      name:
+                        type: string
+      500:
+        description: Database error.
+    """
+    from database import get_alchemy_anchors
+
+    try:
+        anchors = get_alchemy_anchors()
+        # no centroid returned here (name-only list)
+        return jsonify({'anchors': [{'id': a['id'], 'name': a['name']} for a in anchors]})
+    except Exception:
+        logger.exception('Failed to list anchors')
+        return jsonify({'anchors': [], 'error': 'Unable to retrieve anchors at this time.'}), 500
+
+
+def _parse_anchor_exclusions(payload):
+    exclusions = payload.get('exclusions')
+    if not exclusions:
+        return None, None
+    if not isinstance(exclusions, list):
+        return None, 'Anchor exclusions must be a list'
+    parsed = []
+    for entry in exclusions:
+        if not isinstance(entry, dict):
+            return None, 'Each anchor exclusion must be an object'
+        vector = entry.get('vector')
+        if not isinstance(vector, list) or not vector:
+            return None, 'Each anchor exclusion needs a non-empty vector list'
+        distance = entry.get('distance')
+        if distance is not None:
+            try:
+                distance = float(distance)
+            except (TypeError, ValueError):
+                return None, 'Anchor exclusion distance must be a number'
+            if not math.isfinite(distance):
+                return None, 'Anchor exclusion distance must be a finite number'
+        parsed.append({'vector': vector, 'distance': distance})
+    return parsed, None
+
+
+@alchemy_bp.route('/api/anchors', methods=['POST'])
+def create_anchor():
+    """
+    Save a new alchemy anchor.
+    ---
+    tags:
+      - Alchemy
+    summary: Persist an anchor (named centroid plus exclusions) for later reuse in path-finding or alchemy.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, centroid]
+            properties:
+              name:
+                type: string
+              centroid:
+                type: array
+                items:
+                  type: number
+                  format: float
+                description: Embedding vector representing the anchor.
+              exclusions:
+                type: array
+                description: |
+                  Subtracted regions of the run being saved (from the alchemy
+                  response `exclusions` field). Each entry is re-applied when
+                  the anchor is used, making the anchor reproducible.
+                items:
+                  type: object
+                  required: [vector]
+                  properties:
+                    vector:
+                      type: array
+                      items:
+                        type: number
+                        format: float
+                    distance:
+                      type: number
+                      format: float
+                      description: Exclusion radius around the vector.
+    responses:
+      200:
+        description: Anchor saved.
+      400:
+        description: Missing or invalid name/centroid/exclusions.
+      500:
+        description: Database failure.
+    """
+    from database import save_alchemy_anchor
+
+    payload = request.get_json() or {}
+    raw_name = payload.get('name')
+    name = raw_name.strip() if isinstance(raw_name, str) else ''
+    centroid = payload.get('centroid')
+    if not name:
+        return jsonify({'error': 'Anchor name is required'}), 400
+    if not centroid or not isinstance(centroid, list):
+        return jsonify({'error': 'Anchor centroid is required and must be a list'}), 400
+    exclusions, exclusions_error = _parse_anchor_exclusions(payload)
+    if exclusions_error:
+        return jsonify({'error': exclusions_error}), 400
+    anchor = save_alchemy_anchor(name, centroid, exclusions)
+    if not anchor:
+        return jsonify({'error': 'Failed to save anchor'}), 500
+    return jsonify({'anchor': {'id': anchor['id'], 'name': anchor['name']}})
+
+
+@alchemy_bp.route('/api/anchors/<int:anchor_id>', methods=['DELETE'])
+def remove_anchor(anchor_id):
+    """
+    Delete an alchemy anchor.
+    ---
+    tags:
+      - Alchemy
+    summary: Remove a saved anchor by id.
+    parameters:
+      - name: anchor_id
+        in: path
+        required: true
+        schema: { type: integer }
+    responses:
+      200:
+        description: Anchor deleted.
+      404:
+        description: Anchor not found.
+    """
+    from database import delete_alchemy_anchor
+
+    ok = delete_alchemy_anchor(anchor_id)
+    if not ok:
+        return jsonify({'error': 'Anchor not found'}), 404
+    return jsonify({'deleted': True})
+
+
+@alchemy_bp.route('/api/anchors/<int:anchor_id>', methods=['PUT'])
+def rename_anchor(anchor_id):
+    """
+    Rename an alchemy anchor.
+    ---
+    tags:
+      - Alchemy
+    summary: Update the display name of a saved anchor.
+    parameters:
+      - name: anchor_id
+        in: path
+        required: true
+        schema: { type: integer }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name]
+            properties:
+              name:
+                type: string
+    responses:
+      200:
+        description: Anchor renamed.
+      400:
+        description: Empty name.
+      404:
+        description: Anchor not found.
+    """
+    from database import update_alchemy_anchor_name
+
+    payload = request.get_json() or {}
+    raw_name = payload.get('name')
+    name = raw_name.strip() if isinstance(raw_name, str) else ''
+    if not name:
+        return jsonify({'error': 'Anchor name is required'}), 400
+    anchor = update_alchemy_anchor_name(anchor_id, name)
+    if not anchor:
+        return jsonify({'error': 'Anchor not found or rename failed'}), 404
+    return jsonify({'anchor': {'id': anchor['id'], 'name': anchor['name']}})
+
+
+def _parse_radio_settings(payload):
+    temperature = payload.get('temperature')
+    n_results = payload.get('n_results')
+    if temperature is None:
+        return None, None, 'Radio temperature is required'
+    if n_results is None:
+        return None, None, 'Radio number of results is required'
+    try:
+        temperature = float(temperature)
+    except (TypeError, ValueError):
+        return None, None, 'Radio temperature must be a number'
+    if not math.isfinite(temperature):
+        return None, None, 'Radio temperature must be a finite number'
+    try:
+        n_results = int(n_results)
+    except (TypeError, ValueError):
+        return None, None, 'Radio number of results must be an integer'
+    if temperature < 0:
+        return None, None, 'Radio temperature must be 0 or greater'
+    if n_results < 1 or n_results > config.ALCHEMY_MAX_N_RESULTS:
+        return (
+            None,
+            None,
+            f'Radio number of results must be between 1 and {config.ALCHEMY_MAX_N_RESULTS}',
+        )
+    return temperature, n_results, None
+
+
+@alchemy_bp.route('/api/radios', methods=['GET'])
+def list_radios():
+    """
+    List saved alchemy radios.
+    ---
+    tags:
+      - Alchemy
+    summary: Return every saved radio (anchor + temperature + number of results) with its enabled state.
+    responses:
+      200:
+        description: Radio list.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                radios:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: integer
+                      anchor_id:
+                        type: integer
+                      name:
+                        type: string
+                        description: Name of the underlying anchor (the radio shares it).
+                      temperature:
+                        type: number
+                        format: float
+                      n_results:
+                        type: integer
+                      enabled:
+                        type: boolean
+      500:
+        description: Database error.
+    """
+    from database import get_alchemy_radios
+
+    try:
+        radios = get_alchemy_radios()
+        return jsonify(
+            {
+                'radios': [
+                    {
+                        'id': r['id'],
+                        'anchor_id': r['anchor_id'],
+                        'name': r['name'],
+                        'temperature': r['temperature'],
+                        'n_results': r['n_results'],
+                        'enabled': bool(r['enabled']),
+                    }
+                    for r in radios
+                ]
+            }
+        )
+    except Exception:
+        logger.exception('Failed to list radios')
+        return jsonify({'radios': [], 'error': 'Unable to retrieve radios at this time.'}), 500
+
+
+@alchemy_bp.route('/api/radios', methods=['POST'])
+def create_radio():
+    """
+    Save a new alchemy radio.
+    ---
+    tags:
+      - Alchemy
+    summary: Persist a radio (anchor + temperature + number of results) for batch playlist generation.
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [anchor_id, temperature, n_results]
+            properties:
+              anchor_id:
+                type: integer
+                description: Saved anchor the radio is built on (one radio per anchor).
+              temperature:
+                type: number
+                format: float
+              n_results:
+                type: integer
+              enabled:
+                type: boolean
+                default: true
+    responses:
+      200:
+        description: Radio saved.
+      400:
+        description: Missing or invalid anchor/temperature/number of results.
+      500:
+        description: Database failure.
+    """
+    from database import create_alchemy_radio
+
+    payload = request.get_json() or {}
+    anchor_id = payload.get('anchor_id')
+    try:
+        anchor_id = int(anchor_id)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Radio anchor is required'}), 400
+    temperature, n_results, error = _parse_radio_settings(payload)
+    if error:
+        return jsonify({'error': error}), 400
+    enabled = bool(payload.get('enabled', True))
+    radio = create_alchemy_radio(anchor_id, temperature, n_results, enabled)
+    if not radio:
+        return jsonify(
+            {'error': 'Failed to save radio. Check that the anchor exists and has no radio yet.'}
+        ), 400
+    return jsonify({'radio': radio})
+
+
+@alchemy_bp.route('/api/radios/<int:radio_id>', methods=['PUT'])
+def update_radio(radio_id):
+    """
+    Update an alchemy radio.
+    ---
+    tags:
+      - Alchemy
+    summary: Update temperature, number of results and enabled state of a saved radio.
+    parameters:
+      - name: radio_id
+        in: path
+        required: true
+        schema: { type: integer }
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [temperature, n_results, enabled]
+            properties:
+              temperature:
+                type: number
+                format: float
+              n_results:
+                type: integer
+              enabled:
+                type: boolean
+    responses:
+      200:
+        description: Radio updated.
+      400:
+        description: Invalid temperature/number of results.
+      404:
+        description: Radio not found.
+    """
+    from database import update_alchemy_radio
+
+    payload = request.get_json() or {}
+    temperature, n_results, error = _parse_radio_settings(payload)
+    if error:
+        return jsonify({'error': error}), 400
+    enabled = bool(payload.get('enabled', True))
+    radio = update_alchemy_radio(radio_id, temperature, n_results, enabled)
+    if not radio:
+        return jsonify({'error': 'Radio not found or update failed'}), 404
+    return jsonify({'radio': radio})
+
+
+@alchemy_bp.route('/api/radios/<int:radio_id>', methods=['DELETE'])
+def remove_radio(radio_id):
+    """
+    Delete an alchemy radio.
+    ---
+    tags:
+      - Alchemy
+    summary: Remove a saved radio by id (the underlying anchor is kept).
+    parameters:
+      - name: radio_id
+        in: path
+        required: true
+        schema: { type: integer }
+    responses:
+      200:
+        description: Radio deleted.
+      404:
+        description: Radio not found.
+    """
+    from database import delete_alchemy_radio
+
+    ok = delete_alchemy_radio(radio_id)
+    if not ok:
+        return jsonify({'error': 'Radio not found'}), 404
+    return jsonify({'deleted': True})
+
+
+@alchemy_bp.route('/api/radios/run', methods=['POST'])
+def run_radio_playlists_endpoint():
+    """
+    Create playlists for all enabled radios on the selected server.
+    ---
+    tags:
+      - Alchemy
+    summary: Upsert one playlist per enabled radio (reuses existing playlist by name, preserving its server-side ID).
+    description: |
+      Runs only against the server selected in the sidebar (the default server
+      when none is selected), because Alchemy is a per-server page. The
+      alchemy_radio cron row is the batch path and always covers every server.
+    parameters:
+      - name: server
+        in: query
+        required: false
+        schema:
+          type: string
+        description: Target music server name or id. Defaults to the default server.
+    responses:
+      200:
+        description: Run summary.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message:
+                  type: string
+                radios_enabled:
+                  type: integer
+                playlists_created:
+                  type: integer
+                failed:
+                  type: array
+                  items:
+                    type: string
+      400:
+        description: Invalid server selection.
+      500:
+        description: Run failed.
+    """
+    from tasks.radio_manager import run_radio_playlists
+
+    try:
+        server_id = app_server_context.resolve_request_server_id()
+    except ValueError:
+        logger.warning('Invalid server selection.', exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
+
+    try:
+        summary = run_radio_playlists(server_scope=server_id or 'default')
+        return jsonify(summary)
+    except Exception:
+        logger.exception('Radio playlist creation failed')
+        return jsonify({'error': 'Failed to create radio playlists. Check container logs.'}), 500
+
+
 @alchemy_bp.route('/api/artist_projections', methods=['GET'])
 def artist_projections_api():
-    """Return precomputed artist component projections.
-    
-    Response: JSON with:
-    {
-        "components": [
-            {
-                "artist_id": "...",
-                "artist_name": "...",
-                "component_idx": 0,
-                "weight": 0.35,
-                "projection": [x, y]
-            },
-            ...
-        ],
-        "count": N
-    }
     """
-    from app_helper import ARTIST_PROJECTION_CACHE
-    
+    Precomputed artist component projections.
+    ---
+    tags:
+      - Alchemy
+    summary: Return cached 2D projections of artist GMM components for the artist map.
+    responses:
+      200:
+        description: Component list (empty if cache is cold).
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                components:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      artist_id:
+                        type: string
+                      artist_name:
+                        type: string
+                      component_idx:
+                        type: integer
+                      weight:
+                        type: number
+                        format: float
+                      projection:
+                        type: array
+                        items:
+                          type: number
+                          format: float
+                        description: 2D x/y projection.
+                count:
+                  type: integer
+      500:
+        description: Failure to read cache.
+    """
+    from database import ARTIST_PROJECTION_CACHE
+    from tasks.mediaserver import registry
+
+    try:
+        server_id = app_server_context.resolve_request_server_id()
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
+
     try:
         if not ARTIST_PROJECTION_CACHE:
             return jsonify({'components': [], 'count': 0})
-        
+
         component_map = ARTIST_PROJECTION_CACHE.get('component_map', [])
         projection = ARTIST_PROJECTION_CACHE.get('projection')
-        
+
         if projection is None or len(component_map) == 0:
             return jsonify({'components': [], 'count': 0})
-        
+
+        # The cache stores the legacy/default artist_id; expose the selected
+        # server's provider artist id instead, falling back to the artist NAME
+        # (a safe, non-internal identifier the similar-artists endpoint accepts)
+        # so a node without an artist_server_map row still has a live click-through.
+        artist_names = [
+            comp_info.get('artist_name')
+            for comp_info in component_map
+            if comp_info.get('artist_name')
+        ]
+        provider_artist_ids = registry.artist_ids_for_names(artist_names, server_id)
+
         # Build response with components and their 2D projections
         components = []
         for idx, comp_info in enumerate(component_map):
             if idx < len(projection):
-                components.append({
-                    'artist_id': comp_info['artist_id'],
-                    'artist_name': comp_info.get('artist_name', comp_info['artist_id']),
-                    'component_idx': comp_info['component_idx'],
-                    'weight': comp_info['weight'],
-                    'projection': [float(projection[idx][0]), float(projection[idx][1])]
-                })
-        
-        return jsonify({
-            'components': components,
-            'count': len(components)
-        })
-    except Exception as e:
+                artist_name = comp_info.get('artist_name')
+                components.append(
+                    {
+                        'artist_id': (provider_artist_ids.get(artist_name) or artist_name) if artist_name else None,
+                        'artist_name': comp_info.get('artist_name', comp_info['artist_id']),
+                        'component_idx': comp_info['component_idx'],
+                        'weight': comp_info['weight'],
+                        'projection': [float(projection[idx][0]), float(projection[idx][1])],
+                    }
+                )
+
+        return jsonify({'components': components, 'count': len(components)})
+    except Exception:
         logger.exception("Failed to retrieve artist projections")
-        return jsonify({'components': [], 'count': 0, 'error': str(e)}), 500
+        return jsonify(
+            {
+                'components': [],
+                'count': 0,
+                'error': 'Unable to retrieve artist projections at this time.',
+            }
+        ), 500
 
 
 @alchemy_bp.route('/api/build_artist_projection', methods=['POST'])
 def build_artist_projection_endpoint():
-    """Manually trigger artist component projection build.
-    
-    This is useful for rebuilding artist projections without running full analysis.
-    Requires that artist GMM parameters already exist in the database.
-    
-    Response: JSON with status ('success' or 'error') and message
+    """
+    Rebuild artist component projections.
+    ---
+    tags:
+      - Alchemy
+    summary: Manually compute and store artist projections (requires GMM params already in DB).
+    description: |
+      Useful for rebuilding the artist map without running a full analysis.
+      Returns 400 if no artist GMM parameters are present.
+    responses:
+      200:
+        description: Projection rebuilt and cached.
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [success]
+                message:
+                  type: string
+      400:
+        description: No GMM parameters available.
+      500:
+        description: Build failed.
     """
     from app_helper import build_and_store_artist_projection
-    
+
     try:
         success = build_and_store_artist_projection('artist_map')
         if success:
-            return jsonify({
-                'status': 'success',
-                'message': 'Artist component projection built and stored successfully'
-            })
+            return jsonify(
+                {
+                    'status': 'success',
+                    'message': 'Artist component projection built and stored successfully',
+                }
+            )
         else:
-            return jsonify({
-                'status': 'error',
-                'message': 'Artist projection build returned no data (no GMM parameters found?)'
-            }), 400
-    except Exception as e:
+            return jsonify(
+                {
+                    'status': 'error',
+                    'message': 'Artist projection build returned no data (no GMM parameters found?)',
+                }
+            ), 400
+    except Exception:
         logger.exception("Failed to build artist projection")
-        return jsonify({
-            'status': 'error',
-            'message': f'Failed to build artist projection: {str(e)}'
-        }), 500
+        return jsonify(
+            {
+                'status': 'error',
+                'message': 'Failed to build artist projection. Please try again later.',
+            }
+        ), 500

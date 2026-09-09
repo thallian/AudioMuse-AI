@@ -1,98 +1,100 @@
-# /home/guido/Music/AudioMuse-AI/rq_worker.py
+# AudioMuse-AI - https://github.com/NeptuneHub/AudioMuse-AI
+# Copyright (C) 2025 NeptuneHub
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Affero General Public License v3.0. See the LICENSE file
+# in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
+
+"""Entrypoint for the default-priority RQ worker process.
+
+Configures the worker role and BLAS/OpenMP thread caps before importing heavy
+numeric libraries, then runs a worker on the ``default`` queue; the companion
+of ``rq_worker_high_priority`` for the ``high`` queue.
+
+Main Features:
+* Caps math-library threads (cpu_count // 2) and pins passive OpenMP waiting.
+* Heals the config projection before the first job when the process imported config
+  before Postgres was up; a boot that already projected the default server skips it.
+* Takes its worker class from ``rq_heartbeat_worker`` (a heartbeating SimpleWorker on
+  Windows, the forking Worker elsewhere) and restarts after ``RQ_MAX_JOBS`` to limit leaks.
+"""
+
 import os
 import sys
+import logging
 
-# Ensure the /app directory (where app.py and tasks.py are) is in the Python path
-# This is important if rq_worker.py is in the root and app.py/tasks.py are in /app
-# In your Docker setup, PYTHONPATH already includes /app, but this is good for local dev too.
-sys.path.append(os.path.dirname(os.path.abspath(__file__))) # Adds the current directory
-# If app.py is in a subdirectory like 'app_module' relative to rq_worker.py, you'd adjust:
-# sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app_module'))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Signal to app.py that we are an RQ worker, so it should skip index loading and background threads
 os.environ['AUDIOMUSE_ROLE'] = 'worker'
 
-# Import Worker from rq
-from rq import Worker
+_cpu_count = os.cpu_count() or 2
+_max_lyrics_threads = max(2, _cpu_count // 2)
+for _env_key in (
+    'OMP_NUM_THREADS',
+    'MKL_NUM_THREADS',
+    'OPENBLAS_NUM_THREADS',
+    'VECLIB_MAXIMUM_THREADS',
+    'NUMEXPR_NUM_THREADS',
+):
+    os.environ[_env_key] = str(_max_lyrics_threads)
+os.environ.setdefault('GOMP_SPINCOUNT', '0')
+os.environ.setdefault('OMP_WAIT_POLICY', 'passive')
+print(f"Default worker CPU thread cap = {_max_lyrics_threads} (cpu_count // 2, min 2)")
 
-# Import the redis_conn, rq_queue (which is the 'default' queue),
-# and the Flask app instance from your main app.py.
-# This ensures the worker uses the same Redis connection, queue configuration,
-# and application context as your Flask app.
+from rq_heartbeat_worker import WorkerClass
+
 try:
-    # Import the specific queues we defined
-    from app import app
+    import config
     from app_helper import redis_conn
-    from config import APP_VERSION
+    from app_logging import configure_logging
+    from config import APP_VERSION, TEMP_DIR
+    from tasks.setup_manager import hydrate_worker_config
 except ImportError as e:
-    print(f"Error importing from app.py: {e}")
-    print("Please ensure app.py is in the Python path and does not have top-level errors.")
+    print(f"Error importing worker dependencies: {e}")
     sys.exit(1)
 
-# The queues the worker will listen on.
-# The order is important! Workers will always check 'high' before 'default'.
-queues_to_listen = ['default']
-
-if __name__ == '__main__':
-    # The redis_conn is already initialized when imported from app.py.
-    # The queues_to_listen are already configured with this connection.
-
-    # Use the list of names directly for the log message
-    print(f"DEFAULT RQ Worker starting. Version: {APP_VERSION}. Listening on queues: {queues_to_listen}")
-    print(f"Using Redis connection: {redis_conn.connection_pool.connection_kwargs}")
-
-    # Preload CLAP model to avoid loading delays on first text search
-    # NOTE: Disabled for GPU workers - CUDA context doesn't survive process fork()
-    # Model will lazy-load on first use in the forked worker process
-    # try:
-    #     print("Preloading CLAP model for this worker...")
-    #     from tasks.clap_analyzer import initialize_clap_model
-    #     initialize_clap_model()
-    #     print("✓ CLAP model preloaded successfully")
-    # except Exception as e:
-    #     print(f"⚠ CLAP model preload failed, will retry on first use: {e}")
-
-    # Create a worker instance, explicitly passing the connection.
-    # The 'app' object is passed to `with app.app_context():` within the tasks themselves
-    # if they need it. RQ's default job execution doesn't automatically push an app context.
-    # Tasks should be designed to handle this, e.g., by calling `with app.app_context():`
-    # or by using functions from app.py that manage their own context.
-    worker = Worker(
-        queues_to_listen,
-        connection=redis_conn,
-        # --- Resilience Settings for Kubernetes ---
-        worker_ttl=30,  # Consider worker dead if no heartbeat for 30 seconds.
-        job_monitoring_interval=10 # Check for dead workers every 10 seconds.
+try:
+    os.makedirs(TEMP_DIR, exist_ok=True)
+except OSError as e:
+    print(f"Warning: Could not create TEMP_DIR '{TEMP_DIR}': {e}")
+    print(
+        "Note: This may be expected in some test/CI environments, but could lead to task failures in production."
     )
 
-    # Memory leak prevention: restart after N jobs
-    # RQ will automatically respawn via supervisord
-    # Balance: High enough to avoid frequent CLAP reloads, low enough to prevent memory leaks
-    max_jobs_before_restart = int(os.getenv('RQ_MAX_JOBS', '50'))
+configure_logging()
+logger = logging.getLogger(__name__)
 
-    # Start the worker.
-    # You can set logging_level for more verbose output.
-    # Common levels: DEBUG, INFO, WARNING, ERROR, CRITICAL
-    logging_level = os.getenv("RQ_LOGGING_LEVEL", "INFO").upper()
-    print(f"RQ Worker logging level set to: {logging_level}")
-    print(f"Worker will restart after {max_jobs_before_restart} jobs to prevent memory leaks")
+queues_to_listen = ['default']
+
+
+if __name__ == '__main__':
+    logger.info(
+        f"DEFAULT RQ Worker starting. Version: {APP_VERSION}. Listening on queues: {queues_to_listen}"
+    )
+    logger.info(f"Using Redis connection: {redis_conn.connection_pool.connection_kwargs}")
+
+    hydrate_worker_config()
 
     try:
-        # The `with app.app_context():` here is generally NOT how RQ workers are run.
-        # RQ jobs are executed in separate processes. If a job needs app context,
-        # the job function itself should establish it.
-        # However, if there's any setup *for the worker process itself* that needs app context,
-        # it could be done here, but it's uncommon.
-        # For tasks needing app context (like DB access), they should handle it internally:
-        #
-        # In tasks.py:
-        # from app import app, get_db
-        # def my_task():
-        #     with app.app_context():
-        #         db = get_db()
-        #         # ... do work ...
+        from plugin.manager import boot as plugin_boot
 
+        plugin_boot('worker')
+    except Exception:
+        logger.exception('Plugin subsystem worker boot failed; continuing without plugins')
+
+    worker = WorkerClass(
+        queues_to_listen, connection=redis_conn, worker_ttl=120, job_monitoring_interval=30
+    )
+
+    max_jobs_before_restart = config.RQ_MAX_JOBS
+
+    logging_level = config.RQ_LOGGING_LEVEL
+    logger.info(f"RQ Worker logging level set to: {logging_level}")
+    logger.info(f"Worker will restart after {max_jobs_before_restart} jobs to prevent memory leaks")
+
+    try:
         worker.work(logging_level=logging_level, max_jobs=max_jobs_before_restart)
-    except Exception as e:
-        print(f"RQ Worker failed to start or encountered an error: {e}")
+    except Exception:
+        logger.exception("RQ Worker failed to start or encountered an error")
         sys.exit(1)

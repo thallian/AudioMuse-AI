@@ -1,0 +1,455 @@
+{% extends 'includes/layout.html' %}
+
+{% block headAdditions %}
+<style>
+    label {
+        display: block;
+        margin-bottom: 0.35rem;
+        font-weight: 600;
+    }
+    input[type="text"], input[type="password"], select, textarea {
+        width: 100%;
+        border: 1px solid var(--border-color, #ccc);
+        border-radius: 8px;
+        padding: 0.85rem 0.9rem;
+        margin-bottom: 1rem;
+        font-size: 0.98rem;
+        background: var(--bg-input, #fff);
+        color: var(--text-main, #111);
+    }
+    textarea {
+        min-height: 92px;
+        font-family: inherit;
+        resize: vertical;
+    }
+    .section {
+        margin-top: 1.5rem;
+    }
+    .field-grid {
+        display: grid;
+        gap: 1rem;
+    }
+    .required-label::after {
+        content: ' *';
+        color: #c0392b;
+    }
+    #setup-form button {
+        border: none;
+        border-radius: 10px;
+        padding: 0.95rem 1.25rem;
+        cursor: pointer;
+        color: #fff;
+        background: var(--accent-color, #3675f1);
+        font-weight: 700;
+        font-size: 1rem;
+    }
+    #setup-form button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+    }
+    .notice {
+        padding: 1rem 1.15rem;
+        margin: 1rem 0;
+        border-radius: 10px;
+        background: var(--status-idle-bg, #eef5ff);
+        color: var(--status-idle-text, #1f3c72);
+        border: 1px solid var(--border-color, #d6e4ff);
+    }
+    .field-row {
+        margin-bottom: 1rem;
+    }
+    .field-row.inline {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        flex-wrap: wrap;
+    }
+    .field-row.inline .inline-feedback {
+        width: auto;
+        flex: 1;
+        min-width: 220px;
+    }
+    .field-row label {
+        display: block;
+        word-break: break-word;
+        white-space: normal;
+    }
+    .field-row input,
+    .field-row textarea,
+    .field-row select {
+        width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+    }
+    .field-row small {
+        color: var(--text-muted, #666);
+    }
+    .inline-feedback {
+        display: block;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        width: 100%;
+        max-width: 100%;
+        min-height: 2.5rem;
+        padding: 0.8rem 1rem;
+        border-radius: 14px;
+        font-size: 0.96rem;
+        border: 1px solid transparent;
+        line-height: 1.3;
+        background: var(--bg-card, #f8f9fb);
+        color: var(--text-main, #111);
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        word-break: break-word;
+        box-sizing: border-box;
+        margin: 0;
+    }
+    @media (max-width: 640px) {
+        #setup-form button {
+            width: 100%;
+        }
+        .field-row {
+            display: block;
+        }
+    }
+    .inline-feedback.status-success {
+        background: var(--status-success-bg, #e6f4ea);
+        color: var(--status-success-text, #1f4f1f);
+        border-color: var(--status-success-border, #a0d8a8);
+    }
+    .inline-feedback.status-failure {
+        background: var(--status-failure-bg, #fdecea);
+        color: var(--status-failure-text, #7a1f1f);
+        border-color: var(--status-failure-border, #f5c2c0);
+    }
+    .inline-feedback.status-pending {
+        background: var(--status-pending-bg, #fff4db);
+        color: var(--status-pending-text, #7a5c1a);
+        border-color: var(--status-pending-border, #ecd8a9);
+    }
+    #advanced-config summary,
+    #lyrics-api-config summary {
+        cursor: pointer;
+    }
+    #lyrics-api-config {
+        margin-top: 1.5rem;
+    }
+    .advanced-section {
+        margin-top: 0.75rem;
+        border: 1px solid var(--border-color, #e0e0e0);
+        border-radius: 10px;
+        padding: 0.5rem 0.95rem;
+        background: var(--bg-card, #fbfbfd);
+    }
+    .advanced-section > summary {
+        cursor: pointer;
+        font-weight: 700;
+        padding: 0.35rem 0;
+        list-style-position: inside;
+    }
+    .advanced-section[open] > summary {
+        margin-bottom: 0.85rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 1px solid var(--border-color, #eee);
+    }
+    .advanced-toolbar {
+        display: flex;
+        gap: 0.5rem;
+        margin: 1rem 0 0.25rem;
+    }
+    #advanced-config .advanced-toolbar button {
+        width: auto;
+        padding: 0.45rem 0.95rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+        background: var(--bg-input, #fff);
+        color: var(--text-main, #333);
+        border: 1px solid var(--border-color, #ccc);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div id="main-content-inner">
+    <section>
+        <div class="page-header">
+            <h1>AudioMuse-AI - Setup Wizard</h1>
+            <p class="subtitle">Configure your media server, authentication and advanced settings.</p>
+        </div>
+    </section>
+
+    <form id="setup-form" autocomplete="off">
+        <section class="section" id="music-servers-section">
+                <h2>Music Servers</h2>
+                <p class="subtitle" style="margin-top:0.75rem;">Connect one or more media servers (Jellyfin, Emby, Navidrome, Lyrion, Plex, even several of the same type). Analysis covers every configured server: the default server runs first, then each remaining server in turn. Songs shared by several servers are recognized by their audio fingerprint and analyzed only once, and songs that exist on just one server are analyzed too, so the catalogue is the union of all your libraries. Alignment sweeps map the shared content across servers as analysis progresses. Use the server switcher at the bottom of the menu to pick which server the interface works against: playlists and searches then target that server, and tracks it does not have are skipped.</p>
+                <div id="music-servers-panel" style="max-width:100%;">
+                    <div style="overflow-x:auto; max-width:100%; -webkit-overflow-scrolling:touch;">
+                    <table id="music-servers-table" style="width:100%; border-collapse:collapse; min-width:480px;">
+                        <thead>
+                            <tr>
+                                <th style="text-align:left; padding:0.35rem;">Name</th>
+                                <th style="text-align:left; padding:0.35rem;">Type</th>
+                                <th style="padding:0.35rem;">Default</th>
+                                <th style="padding:0.35rem;">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="music-servers-tbody"></tbody>
+                    </table>
+                    </div>
+                    <p id="music-servers-empty" style="display:none; opacity:0.8;">No servers configured yet.</p>
+                    <p id="music-servers-error" class="inline-feedback" style="display:none;"></p>
+                    <div id="sweep-progress" style="display:none; margin-top:0.75rem;">
+                        <div style="display:flex; align-items:center; gap:0.5rem;">
+                            <div style="flex:1; background:rgba(128,128,128,0.25); border-radius:6px; height:14px; overflow:hidden;">
+                                <div id="sweep-progress-bar" style="height:100%; width:0%; background:#4a90d9; transition:width 0.5s;"></div>
+                            </div>
+                            <span id="sweep-progress-pct" style="font-size:0.85rem; min-width:3em; text-align:right;">0%</span>
+                            <button type="button" id="sweep-cancel-btn" style="display:none;">Cancel</button>
+                        </div>
+                        <p id="sweep-progress-text" style="margin:0.35rem 0 0; font-size:0.85rem; opacity:0.9;"></p>
+                    </div>
+                </div>
+                <div style="margin:0.75rem 0; display:flex; gap:0.5rem; flex-wrap:wrap;">
+                    <button type="button" id="ms-add-btn">+ Add server</button>
+                    <button type="button" id="ms-align-btn">Align music servers</button>
+                </div>
+                <div id="music-server-form" style="display:none; margin-top:1rem; border:1px solid var(--border-color, #ccc); border-radius:8px; padding:1rem;">
+                    <h3 id="music-server-form-title" style="margin-top:0;">Add a server</h3>
+                    <input type="hidden" id="ms-edit-id" value="">
+                    <div style="display:flex; flex-direction:column; gap:0.5rem;">
+                        <label for="ms-name">Display name</label>
+                        <input type="text" id="ms-name" placeholder="e.g. Office Jellyfin" style="width:100%;">
+                        <label for="ms-type">Server type</label>
+                        <select id="ms-type" style="width:100%;">
+                            <option value="jellyfin">Jellyfin</option>
+                            <option value="emby">Emby</option>
+                            <option value="navidrome">Navidrome / Subsonic</option>
+                            <option value="lyrion">Lyrion (LMS)</option>
+                            <option value="plex">Plex</option>
+                        </select>
+                        <div id="ms-cred-fields" style="display:flex; flex-direction:column; gap:0.5rem;"></div>
+                        <input type="hidden" id="ms-libraries" value="">
+                        <div id="ms-libraries-boxes" style="display:none; flex-direction:column; gap:0.25rem;"></div>
+                        <label style="display:flex; align-items:center; gap:0.5rem;"><input type="checkbox" id="ms-make-default"> Set as the default server</label>
+                    </div>
+                    <div style="margin-top:0.75rem; display:flex; gap:0.5rem; flex-wrap:wrap;">
+                        <button type="button" id="ms-test-btn">Test connection</button>
+                        <button type="button" id="ms-save-btn">Save server</button>
+                        <button type="button" id="ms-cancel-btn">Cancel</button>
+                    </div>
+                    <p id="ms-feedback" class="inline-feedback" style="display:none; margin-top:0.5rem;"></p>
+                </div>
+                <div id="default-server-editor" style="display:none; margin-top:1rem; border:1px solid var(--border-color, #ccc); border-radius:8px; padding:1rem;">
+                    <h3 style="margin-top:0;">Edit default server</h3>
+                <div class="field-row">
+                    <label for="MEDIASERVER_TYPE" class="label-with-tooltip">
+                        Media server type
+                        <span class="info-tooltip" tabindex="0">
+                            <span class="info-icon"></span>
+                            <span class="tooltip-text">Pick the music server AudioMuse-AI should connect to. Each option asks for slightly different credentials below: Jellyfin/Emby use URL + user ID + API token, Navidrome uses URL + username + password, Lyrion uses just a URL, Plex uses URL + API token.</span>
+                        </span>
+                    </label>
+                    <select id="MEDIASERVER_TYPE" name="MEDIASERVER_TYPE" required>
+                        <option value="jellyfin">Jellyfin</option>
+                        <option value="navidrome">Navidrome</option>
+                        <option value="lyrion">Lyrion</option>
+                        <option value="emby">Emby</option>
+                        <option value="plex">Plex</option>
+                    </select>
+                </div>
+                <div id="server-config-fields"></div>
+                <div class="field-row">
+                    <button id="test-button" type="button" disabled>Test connection</button>
+                </div>
+                <div class="field-row">
+                    <p id="test-feedback" class="inline-feedback" style="display:none; margin:0; width:100%;"></p>
+                </div>
+                <div id="music-libraries-section" class="field-row" style="display:none; flex-direction:column; align-items:flex-start;">
+                    <label class="label-with-tooltip" style="margin-bottom:0.5rem;">
+                        Music libraries to scan
+                        <span class="info-tooltip" tabindex="0">
+                            <span class="info-icon"></span>
+                            <span class="tooltip-text">Pick which libraries to analyze. Check "No restriction" to scan every library on the server (including any added later) - this disables the per-library checkboxes. Otherwise check only the specific libraries you want; the rest will be skipped. This list is fetched live from your media server after a successful connection test.</span>
+                        </span>
+                    </label>
+                    <div id="music-libraries-list" style="display:flex; flex-direction:column; gap:0.25rem; width:100%;"></div>
+                    <small style="margin-top:0.5rem; opacity:0.85;">Changes apply to new analyses only. Run a Cleaning task to remove already-analyzed tracks from libraries you uncheck.</small>
+                    <small id="music-libraries-hint" style="display:none; margin-top:0.5rem;">Select at least one library, or check "No restriction" to scan everything.</small>
+                </div>
+                </div>
+            </section>
+
+            <section class="section">
+                <h2>Authentication</h2>
+                <div class="field-row">
+                    <label for="AUTH_ENABLED" class="required-label label-with-tooltip">
+                        Enable authentication
+                        <span class="info-tooltip" tabindex="0">
+                            <span class="info-icon"></span>
+                            <span class="tooltip-text">When True, the web UI and API require login. When False, AudioMuse-AI is fully open to anyone who can reach it.</span>
+                        </span>
+                    </label>
+                    <select id="AUTH_ENABLED" name="AUTH_ENABLED" required>
+                        <option value="true">True</option>
+                        <option value="false">False</option>
+                    </select>
+                </div>
+                <div id="auth-admin-exists" class="field-row" style="display:none;">
+                    <p style="margin:0; padding:0.75rem 1rem; border-radius:6px; background:var(--bg-card, #f5f5f5); border:1px solid var(--border-color, #ccc);">
+                        An admin account already exists. To add, remove, or change
+                        admin and normal user accounts, go to the
+                        <a href="{{ url_for('users_bp.users_page') }}">Users</a> page.
+                    </p>
+                </div>
+                <div id="auth-credentials" class="field-grid">
+                    <div class="auth-admin-credential">
+                        <label for="AUDIOMUSE_USER" class="label-with-tooltip">
+                            Admin Username
+                            <span class="info-tooltip" tabindex="0">
+                                <span class="info-icon"></span>
+                                <span class="tooltip-text">The admin username you'll use to log into the AudioMuse-AI web interface. The admin has full access, including the Administration menu (Setup Wizard, Users, Cleaning, Scheduled Tasks, Backup, Provider Migration, Analysis and Clustering). Additional non-admin users can be created later from the Users page.</span>
+                            </span>
+                        </label>
+                        <input id="AUDIOMUSE_USER" name="AUDIOMUSE_USER" type="text" placeholder="alice">
+                    </div>
+                    <div class="auth-admin-credential">
+                        <label for="AUDIOMUSE_PASSWORD" class="label-with-tooltip">
+                            Admin Password
+                            <span class="info-tooltip" tabindex="0">
+                                <span class="info-icon"></span>
+                                <span class="tooltip-text">The password for the admin user above.</span>
+                            </span>
+                        </label>
+                        <input id="AUDIOMUSE_PASSWORD" name="AUDIOMUSE_PASSWORD" type="password" placeholder="secret123" autocomplete="new-password">
+                        <p id="admin-password-hint" class="inline-feedback status-pending" style="display:none; margin:6px 0 0; width:100%;"></p>
+                    </div>
+                    <div class="auth-admin-credential">
+                        <label for="AUDIOMUSE_PASSWORD_CONFIRM" class="label-with-tooltip">
+                            Confirm Admin Password
+                            <span class="info-tooltip" tabindex="0">
+                                <span class="info-icon"></span>
+                                <span class="tooltip-text">Re-enter the admin password above to confirm it. Both fields must match before saving.</span>
+                            </span>
+                        </label>
+                        <input id="AUDIOMUSE_PASSWORD_CONFIRM" type="password" placeholder="secret123" autocomplete="new-password">
+                    </div>
+                    <div>
+                        <label for="JWT_SECRET" class="label-with-tooltip">
+                            JWT Secret
+                            <span class="info-tooltip" tabindex="0">
+                                <span class="info-icon"></span>
+                                <span class="tooltip-text">Random secret used to sign login tokens. Leave blank to auto-generate a strong one. Changing it invalidates all existing sessions.</span>
+                            </span>
+                        </label>
+                        <input id="JWT_SECRET" name="JWT_SECRET" type="password" placeholder="********" autocomplete="new-password">
+                    </div>
+                </div>
+                <div id="api-token-row" class="field-row">
+                    <label for="API_TOKEN" class="label-with-tooltip">
+                        API token
+                        <span class="info-tooltip" tabindex="0">
+                            <span class="info-icon"></span>
+                            <span class="tooltip-text">Optional bearer token for programmatic API access, needed for AudioMuse-AI plugin.</span>
+                        </span>
+                    </label>
+                    <input id="API_TOKEN" name="API_TOKEN" type="password" placeholder="api-token" autocomplete="new-password">
+                </div>
+            </section>
+
+            <details id="advanced-config">
+                <summary>Advanced configuration</summary>
+                <div class="notice" style="margin-top: 1rem;">
+                    <strong>⚠️ Read the documentation first.</strong>
+                    These settings tune analysis, clustering and internal behavior. Wrong values can break analysis runs or produce poor playlists. Please review the
+                    <a href="https://github.com/NeptuneHub/AudioMuse-AI/blob/main/docs/PARAMETERS.md" target="_blank" rel="noopener noreferrer">PARAMETERS documentation on GitHub</a>
+                    before changing anything here.
+                </div>
+                <div class="advanced-toolbar">
+                    <button type="button" id="advanced-expand-all">Expand all</button>
+                    <button type="button" id="advanced-collapse-all">Collapse all</button>
+                </div>
+                <div id="advanced-fields"></div>
+            </details>
+
+            {% if lyrics_enabled %}
+            <details id="lyrics-api-config">
+                <summary>Lyrics API</summary>
+                <div class="notice" style="margin-top: 1rem;">
+                    These are the external APIs used to fetch lyrics before analysis.
+                    If no API is configured, or if all configured APIs fail or time out,
+                    AudioMuse-AI will fall back to local transcription with <strong>Whisper</strong>.
+                    <br><br>
+                    Paste a real example URL (with actual artist and track values) including http:// or https:// and click <strong>Analyze</strong>.
+                    AudioMuse-AI will call the URL, detect the parameters automatically, and show the JSON response
+                    so you can click the field that contains the lyrics.
+                </div>
+
+                <!-- API Slot 1 -->
+                <div class="section" style="margin-top: 1.5rem;">
+                    <h3 style="margin-bottom: 1rem;">API Slot 1</h3>
+                    <div id="lyrics-api-1-input-row" class="field-row inline" style="align-items:center;">
+                        <input id="lyrics-api-1-example-url" type="text" style="flex:1; min-width:200px; margin-bottom:0;">
+                        <button type="button" id="lyrics-api-1-analyze-btn" style="white-space:nowrap;">Analyze</button>
+                    </div>
+                    <div id="lyrics-api-1-analyze-status" class="field-row" style="display:none;">
+                        <p id="lyrics-api-1-status-msg" class="inline-feedback" style="margin:0; width:100%;"></p>
+                    </div>
+                    <div id="lyrics-api-1-analyze-area" style="display:none; margin-top:1rem;"></div>
+                    <div id="lyrics-api-1-config-summary" style="display:none; margin-top:1rem; padding:1rem; border-radius:10px; background:var(--bg-card,#f8f9fb); border:1px solid var(--border-color,#ccc);"></div>
+                    <div id="lyrics-api-1-timeout-row" class="field-row" style="display:none; margin-top:0.75rem; align-items:center; gap:0.75rem; flex-wrap:wrap;">
+                        <label for="LYRICS_API_1_TIMEOUT" style="margin-bottom:0; white-space:nowrap;">Timeout before falling back to Whisper (seconds)</label>
+                        <input id="LYRICS_API_1_TIMEOUT" name="LYRICS_API_1_TIMEOUT" type="number" min="1" step="0.5"
+                               style="width:100px; margin-bottom:0;" value="5">
+                    </div>
+                    <input type="hidden" id="LYRICS_API_1_URL_TEMPLATE" name="LYRICS_API_1_URL_TEMPLATE">
+                    <input type="hidden" id="LYRICS_API_1_ARTIST_PARAM" name="LYRICS_API_1_ARTIST_PARAM">
+                    <input type="hidden" id="LYRICS_API_1_TITLE_PARAM" name="LYRICS_API_1_TITLE_PARAM">
+                    <input type="hidden" id="LYRICS_API_1_LYRICS_FIELD" name="LYRICS_API_1_LYRICS_FIELD">
+                    <input type="hidden" id="LYRICS_API_1_APIKEY_PARAM" name="LYRICS_API_1_APIKEY_PARAM">
+                    <input type="hidden" id="LYRICS_API_1_APIKEY_VALUE" name="LYRICS_API_1_APIKEY_VALUE">
+                </div>
+
+                <!-- API Slot 2 -->
+                <div class="section" style="margin-top: 1.5rem; padding-top:1.5rem; border-top:1px solid var(--border-color,#eee);">
+                    <h3 style="margin-bottom: 1rem;">API Slot 2</h3>
+                    <div id="lyrics-api-2-input-row" class="field-row inline" style="align-items:center;">
+                        <input id="lyrics-api-2-example-url" type="text" style="flex:1; min-width:200px; margin-bottom:0;">
+                        <button type="button" id="lyrics-api-2-analyze-btn" style="white-space:nowrap;">Analyze</button>
+                    </div>
+                    <div id="lyrics-api-2-analyze-status" class="field-row" style="display:none;">
+                        <p id="lyrics-api-2-status-msg" class="inline-feedback" style="margin:0; width:100%;"></p>
+                    </div>
+                    <div id="lyrics-api-2-analyze-area" style="display:none; margin-top:1rem;"></div>
+                    <div id="lyrics-api-2-config-summary" style="display:none; margin-top:1rem; padding:1rem; border-radius:10px; background:var(--bg-card,#f8f9fb); border:1px solid var(--border-color,#ccc);"></div>
+                    <div id="lyrics-api-2-timeout-row" class="field-row" style="display:none; margin-top:0.75rem; align-items:center; gap:0.75rem; flex-wrap:wrap;">
+                        <label for="LYRICS_API_2_TIMEOUT" style="margin-bottom:0; white-space:nowrap;">Timeout before falling back to Whisper (seconds)</label>
+                        <input id="LYRICS_API_2_TIMEOUT" name="LYRICS_API_2_TIMEOUT" type="number" min="1" step="0.5"
+                               style="width:100px; margin-bottom:0;" value="5">
+                    </div>
+                    <input type="hidden" id="LYRICS_API_2_URL_TEMPLATE" name="LYRICS_API_2_URL_TEMPLATE">
+                    <input type="hidden" id="LYRICS_API_2_ARTIST_PARAM" name="LYRICS_API_2_ARTIST_PARAM">
+                    <input type="hidden" id="LYRICS_API_2_TITLE_PARAM" name="LYRICS_API_2_TITLE_PARAM">
+                    <input type="hidden" id="LYRICS_API_2_LYRICS_FIELD" name="LYRICS_API_2_LYRICS_FIELD">
+                    <input type="hidden" id="LYRICS_API_2_APIKEY_PARAM" name="LYRICS_API_2_APIKEY_PARAM">
+                    <input type="hidden" id="LYRICS_API_2_APIKEY_VALUE" name="LYRICS_API_2_APIKEY_VALUE">
+                </div>
+            </details>
+            {% endif %}
+
+            <div style="margin-top: 2rem;"></div>
+            <div class="field-row">
+                <button id="save-button" type="submit">Save configuration</button>
+            </div>
+            <div class="field-row">
+                <p id="save-feedback" class="inline-feedback" style="display:none; margin:0; width:100%;"></p>
+            </div>
+        </form>
+</div>
+{% endblock %}
+
+{% block bodyAdditions %}
+<script src="{{ url_for('static', filename='plex_link.js') }}"></script>
+<script src="{{ url_for('static', filename='setup.js') }}"></script>
+<script src="{{ url_for('static', filename='music_servers_admin.js') }}"></script>
+<script src="{{ url_for('static', filename='menu.js') }}"></script>
+{% endblock %}

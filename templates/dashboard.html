@@ -1,0 +1,846 @@
+{% extends "includes/layout.html" %}
+
+{% block headAdditions %}
+<style>
+    /* Per-section "updated at" caption shown right under each section header. */
+    .dash-updated {
+        font-size: 0.8rem;
+        margin-top: 0.25rem;
+        margin-bottom: 0.75rem;
+    }
+
+    .dash-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+        gap: 12px;
+    }
+    .dash-stat-card {
+        background: var(--bg-body);
+        border: 1px solid var(--border-color);
+        border-radius: 0.6rem;
+        padding: 12px;
+        min-width: 0;
+    }
+    .dash-stat-card h3 {
+        margin: 0 0 6px 0;
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        letter-spacing: 0.05em;
+        font-weight: 600;
+    }
+    .dash-stat {
+        font-size: 1.5rem;
+        font-weight: 700;
+        color: var(--text-title);
+        line-height: 1.1;
+        word-break: break-word;
+    }
+    .dash-substat {
+        font-size: 0.78rem;
+        color: var(--text-muted);
+        margin-top: 4px;
+        word-break: break-word;
+    }
+    .dash-section-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.25rem;
+        min-width: 0;
+    }
+    .dash-section-grid > * { min-width: 0; }
+    @media (max-width: 900px) {
+        .dash-section-grid { grid-template-columns: 1fr; }
+        .dash-stat { font-size: 1.3rem; }
+    }
+    @media (max-width: 480px) {
+        .dash-stat { font-size: 1.15rem; }
+    }
+
+    .dash-table-wrap {
+        width: 100%;
+        max-width: 100%;
+        /* Scroll the table WITHIN its wrapper at any width, so a wide table
+           (e.g. Music Server Status) never pushes the whole page off-screen -
+           it shrinks to fit, then scrolls horizontally. */
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    /* Below this breakpoint tables stop shrinking and instead scroll so
+       content stays readable on phones. */
+    @media (max-width: 600px) {
+        .dash-table {
+            min-width: 560px;
+            table-layout: auto;
+        }
+        .dash-table td, .dash-table th { white-space: nowrap !important; }
+        .dash-table td code { white-space: nowrap !important; }
+    }
+    .dash-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9rem;
+        table-layout: fixed;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+    }
+    /* Force every cell to wrap onto a new line instead of bleeding into
+       the next column (applies to every table on the dashboard). */
+    .dash-table td, .dash-table th {
+        white-space: normal !important;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+    }
+    .dash-table td code {
+        white-space: normal !important;
+        word-break: break-all;
+        overflow-wrap: anywhere;
+        display: inline-block;
+        max-width: 100%;
+    }
+    .dash-table th, .dash-table td {
+        text-align: left;
+        padding: 8px 10px;
+        border-bottom: 1px solid var(--border-color);
+        vertical-align: top;
+        min-width: 0;
+    }
+    .dash-table th {
+        font-weight: 600;
+        color: var(--text-muted);
+        font-size: 0.72rem;
+        text-transform: uppercase;
+    }
+    .dash-table code {
+        word-break: break-all;
+        font-size: 0.8rem;
+        white-space: normal !important;
+    }
+    .dash-table .col-narrow { width: 70px; }
+    .dash-table .col-medium { width: 110px; }
+    /* The Orphan and "on multiple servers" rows are accounting lines, not real
+       servers: mute them so they read as adjustments under the configured ones. */
+    .dash-note-row td { color: var(--text-muted); font-style: italic; }
+    /* Clickable dashboard numbers open the paginated Browse view pre-filtered.
+       Coloured + dashed underline + pointer so it is obvious they are links. */
+    .dash-stat-link { color: inherit; text-decoration: none; cursor: pointer; }
+    .dash-stat-link:hover, .dash-stat-link:focus-visible { text-decoration: underline; }
+    /* A one-line hint so users know the counts open a list. */
+    .dash-clickhint { color: var(--text-muted); font-size: 0.78rem; margin: 0.15rem 0 0; }
+    /* Music Server Status: shrink a little, then scroll the wrapper horizontally
+       rather than squish every column. The min-width keeps ~170px for the
+       Server name (the one flexible column) after the fixed columns take
+       theirs, so it stays readable on phones. */
+    #music-servers-status-table { min-width: 640px; }
+
+    /* Workers table: force hostname and current-job cells to wrap onto new
+       lines instead of bleeding into the next column. */
+    .workers-table td, .workers-table th { white-space: normal; }
+    .workers-table td:nth-child(1),
+    .workers-table td:nth-child(6) {
+        word-break: break-all;
+        overflow-wrap: anywhere;
+    }
+
+    .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.72rem;
+        font-weight: 600;
+        white-space: nowrap;
+    }
+    .badge-success, .badge-ok { background: var(--status-success-bg); color: var(--status-success-text); }
+    .badge-failure { background: var(--status-failure-bg); color: var(--status-failure-text); }
+    .badge-pending { background: var(--status-pending-bg); color: var(--status-pending-text); }
+    .badge-progress, .badge-started { background: #DBEAFE; color: #1E40AF; }
+    .badge-revoked, .badge-unknown { background: #E5E7EB; color: #374151; }
+
+    .chart-wrap {
+        position: relative;
+        width: 100%;
+        max-width: 100%;
+        height: 260px;
+        min-width: 0;
+        overflow: hidden;
+    }
+    /* Pie/doughnut charts: same size for visual consistency. */
+    .chart-wrap-pie { height: 420px; }
+    @media (max-width: 600px) {
+        .chart-wrap { height: 200px; }
+        .chart-wrap-pie { height: 280px; }
+    }
+    .chart-wrap canvas { max-width: 100% !important; }
+
+    /* Content/Library subtitles: same size as the section <h2>, with a
+       horizontal separator bar underneath. */
+    .dash-subhead {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: var(--text-title);
+        margin: 0 0 0.75rem 0;
+        padding-bottom: 0.4rem;
+        border-bottom: 1px solid var(--border-color);
+        display: flex;
+        align-items: center;
+        gap: 0.35rem;
+        flex-wrap: wrap;
+    }
+    /* Content/Library subsection spacing: generous on desktop, tight
+       on phones so charts don't feel disconnected by blank areas. */
+    .dash-subsection { margin-top: 1.5rem; }
+    .dash-subsection:first-of-type { margin-top: 1rem; }
+    @media (max-width: 600px) {
+        .dash-subsection { margin-top: 0.6rem; }
+        .dash-subsection:first-of-type { margin-top: 0.4rem; }
+        .dash-subhead {
+            font-size: 1.05rem;
+            margin-bottom: 0.4rem;
+            padding-bottom: 0.25rem;
+        }
+        section { margin-bottom: 0.75rem; }
+    }
+
+    .muted { color: var(--text-muted); font-size: 0.85rem; }
+
+    /* .scope-chip / .scope-catalog / .scope-server live in style.css, shared with
+       the corner chip server_selector.js pins on every page. Hidden by default and
+       revealed only once server_selector.js puts .multi-server on <body> (2+ servers),
+       so a single-server install never even flashes them during load. */
+</style>
+{% endblock %}
+
+{% block content %}
+<div id="main-content-inner">
+
+    <!-- Header + refresh (above) + key numbers -->
+    <section class="scope-chip-host">
+        <span class="scope-chip scope-chip-corner scope-catalog">Catalogue</span>
+        <div id="config-header">
+            <div class="config-title-group">
+                <h1>AudioMuse-AI</h1>
+                <p class="subtitle">Where Music Takes Shape</p>
+            </div>
+        </div>
+        <p class="muted dash-updated" id="keynumbers-updated">Loading…</p>
+        <div class="dash-grid" id="key-numbers"></div>
+        <p class="dash-clickhint">Click any underlined number to open the full list.</p>
+    </section>
+
+    <!-- Music Server Status (shown when at least one server is configured) -->
+    <section id="music-server-status-section" class="scope-chip-host" style="display:none;">
+        <span class="scope-chip scope-chip-corner scope-server">Per server</span>
+        <h2>Music Server Status
+            <span class="info-tooltip" tabindex="0">
+                <span class="info-icon" aria-hidden="true"></span>
+                <span class="tooltip-text">Each server holds its own library; the catalogue is the union of all of them, deduplicated. "Unique in catalogue" counts THAT server's distinct analyzed songs; "Duplicate files" are extra copies of a song already counted (same audio, several files). The "On multiple servers" row is a NEGATIVE adjustment: a song on more than one server is counted in each server row above, so it is subtracted once to avoid double-counting. The "Orphan" row counts songs bound to NO server (a removed server or deleted file leaves the analysis in the catalogue). With both, the "Unique in catalogue" column sums exactly to the total unique songs.</span>
+            </span>
+        </h2>
+        <p class="muted dash-updated" id="music-servers-updated">Loading…</p>
+        <p class="dash-clickhint">Click any underlined count to open the full list of those songs.</p>
+        <div class="dash-table-wrap">
+            <table class="dash-table" id="music-servers-status-table">
+                <thead><tr>
+                    <th>Server</th>
+                    <th class="col-medium">Type</th>
+                    <th class="col-narrow">Default</th>
+                    <th class="col-medium">Unique in catalogue</th>
+                    <th class="col-narrow">Duplicate files</th>
+                </tr></thead>
+                <tbody><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- Workers -->
+    <section class="scope-chip-host">
+        <span class="scope-chip scope-chip-corner scope-catalog">Catalogue</span>
+        <h2>Queue Workers
+            <span class="info-tooltip" tabindex="0">
+                <span class="info-icon" aria-hidden="true"></span>
+                <span class="tooltip-text">Each worker container spins up two RQ workers: one serving the <strong>high</strong> priority queue and one serving the <strong>default</strong> queue. So a single physical node usually shows up as two rows here.</span>
+            </span>
+        </h2>
+        <p class="muted dash-updated" id="workers-updated">Loading…</p>
+        <div class="dash-table-wrap">
+            <table class="dash-table workers-table" id="workers-table">
+                <thead><tr>
+                    <th>Hostname</th>
+                    <th class="col-narrow">State</th>
+                    <th>Queues</th>
+                    <th class="col-narrow">OK</th>
+                    <th class="col-narrow">Fail</th>
+                    <th>Current Job</th>
+                </tr></thead>
+                <tbody><tr><td colspan="6" class="muted">Loading…</td></tr></tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- Recent activity (table only) -->
+    <section class="scope-chip-host">
+        <span class="scope-chip scope-chip-corner scope-catalog">Catalogue</span>
+        <h2>Recent tasks
+            <span class="info-tooltip" tabindex="0">
+                <span class="info-icon" aria-hidden="true"></span>
+                <span class="tooltip-text">The last 10 completed top-level tasks. This is the full history AudioMuse-AI keeps: only the newest 10 rows are retained.</span>
+            </span>
+        </h2>
+        <p class="muted dash-updated" id="recent-updated">Loading…</p>
+        <div class="dash-table-wrap" style="margin-top:1rem;">
+            <table class="dash-table" id="recent-tasks-table">
+                <thead><tr>
+                    <th>Type</th>
+                    <th class="col-narrow">Status</th>
+                    <th class="col-medium">Duration</th>
+                    <th>When</th>
+                    <th>Note</th>
+                </tr></thead>
+                <tbody><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- Content metrics -->
+    <section class="scope-chip-host">
+        <span class="scope-chip scope-chip-corner scope-catalog">Catalogue</span>
+        <h2>Library
+            <span class="info-tooltip" tabindex="0">
+                <span class="info-icon" aria-hidden="true"></span>
+                <span class="tooltip-text">The catalogue is every analyzed song across all your music servers, deduplicated: a song present on two servers is counted once.</span>
+            </span>
+        </h2>
+        <p class="muted dash-updated" id="content-updated">Loading…</p>
+
+        <div class="dash-subsection">
+            <h3 class="dash-subhead">Genres
+                <span class="info-tooltip" tabindex="0">
+                    <span class="info-icon" aria-hidden="true"></span>
+                    <span class="tooltip-text">Every analyzed song is counted once, under the mood that scored highest in its vector (the closest proxy for "genre" in this library). All detected genres are shown.</span>
+                </span>
+            </h3>
+            <div class="chart-wrap" id="chart-top-genre-wrap"><canvas id="chart-top-genre"></canvas></div>
+        </div>
+
+        <div class="dash-subsection">
+            <h3 class="dash-subhead">Moods Coverage
+                <span class="info-tooltip" tabindex="0">
+                    <span class="info-icon" aria-hidden="true"></span>
+                    <span class="tooltip-text">Emotional mood breakdown (<strong>danceable</strong>, <strong>aggressive</strong>, <strong>happy</strong>, <strong>party</strong>, <strong>relaxed</strong>, <strong>sad</strong>) summed across every song’s mood vector.</span>
+                </span>
+            </h3>
+            <div class="chart-wrap chart-wrap-pie"><canvas id="chart-moods-coverage"></canvas></div>
+        </div>
+
+        <div class="dash-subsection">
+            <h3 class="dash-subhead">Tempo Profile
+                <span class="info-tooltip" tabindex="0">
+                    <span class="info-icon" aria-hidden="true"></span>
+                    <span class="tooltip-text" id="tempo-tooltip">Distribution of songs across tempo buckets: Slow (&lt;85 BPM), Medium (85–110), Fast (110–140), Very Fast (≥140).</span>
+                </span>
+            </h3>
+            <div class="chart-wrap chart-wrap-pie"><canvas id="chart-tempo"></canvas></div>
+        </div>
+    </section>
+
+    <!-- Scheduled Tasks -->
+    <section class="scope-chip-host">
+        <span class="scope-chip scope-chip-corner scope-catalog">Catalogue</span>
+        <h2>Scheduled Tasks
+            <span class="info-tooltip" tabindex="0">
+                <span class="info-icon" aria-hidden="true"></span>
+                <span class="tooltip-text">Every schedule is catalogue-wide: a batch task always runs against all configured music servers, one server at a time. "Last triggered" is when the schedule last fired, not when the job last succeeded: a run skipped because another main task was already active still counts as triggered.</span>
+            </span>
+        </h2>
+        <p class="muted dash-updated" id="cron-updated">Loading…</p>
+        <div class="dash-table-wrap" style="margin-top:1rem;">
+            <table class="dash-table" id="cron-table">
+                <thead><tr>
+                    <th>Name</th>
+                    <th>Type</th>
+                    <th>Cron</th>
+                    <th class="col-narrow">Enabled</th>
+                    <th>Last Triggered</th>
+                </tr></thead>
+                <tbody><tr><td colspan="5" class="muted">Loading…</td></tr></tbody>
+            </table>
+        </div>
+    </section>
+
+</div>
+{% endblock %}
+
+{% block postHTMLScripts %}
+<script src="{{ url_for('static', filename='menu.js') }}"></script>
+<script src="{{ url_for('static', filename='chart.js') }}"></script>
+<script>
+(function() {
+    const charts = {};
+
+    // Which caption each section gets. A section is in exactly one list, by its
+    // cadence: FAST snapshot keys (every 60s), CHARTS snapshot keys (hourly,
+    // stamped separately), or LIVE (recomputed on every poll).
+    const FAST_CAPTIONS = ['keynumbers-updated', 'music-servers-updated'];
+    const CHARTS_CAPTIONS = ['content-updated'];
+    const LIVE_CAPTIONS = ['workers-updated', 'recent-updated', 'cron-updated'];
+
+    const isDark = () => document.body.classList.contains('dark-mode')
+        || document.documentElement.classList.contains('dark-mode');
+    const gridColor = () => isDark() ? 'rgba(200,200,200,0.1)' : 'rgba(0,0,0,0.1)';
+    const tickColor = () => isDark() ? '#D1D5DB' : '#374151';
+
+    function statusBadgeClass(status) {
+        if (!status) return 'badge-unknown';
+        const s = status.toUpperCase();
+        if (s === 'SUCCESS' || s === 'OK') return 'badge-success';
+        if (s === 'FAILURE' || s === 'DOWN') return 'badge-failure';
+        if (s === 'PENDING') return 'badge-pending';
+        if (s === 'STARTED') return 'badge-started';
+        if (s === 'PROGRESS') return 'badge-progress';
+        if (s === 'REVOKED') return 'badge-revoked';
+        return 'badge-unknown';
+    }
+
+    function fmtDuration(secs) {
+        if (secs == null) return '–';
+        if (secs < 1) return (secs * 1000).toFixed(0) + ' ms';
+        if (secs < 60) return secs.toFixed(1) + ' s';
+        if (secs < 3600) return (secs / 60).toFixed(1) + ' min';
+        return (secs / 3600).toFixed(2) + ' h';
+    }
+    function fmtTime(iso) { return iso ? iso.replace('T', ' ').substring(0, 19) : '–'; }
+    function setText(id, value) { const el = document.getElementById(id); if (el) el.textContent = value; }
+
+    // The one percentage formatter on this page. Floors so an incomplete job
+    // never rounds up to 100%; num >= den (overshoot included) is complete;
+    // an unknown denominator reports 'unknown', never a misleading "0.0%".
+    function ratio(num, den) {
+        const n = Number(num) || 0;
+        const d = Number(den) || 0;
+        if (d <= 0) return { state: 'unknown', pct: 0, text: null };
+        if (n >= d) return { state: 'complete', pct: 100, text: '100%' };
+        const pct = Math.floor(1000 * n / d) / 10;
+        return { state: 'ok', pct: pct, text: pct.toFixed(1) + '%' };
+    }
+
+    // Percent of a whole for chart slices, where the parts always sum to the
+    // total: floor so a dominant slice cannot round up to a false 100.0%.
+    function slicePct(value, total) {
+        if (!total) return '0.0';
+        return (Math.floor(1000 * value / total) / 10).toFixed(1);
+    }
+
+    // Custom plugin: draws the label name + percentage inside each slice
+    // of a pie/doughnut chart, so we can hide the side legend entirely.
+    const pieSliceLabelPlugin = {
+        id: 'pieSliceLabel',
+        afterDatasetsDraw(chart) {
+            if (chart.config.type !== 'doughnut' && chart.config.type !== 'pie') return;
+            const ctx = chart.ctx;
+            chart.data.datasets.forEach((ds, di) => {
+                const meta = chart.getDatasetMeta(di);
+                if (!meta || meta.hidden) return;
+                const total = ds.data.reduce((a, b) => a + (Number(b) || 0), 0);
+                if (!total) return;
+                meta.data.forEach((arc, i) => {
+                    const value = Number(ds.data[i]) || 0;
+                    if (!value) return;
+                    const pct = 100 * value / total;
+                    if (pct < 3) return; // skip tiny slices to avoid overlap
+                    const pos = arc.tooltipPosition();
+                    const label = chart.data.labels[i] || '';
+                    const pctStr = slicePct(value, total) + '%';
+                    ctx.save();
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.font = '600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif';
+                    ctx.shadowColor = 'transparent';
+                    ctx.shadowBlur = 0;
+                    ctx.shadowOffsetX = 0;
+                    ctx.shadowOffsetY = 0;
+                    ctx.lineWidth = 2;
+                    ctx.lineJoin = 'round';
+                    ctx.miterLimit = 2;
+                    ctx.strokeStyle = '#000000';
+                    ctx.fillStyle = '#FFFFFF';
+                    ctx.strokeText(label, pos.x, pos.y - 7);
+                    ctx.fillText(label, pos.x, pos.y - 7);
+                    ctx.strokeText(pctStr, pos.x, pos.y + 7);
+                    ctx.fillText(pctStr, pos.x, pos.y + 7);
+                    ctx.restore();
+                });
+            });
+        }
+    };
+
+    function renderChartDoughnut(canvasId, labels, data, palette) {
+        const ctx = document.getElementById(canvasId).getContext('2d');
+        if (charts[canvasId]) charts[canvasId].destroy();
+        charts[canvasId] = new Chart(ctx, {
+            type: 'doughnut',
+            data: { labels, datasets: [{ data, backgroundColor: palette, borderWidth: 1 }] },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label(ctx) {
+                                const total = ctx.dataset.data.reduce((a, b) => a + (Number(b) || 0), 0);
+                                const v = Number(ctx.parsed) || 0;
+                                return ctx.label + ': ' + v.toLocaleString()
+                                    + ' (' + slicePct(v, total) + '%)';
+                            }
+                        }
+                    }
+                }
+            },
+            plugins: [pieSliceLabelPlugin]
+        });
+    }
+    function renderChartHorizontalBar(canvasId, labels, data, color) {
+        const ctx = document.getElementById(canvasId).getContext('2d');
+        if (charts[canvasId]) charts[canvasId].destroy();
+        charts[canvasId] = new Chart(ctx, {
+            type: 'bar',
+            data: { labels, datasets: [{ label: 'count', data, backgroundColor: color }] },
+            options: {
+                indexAxis: 'y',
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { beginAtZero: true, grid: { color: gridColor() }, ticks: { color: tickColor() } },
+                    y: { grid: { color: gridColor() }, ticks: { color: tickColor() } }
+                }
+            }
+        });
+    }
+
+    // A "N (P%)" sub-line for a genuine subset of the catalogue. When the
+    // denominator is unknown it says so instead of printing a fake 0.0%.
+    function subsetLine(label, num, den) {
+        const r = ratio(num, den);
+        if (r.state === 'unknown') return label + ': unknown';
+        const n = (Number(num) || 0).toLocaleString();
+        if (r.state === 'complete') return label + ': ' + n + ' (all)';
+        return label + ': ' + n + ' (' + r.text + ')';
+    }
+
+    function renderKeyNumbers(d) {
+        const c = d.content || {};
+        const hasStats = !!d.stats_updated_at;
+        const host = document.getElementById('key-numbers');
+        host.innerHTML = '';
+
+        if (!hasStats) {
+            const div = document.createElement('div');
+            div.className = 'dash-stat-card';
+            div.style.gridColumn = '1 / -1';
+            div.innerHTML = `<h3>Catalogue</h3>
+                             <div class="dash-stat" style="font-size:1rem;">First snapshot is still being computed</div>
+                             <div class="dash-substat">It lands about a minute after startup, then refreshes every minute.</div>`;
+            host.appendChild(div);
+            return;
+        }
+
+        const totalSongs = c.total_songs || 0;
+        const totalArtists = c.distinct_artists || 0;
+
+        // "(unique)" in the title; the number links into the Browse view for that
+        // kind (catalogue-wide, all servers).
+        const cards = [
+            { title: 'Songs (unique)', value: totalSongs.toLocaleString(), kind: 'songs' },
+            { title: 'Artists (unique)', value: totalArtists.toLocaleString(), kind: 'artists' },
+            { title: 'Albums (unique)', value: (c.distinct_albums || 0).toLocaleString(), kind: 'albums' },
+        ];
+
+        cards.forEach(card => {
+            const div = document.createElement('div');
+            div.className = 'dash-stat-card';
+            const href = BROWSE_URL + '?kind=' + card.kind;
+            const tip = 'Click to open the full list of ' + card.kind;
+            div.innerHTML = `<h3>${card.title}</h3>
+                             <div class="dash-stat"><a class="dash-stat-link" href="${href}" title="${tip}">${card.value}</a></div>`;
+            host.appendChild(div);
+        });
+    }
+
+    function badgeCell(text, cls) {
+        const td = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'badge ' + cls;
+        badge.textContent = text;
+        td.appendChild(badge);
+        return td;
+    }
+
+    function textCell(text) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        return td;
+    }
+
+    const BROWSE_URL = "{{ url_for('dashboard_bp.browse_page') }}";
+
+    function linkCell(text, href, tip) {
+        const td = document.createElement('td');
+        const a = document.createElement('a');
+        a.className = 'dash-stat-link';
+        a.href = href;
+        a.textContent = text;
+        if (tip) a.title = tip;
+        td.appendChild(a);
+        return td;
+    }
+
+    function renderWorkers(workers) {
+        const tbody = document.querySelector('#workers-table tbody');
+        tbody.innerHTML = '';
+        if (!workers || workers.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" class="muted">No active workers detected.</td></tr>';
+            return;
+        }
+        workers.forEach(w => {
+            const cls = w.state === 'busy' ? 'badge-progress'
+                : (w.state === 'idle' ? 'badge-ok' : 'badge-unknown');
+            const jobTd = document.createElement('td');
+            if (w.current_job_id) {
+                const code = document.createElement('code');
+                code.textContent = w.current_job_id;
+                jobTd.appendChild(code);
+            } else {
+                jobTd.textContent = '-';
+            }
+            const tr = document.createElement('tr');
+            tr.appendChild(textCell(w.hostname || '-'));
+            tr.appendChild(badgeCell(w.state || 'unknown', cls));
+            tr.appendChild(textCell((w.queues || []).join(', ') || '-'));
+            tr.appendChild(textCell(w.successful_jobs ?? 0));
+            tr.appendChild(textCell(w.failed_jobs ?? 0));
+            tr.appendChild(jobTd);
+            tbody.appendChild(tr);
+        });
+    }
+
+    function renderRecentTasks(tasks) {
+        const tbody = document.querySelector('#recent-tasks-table tbody');
+        tbody.innerHTML = '';
+        if (!tasks || tasks.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="muted">No tasks yet.</td></tr>';
+            return;
+        }
+        tasks.forEach(t => {
+            const tr = document.createElement('tr');
+            tr.appendChild(textCell(t.task_type || '-'));
+            tr.appendChild(badgeCell(t.status || '?', statusBadgeClass(t.status)));
+            tr.appendChild(textCell(fmtDuration(t.duration_seconds)));
+            tr.appendChild(textCell(fmtTime(t.timestamp)));
+            tr.appendChild(textCell(t.note || ''));
+            tbody.appendChild(tr);
+        });
+    }
+
+    function showChartPlaceholder(canvasId, message) {
+        if (charts[canvasId]) { charts[canvasId].destroy(); delete charts[canvasId]; }
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !canvas.parentElement) return;
+        const wrap = canvas.parentElement;
+        // Preserve the canvas in the DOM but overlay a centred message
+        let msg = wrap.querySelector('.chart-empty');
+        if (!msg) {
+            msg = document.createElement('div');
+            msg.className = 'chart-empty muted';
+            msg.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:1rem;';
+            wrap.style.position = wrap.style.position || 'relative';
+            wrap.appendChild(msg);
+        }
+        msg.textContent = message;
+    }
+    function clearChartPlaceholder(canvasId) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !canvas.parentElement) return;
+        const msg = canvas.parentElement.querySelector('.chart-empty');
+        if (msg) msg.remove();
+    }
+
+    function renderTopGenre(rows) {
+        if (!rows || rows.length === 0) {
+            showChartPlaceholder('chart-top-genre', 'Still collecting library data…');
+            return;
+        }
+        clearChartPlaceholder('chart-top-genre');
+        // Scale the chart container so every genre gets a readable row.
+        const wrap = document.getElementById('chart-top-genre-wrap');
+        if (wrap) {
+            const px = Math.max(300, rows.length * 22 + 40);
+            wrap.style.height = px + 'px';
+        }
+        renderChartHorizontalBar('chart-top-genre',
+            rows.map(r => r.label), rows.map(r => r.count), '#7C3AED');
+    }
+
+    function renderMoodsCoverage(rows) {
+        if (!rows || rows.length === 0) {
+            showChartPlaceholder('chart-moods-coverage', 'Still collecting library data…');
+            return;
+        }
+        clearChartPlaceholder('chart-moods-coverage');
+        const palette = [
+            '#7C3AED', '#0EA5E9', '#F59E0B', '#EF4444', '#10B981',
+            '#F97316', '#EC4899', '#3B82F6', '#84CC16', '#8B5CF6',
+            '#14B8A6', '#F43F5E', '#A855F7', '#06B6D4', '#EAB308',
+            '#22C55E', '#DB2777', '#6366F1', '#D946EF', '#0891B2',
+            '#65A30D', '#DC2626'
+        ];
+        const labels = rows.map(r => r.label);
+        const data = rows.map(r => r.score);
+        const colors = labels.map((_, i) => palette[i % palette.length]);
+        renderChartDoughnut('chart-moods-coverage', labels, data, colors);
+    }
+
+    function renderTempo(profile) {
+        const data = profile
+            ? [profile.slow || 0, profile.medium || 0, profile.fast || 0, profile.very_fast || 0]
+            : [0, 0, 0, 0];
+        const total = data.reduce((a, b) => a + b, 0);
+        if (!profile || total === 0) {
+            showChartPlaceholder('chart-tempo', 'Still collecting library data…');
+            return;
+        }
+        clearChartPlaceholder('chart-tempo');
+        const labels = ['Slow (<85)', 'Medium (85-110)', 'Fast (110-140)', 'Very Fast (≥140)'];
+        const palette = ['#60A5FA', '#34D399', '#F59E0B', '#EF4444'];
+        renderChartDoughnut('chart-tempo', labels, data, palette);
+        const avg = profile.avg_tempo != null ? profile.avg_tempo.toFixed(1) + ' BPM' : '–';
+        const tip = document.getElementById('tempo-tooltip');
+        if (tip) {
+            tip.innerHTML = 'Distribution of songs across tempo buckets: Slow (&lt;85 BPM), '
+                + 'Medium (85–110), Fast (110–140), Very Fast (≥140). '
+                + total.toLocaleString() + ' songs with tempo • average '
+                + avg + '.';
+        }
+    }
+
+    function renderCron(rows) {
+        const tbody = document.querySelector('#cron-table tbody');
+        tbody.innerHTML = '';
+        if (!rows || rows.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="muted">No scheduled tasks configured.</td></tr>';
+            return;
+        }
+        rows.forEach(c => {
+            const tr = document.createElement('tr');
+            const exprTd = document.createElement('td');
+            const code = document.createElement('code');
+            code.textContent = c.cron_expr || '-';
+            exprTd.appendChild(code);
+            tr.appendChild(textCell(c.name || '-'));
+            tr.appendChild(textCell(c.task_type || '-'));
+            tr.appendChild(exprTd);
+            tr.appendChild(badgeCell(c.enabled ? 'enabled' : 'disabled',
+                c.enabled ? 'badge-ok' : 'badge-unknown'));
+            tr.appendChild(textCell(c.last_run || '-'));
+            tbody.appendChild(tr);
+        });
+    }
+
+    function renderMusicServers(servers) {
+        const section = document.getElementById('music-server-status-section');
+        if (!section) return;
+        // The Orphan and "on multiple servers" rows are synthetic tallies, not
+        // configured servers. The section shows for ANY configured server (even a
+        // single one) so its duplicate-files and orphan counts are always visible;
+        // it only hides when no server is configured at all.
+        const realServers = Array.isArray(servers)
+            ? servers.filter(s => !s.is_orphan && !s.is_overlap) : [];
+        if (realServers.length < 1) {
+            section.style.display = 'none';
+            return;
+        }
+        section.style.display = '';
+        const tbody = document.querySelector('#music-servers-status-table tbody');
+        tbody.innerHTML = '';
+        servers.forEach(s => {
+            const tr = document.createElement('tr');
+            if (s.is_orphan || s.is_overlap) tr.className = 'dash-note-row';
+            tr.appendChild(textCell(s.name || '-'));
+            tr.appendChild(textCell(s.server_type || '-'));
+            tr.appendChild(textCell(s.is_default ? 'yes' : ''));
+
+            // Unique-in-catalogue links to the matching Browse view. The "on
+            // multiple servers" adjustment row is a negative tally with no list
+            // behind it, so it stays plain text.
+            const uniqueVal = (s.unique_songs || 0).toLocaleString();
+            if (s.is_overlap) {
+                tr.appendChild(textCell(uniqueVal));
+            } else if (s.is_orphan) {
+                tr.appendChild(linkCell(uniqueVal, BROWSE_URL + '?kind=songs&filter=orphan',
+                    'Click to list the orphan songs (on no server)'));
+            } else {
+                tr.appendChild(linkCell(uniqueVal,
+                    BROWSE_URL + '?kind=songs&server=' + encodeURIComponent(s.name || ''),
+                    'Click to list the songs on ' + (s.name || 'this server')));
+            }
+
+            // Duplicate files links to that server's duplicates view; '-' when none.
+            const dup = s.duplicate_copies || 0;
+            if (!s.is_orphan && !s.is_overlap && dup) {
+                tr.appendChild(linkCell(dup.toLocaleString(),
+                    BROWSE_URL + '?kind=songs&filter=duplicates&server=' + encodeURIComponent(s.name || ''),
+                    'Click to list the duplicated files on ' + (s.name || 'this server')));
+            } else {
+                tr.appendChild(textCell(dup ? dup.toLocaleString() : '-'));
+            }
+            tbody.appendChild(tr);
+        });
+    }
+
+    async function loadDashboard() {
+        try {
+            const res = await fetch('/api/dashboard/summary', { credentials: 'same-origin' });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const d = await res.json();
+            // A snapshot written by an older version carries no music_servers
+            // key. Treat that as "not in this snapshot yet", not as "no servers".
+            const content = d.content || {};
+            const servers = Array.isArray(content.music_servers) ? content.music_servers : [];
+            renderKeyNumbers(d);
+            renderWorkers(d.workers);
+            renderRecentTasks(d.recent_tasks);
+            renderTopGenre(content.top_genre);
+            renderMoodsCoverage(content.moods_coverage);
+            renderTempo(content.tempo_profile);
+            renderMusicServers(servers);
+            renderCron(d.cron);
+
+            // Three captions, one per cadence. A snapshot section stamps its own
+            // computed-at time and NEVER generated_at: stamping the request time
+            // made stale data look freshly computed, because the caption ticked
+            // every 30s while the data underneath it sat still. The charts section
+            // is hourly, so it uses its own charts_updated_at - not the fast tier's
+            // every-minute stamp, which is exactly what made the Genres/Moods
+            // charts read "recomputed every minute" when they are recomputed hourly.
+            const fast = d.stats_updated_at
+                ? 'Snapshot taken ' + d.stats_updated_at + ' - recomputed every minute'
+                : 'First snapshot is still being computed - it lands about a minute after startup';
+            const charts = content.charts_updated_at
+                ? 'Snapshot taken ' + content.charts_updated_at + ' - recomputed hourly'
+                : 'Charts are still being computed - they land about a minute after startup';
+            const live = d.generated_at
+                ? 'Live - updated ' + d.generated_at + ' - refreshes every 30s'
+                : 'Live';
+            FAST_CAPTIONS.forEach(id => setText(id, fast));
+            CHARTS_CAPTIONS.forEach(id => setText(id, charts));
+            LIVE_CAPTIONS.forEach(id => setText(id, live));
+        } catch (e) {
+            console.error('Dashboard load failed', e);
+            FAST_CAPTIONS.concat(CHARTS_CAPTIONS).concat(LIVE_CAPTIONS)
+                .forEach(id => setText(id, 'Could not load - check the container log.'));
+        }
+    }
+
+    loadDashboard();
+    setInterval(loadDashboard, 30000);
+})();
+</script>
+{% endblock %}

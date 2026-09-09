@@ -8,7 +8,15 @@ __pycache__/
 venv/
 .venv/
 .venv-macos/
+.venv-linux/
+.venv-windows/
 env/
+
+# Linux native build inputs built fresh in CI (not committed; see native-build/linux/vendor/README.md)
+/native-build/linux/vendor/redis/
+/native-build/linux/vendor/pg-contrib/*/
+/native-build/linux/vendor/postgres/*/
+/native-build/windows/vendor/redis/
 
 # Local environment variables
 # IMPORTANT: Never commit your .env file with secrets!
@@ -30,6 +38,10 @@ env/
 # This directory is used to download audio files from Jellyfin
 /temp_audio/
 
+# Plugin runtime cache: installed plugins are materialized here from the DB at boot
+/plugin/installed/*
+!/plugin/installed/.gitkeep
+
 # Log files
 *.log
 
@@ -38,25 +50,12 @@ env/
 htmlcov/
 nul
 
-# Large model files in query folder
-/query/*.pt
-/query/*.onnx
-
-
-# CLAMP3 weight files (large model files)
-/CLAMP3/weights_*.pth
-/CLAMP3/*.pth
-
-
 # Downloaded ONNX models (from run_worker_macos.sh or similar)
 /model/
 
 # Test models (downloaded by CI workflow from GitHub Releases)
 test/models/*.onnx
 test/models/*.onnx.data
-
-# Exported MuLan models
-mulan_model_export/
 
 # Student CLAP training artifacts
 student_clap/cache/
@@ -67,5 +66,13 @@ student_clap/config.local.yaml
 student_clap/models/FMA_SONGS_LICENSE.md
 student_clap/models/FMA_SONGS_2247_LICENSE.md
 
+# macOS standalone build artifacts (PyInstaller output)
+/build/
+/dist/
+
 # Testing suite
 testing_suite/
+analysis.md
+.claude/
+lyrics_model_gte_vnni.tar.gz
+native-build/windows/vendor/redis/amd64/redis-server.exe
