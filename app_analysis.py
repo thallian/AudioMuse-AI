@@ -9,7 +9,7 @@
 """Flask blueprint for launching library analysis and database cleaning.
 
 Thin route layer that enqueues the long-running main tasks onto the high
-priority RQ queue and returns their job id for the UI to poll via the generic
+priority task queue and returns their job id for the UI to poll via the generic
 status routes in `app.py`.
 
 Main Features:
@@ -19,19 +19,24 @@ Main Features:
   guards against a second concurrent main task via `get_active_main_task`.
 """
 
-from flask import Blueprint, jsonify, request, render_template
+from flask import Blueprint, request, render_template
 import uuid
 import logging
 
 # Import configuration from the main config.py
-from config import NUM_RECENT_ALBUMS, TOP_N_MOODS, TASK_STATUS_PENDING, CLEANING_CATALOGUE
+from config import (
+    NUM_RECENT_ALBUMS,
+    TOP_N_MOODS,
+    CLEANING_CATALOGUE,
+)
 
-# RQ import
-from rq import Retry
+# Task queue
+import taskqueue
 
 # App helper functions
-from app_helper import rq_queue_high, save_task_status
-from database import clean_up_previous_main_tasks, get_active_main_task
+import database
+
+from app_helper import admit_and_enqueue_main_task
 
 logger = logging.getLogger(__name__)
 
@@ -108,18 +113,7 @@ def start_analysis_endpoint():
       500:
         description: Server error during task enqueue.
     """
-    # Check for any existing active main task to prevent parallel batch runs.
-    active_task = get_active_main_task()
-    if active_task:
-        return jsonify(
-            {
-                "error": "An active batch task is already in progress.",
-                "task_id": active_task['task_id'],
-                "status": active_task['status'],
-            }
-        ), 409
-
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     # MODIFIED: Removed jellyfin_url, jellyfin_user_id, and jellyfin_token as they are no longer passed to the task.
     # The task now gets these details from the central config.
     num_recent_albums = int(data.get('num_recent_albums', NUM_RECENT_ALBUMS))
@@ -130,25 +124,29 @@ def start_analysis_endpoint():
 
     job_id = str(uuid.uuid4())
 
-    # Clean up details of previously successful or stale tasks before starting a new one
-    clean_up_previous_main_tasks()
-    save_task_status(
-        job_id, "main_analysis", TASK_STATUS_PENDING, details={"message": "Task enqueued."}
-    )
-
-    # Enqueue task using a string path to its function.
-    # MODIFIED: The arguments passed to the task are updated to match the new function signature.
-    job = rq_queue_high.enqueue(
-        'tasks.analysis.run_analysis_task',
-        args=(num_recent_albums, top_n_moods),
+    # The gate and the claim are one INSERT. A partial unique index allows exactly
+    # one live main task, so a double click or a cron tick landing on a manual
+    # start loses the race in Postgres rather than in application code, and the
+    # advisory lock that used to serialize check-then-act is gone with it.
+    # Gate, archive and enqueue are one session-scoped critical section (see
+    # app_helper.admit_and_enqueue_main_task): the archive REVOKES every live
+    # root, so it must come after the gate, and the lock must span the archive's
+    # internal commit so this start cannot retire a task another caller enqueued
+    # between our gate read and our archive.
+    return admit_and_enqueue_main_task(
         job_id=job_id,
-        description="Main Music Analysis",
-        retry=Retry(max=3),
-        job_timeout=-1,  # No timeout
+        task_type="main_analysis",
+        busy_label='analysis',
+        error_message="Could not queue the analysis. Check the logs.",
+        enqueue=lambda: taskqueue.enqueue(
+            'tasks.analysis.run_analysis_task',
+            args=(num_recent_albums, top_n_moods),
+            task_id=job_id,
+            task_type="main_analysis",
+            queue=taskqueue.QUEUE_HIGH,
+            details={"message": "Task queued."},
+        ),
     )
-    return jsonify(
-        {"task_id": job.id, "task_type": "main_analysis", "status": job.get_status()}
-    ), 202
 
 
 @analysis_bp.route('/api/cleaning/start', methods=['POST'])
@@ -185,40 +183,35 @@ def start_cleaning_endpoint():
     # minutes earlier, so an overlap lets cleaning delete the mappings the sweep just
     # wrote. Every other task type may run alongside a sweep, so they keep the
     # default exclusion.
-    active_task = get_active_main_task(exclude_task_types=())
-    if active_task:
-        return jsonify(
-            {
-                "error": "An active batch task is already in progress.",
-                "task_id": active_task['task_id'],
-                "status": active_task['status'],
-            }
-        ), 409
-
     # Per-run opt-in: when the cleaning page's checkbox is ticked (or CLEANING_CATALOGUE
     # is the env default) the task also DELETES catalogue rows bound to no server;
     # otherwise it only unbinds each server's stale mappings.
     data = request.get_json(silent=True) or {}
     clean_catalogue = bool(data.get('clean_catalogue', CLEANING_CATALOGUE))
 
-    # Clean up any previous cleaning tasks
-    clean_up_previous_main_tasks()
-
     job_id = str(uuid.uuid4())
-    save_task_status(
-        job_id,
-        "cleaning",
-        TASK_STATUS_PENDING,
-        details={"message": "Database cleaning task enqueued."},
-    )
 
-    # Enqueue combined cleaning task
-    job = rq_queue_high.enqueue(
-        'tasks.cleaning.identify_and_clean_orphaned_albums_task',
-        clean_catalogue,
+    # Cleaning is the one start that also refuses while a SWEEP runs, because the
+    # two write the same mappings; that stricter check stays a read, while the
+    # unique index enforces the one-live-main-task rule itself.
+    return admit_and_enqueue_main_task(
         job_id=job_id,
-        description="Database Cleaning (Identify and Delete Orphaned Albums)",
-        retry=Retry(max=2),
-        job_timeout=-1,  # No timeout
+        task_type="cleaning",
+        busy_label='cleaning',
+        error_message="Could not queue the cleaning. Check the logs.",
+        blocking_gate=lambda: (
+            database.get_queue_blocking_task()
+            or database.get_active_main_task(task_type='server_sweep')
+        ),
+        race_read=lambda: database.get_active_main_task(
+            exclude_task_types=database.NON_BLOCKING_TASK_TYPES
+        ),
+        enqueue=lambda: taskqueue.enqueue(
+            'tasks.cleaning.identify_and_clean_orphaned_albums_task',
+            args=(clean_catalogue,),
+            task_id=job_id,
+            task_type="cleaning",
+            queue=taskqueue.QUEUE_HIGH,
+            details={"message": "Database cleaning task queued."},
+        ),
     )
-    return jsonify({"task_id": job.id, "task_type": "cleaning", "status": job.get_status()}), 202

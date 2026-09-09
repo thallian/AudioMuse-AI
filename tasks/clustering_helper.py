@@ -9,7 +9,7 @@
 """Per-iteration clustering worker: parameter generation, fitting and scoring.
 
 The inner loop of the clustering search run by tasks.clustering. Given a method
-and parameter set it prepares and scales the feature/embedding data, fits a model
+and parameter set it L2-normalizes the feature/embedding data, fits a model
 (via clustering_gpu), and scores the resulting playlists. Also generates the
 random and evolutionary parameter mutations that the elitist search explores.
 
@@ -32,36 +32,31 @@ import time
 import numpy as np
 from collections import Counter, defaultdict
 
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans, DBSCAN, SpectralClustering
+from sklearn.preprocessing import Normalizer
 from sklearn.decomposition import PCA
-from sklearn.mixture import GaussianMixture
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 
 logger = logging.getLogger(__name__)
 
 try:
-    from .clustering_gpu import get_clustering_model, get_pca_model
+    from .clustering_gpu import get_clustering_model, get_pca_model, clustering_use_gpu
 
     GPU_CLUSTERING_AVAILABLE = True
 except ImportError:
     GPU_CLUSTERING_AVAILABLE = False
     logger.debug("GPU clustering module not available, using CPU only")
 
-from rq.job import Job, JobStatus
-from rq.exceptions import NoSuchJobError
 
 from config import (
     STRATIFIED_GENRES,
     OTHER_FEATURE_LABELS,
     MOOD_LABELS,
+    MOOD_SCORE_MATCH_THRESHOLD,
     MAX_DISTANCE,
     MAX_SONGS_PER_ARTIST,
     MIN_PLAYLIST_SIZE_FOR_TOP_N,
     CLUSTERING_MAX_PLAYLIST_SONGS,
     CLUSTERING_SUBSET_SONGS,
-    GMM_COVARIANCE_TYPE,
-    SPECTRAL_N_NEIGHBORS,
     TOP_K_MOODS_FOR_PURITY_CALCULATION,
     LN_MOOD_DIVERSITY_STATS,
     LN_MOOD_PURITY_STATS,
@@ -70,8 +65,6 @@ from config import (
     LN_OTHER_FEATURES_DIVERSITY_STATS,
     LN_OTHER_FEATURES_PURITY_STATS,
     OTHER_FEATURE_PREDOMINANCE_THRESHOLD_FOR_PURITY,
-    USE_GPU_CLUSTERING,
-    TASK_STATUS_SUCCESS,
     LYRICS_ENABLED,
 )
 from .commons import score_vector
@@ -82,10 +75,8 @@ from tasks.ai.playlist_namer import build_naming_context, evidence_from_cluster_
 from database import (
     get_tracks_by_ids,
     get_score_data_by_ids,
-    get_task_info_from_db,
     get_lyrics_axis_vectors,
 )
-from taskqueue import redis_conn
 
 
 def _shuffle_playlist_songs(songs, playlist_name):
@@ -259,6 +250,7 @@ def _perform_single_clustering_iteration(
     mutation_config,
     score_weights,
     enable_clustering_embeddings,
+    tracks_cache=None,
 ):
     try:
         from flask_app import app
@@ -276,11 +268,12 @@ def _perform_single_clustering_iteration(
                 enable_clustering_embeddings,
                 log_prefix,
                 run_idx,
+                tracks_cache=tracks_cache,
             )
         if valid_tracks is None:
             return {"fitness_score": -1.0}
 
-        data_to_cluster, scaler = _prepare_and_scale_data(
+        data_to_cluster = _prepare_and_normalize_data(
             X_feat_orig, X_embed_raw, enable_clustering_embeddings
         )
         if data_to_cluster is None:
@@ -306,7 +299,7 @@ def _perform_single_clustering_iteration(
 
         pca_model, data_after_pca = None, data_to_cluster
         if params['pca_config']['enabled']:
-            if USE_GPU_CLUSTERING and GPU_CLUSTERING_AVAILABLE:
+            if GPU_CLUSTERING_AVAILABLE and clustering_use_gpu():
                 pca_model = get_pca_model(
                     n_components=params['pca_config']['components'], use_gpu=True
                 )
@@ -329,7 +322,6 @@ def _perform_single_clustering_iteration(
             data_after_pca,
             cluster_centers_map,
             pca_model,
-            scaler,
             active_mood_labels,
             params,
             max_songs_per_cluster,
@@ -344,22 +336,56 @@ def _perform_single_clustering_iteration(
         raise
 
 
-def _prepare_iteration_data(item_ids, active_mood_labels, use_embeddings, log_prefix, run_idx):
+def _fetch_track_rows(item_ids, use_embeddings):
+    return get_tracks_by_ids(item_ids) if use_embeddings else get_score_data_by_ids(item_ids)
+
+
+def _cached_track_rows(item_ids, use_embeddings, tracks_cache):
+    missing = [iid for iid in item_ids if iid not in tracks_cache]
+    for row_data in _fetch_track_rows(missing, use_embeddings) if missing else []:
+        if row_data and row_data.get('item_id') is not None:
+            tracks_cache[row_data['item_id']] = row_data
+    rows = [tracks_cache[iid] for iid in item_ids if iid in tracks_cache]
+    # Evict what this iteration did not ask for: consecutive iterations overlap
+    # heavily, so keeping only the live subset preserves nearly every cache hit
+    # while pinning the cache (embeddings included) at one subset instead of
+    # letting it grow towards the whole batch's union.
+    wanted = set(item_ids)
+    for stale_id in [iid for iid in tracks_cache if iid not in wanted]:
+        del tracks_cache[stale_id]
+    return rows
+
+
+def _iteration_vectors(row_data, active_mood_labels, use_embeddings):
+    feature_vec = score_vector(row_data, active_mood_labels, OTHER_FEATURE_LABELS)
+    if not use_embeddings:
+        return feature_vec, None
+    embedding_vec = row_data.get('embedding_vector')
+    if embedding_vec is None or embedding_vec.size == 0:
+        logger.warning(f"Skipping track {row_data.get('item_id')} due to missing embedding.")
+        return None, None
+    return feature_vec, embedding_vec
+
+
+def _prepare_iteration_data(
+    item_ids, active_mood_labels, use_embeddings, log_prefix, run_idx, tracks_cache=None
+):
     logger.info(
         f"{log_prefix} Iteration {run_idx}: Fetching data for {len(item_ids)} tracks. Use embeddings: {use_embeddings}"
     )
-    rows = get_tracks_by_ids(item_ids) if use_embeddings else get_score_data_by_ids(item_ids)
+    if tracks_cache is None:
+        rows = _fetch_track_rows(item_ids, use_embeddings)
+    else:
+        rows = _cached_track_rows(item_ids, use_embeddings, tracks_cache)
     valid_tracks, X_feat_orig_list, X_embed_raw_list = [], [], []
     for row_data in (dict(r) for r in rows if r):
         try:
-            feature_vec = score_vector(row_data, active_mood_labels, OTHER_FEATURE_LABELS)
+            feature_vec, embedding_vec = _iteration_vectors(
+                row_data, active_mood_labels, use_embeddings
+            )
+            if feature_vec is None:
+                continue
             if use_embeddings:
-                embedding_vec = row_data.get('embedding_vector')
-                if embedding_vec is None or embedding_vec.size == 0:
-                    logger.warning(
-                        f"Skipping track {row_data.get('item_id')} due to missing embedding."
-                    )
-                    continue
                 X_embed_raw_list.append(embedding_vec)
             X_feat_orig_list.append(feature_vec)
             valid_tracks.append(row_data)
@@ -375,13 +401,11 @@ def _prepare_iteration_data(item_ids, active_mood_labels, use_embeddings, log_pr
     )
 
 
-def _prepare_and_scale_data(X_feat, X_embed, use_embeddings):
-    data_source = X_embed if use_embeddings else X_feat
+def _prepare_and_normalize_data(x_feat, x_embed, use_embeddings):
+    data_source = x_embed if use_embeddings else x_feat
     if data_source is None or data_source.shape[0] == 0:
-        return None, None
-    scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(data_source)
-    return scaled_data, scaler
+        return None
+    return Normalizer(norm='l2').fit_transform(data_source)
 
 
 def _mutate_param(value, min_val, max_val, delta, is_float=False):
@@ -567,7 +591,7 @@ def _mutate_parameters(
     }
 
 
-def _split_oversized_clusters(labels, data):
+def _split_oversized_clusters(labels, data, use_gpu=False):
     labels = np.asarray(labels).copy()
     target = max(2 * MIN_PLAYLIST_SIZE_FOR_TOP_N, CLUSTERING_MAX_PLAYLIST_SONGS // 2)
     next_label = int(labels.max()) + 1
@@ -576,9 +600,10 @@ def _split_oversized_clusters(labels, data):
         if len(idx) <= CLUSTERING_MAX_PLAYLIST_SONGS:
             continue
         n_sub = min(len(idx), max(2, -(-len(idx) // target)))
-        sub_labels = KMeans(
-            n_clusters=n_sub, init='k-means++', n_init=3
-        ).fit_predict(data[idx])
+        sub_model = get_clustering_model(
+            'kmeans', {'n_clusters': n_sub}, use_gpu=use_gpu, n_init=3
+        )
+        sub_labels = sub_model.fit_predict(data[idx])
         labels[idx] = next_label + sub_labels
         next_label += n_sub
     return labels
@@ -599,48 +624,31 @@ def _apply_clustering_model(data, method_config, log_prefix, run_idx):
             if params.get('n_clusters', 0) < 2 or params['n_clusters'] >= data.shape[0]:
                 return None, None, None
 
-        use_gpu = USE_GPU_CLUSTERING and GPU_CLUSTERING_AVAILABLE
+        use_gpu = GPU_CLUSTERING_AVAILABLE and clustering_use_gpu()
 
         if use_gpu:
             try:
                 model = get_clustering_model(method, params, use_gpu=True)
                 labels = model.fit_predict(data)
-                logger.debug(f"{log_prefix} Iteration {run_idx}: GPU clustering used for {method}")
-            except Exception as e:
-                logger.warning(f"{log_prefix} GPU clustering failed, falling back to CPU: {e}")
+                use_gpu = bool(getattr(model, 'using_gpu', False))
+            except Exception:
+                logger.warning(
+                    f"{log_prefix} GPU clustering failed, falling back to CPU", exc_info=True
+                )
+                model = None
                 use_gpu = False
 
-        if not use_gpu:
-            if method == 'kmeans':
-                model = KMeans(n_clusters=params['n_clusters'], init='k-means++', n_init=10)
-            elif method == 'dbscan':
-                model = DBSCAN(eps=params['eps'], min_samples=params['min_samples'])
-            elif method == 'gmm':
-                model = GaussianMixture(
-                    n_components=params['n_components'],
-                    covariance_type=GMM_COVARIANCE_TYPE,
-                    init_params='k-means++',
-                    n_init=3,
-                    random_state=None,
-                    reg_covar=1e-4,
-                )
-            elif method == 'spectral':
-                model = SpectralClustering(
-                    n_clusters=params['n_clusters'],
-                    assign_labels='kmeans',
-                    affinity='nearest_neighbors',
-                    n_neighbors=SPECTRAL_N_NEIGHBORS,
-                    random_state=params.get("random_state"),
-                    n_init=10,
-                    verbose=False,
-                )
+        if model is None:
+            if method == 'gmm':
+                model = get_clustering_model(method, params, use_gpu=False, n_init=3)
             else:
-                raise ValueError(f"Unsupported clustering method: {method}")
-
+                model = get_clustering_model(method, params, use_gpu=False)
             labels = model.fit_predict(data)
+        elif use_gpu:
+            logger.debug(f"{log_prefix} Iteration {run_idx}: GPU clustering used for {method}")
 
         if method == 'dbscan' and labels is not None:
-            labels = _split_oversized_clusters(labels, data)
+            labels = _split_oversized_clusters(labels, data, use_gpu=use_gpu)
 
         centers = {}
         if hasattr(model, 'cluster_centers_') and model.cluster_centers_ is not None:
@@ -682,7 +690,6 @@ def _format_and_score_iteration_result(
     data_for_metrics,
     centers,
     pca,
-    scaler,
     active_moods,
     params,
     max_songs_per_cluster,
@@ -776,19 +783,12 @@ def _format_and_score_iteration_result(
     for label_id, songs_list in filtered_clusters.items():
         if songs_list and label_id in centers:
             center_vec = centers[label_id]
-            if use_embeddings:
-                feature_centroid_vec = _get_feature_centroid_for_embedding_cluster(
-                    label_id, labels, x_feat_orig
-                )
-                if feature_centroid_vec is None:
-                    continue
-                name, centroid_details = _name_cluster(
-                    feature_centroid_vec, None, False, active_moods, None
-                )
-            else:
-                name, centroid_details = _name_cluster(
-                    center_vec, pca, params['pca_config']['enabled'], active_moods, scaler
-                )
+            feature_centroid_vec = _get_feature_centroid_for_embedding_cluster(
+                label_id, labels, x_feat_orig
+            )
+            if feature_centroid_vec is None:
+                continue
+            name, centroid_details = _name_cluster(feature_centroid_vec, active_moods)
 
             temp_name, suffix = name, 1
             while temp_name in named_playlists:
@@ -1009,9 +1009,6 @@ def _format_and_score_iteration_result(
         "playlist_to_centroid_vector_map": playlist_to_centroid_vector_map,
         "playlist_primary_genres": playlist_primary_genres,
         "parameters": {**params, "max_songs_per_cluster": max_songs_per_cluster, "run_id": run_idx},
-        "scaler_details": {"mean": scaler.mean_.tolist(), "scale": scaler.scale_.tolist()}
-        if scaler
-        else None,
         "pca_model_details": {
             "components": pca.components_.tolist(),
             "variance": pca.explained_variance_ratio_.tolist(),
@@ -1021,18 +1018,12 @@ def _format_and_score_iteration_result(
     }
 
 
-def _name_cluster(centroid_vector, pca_model, pca_enabled, mood_labels, scaler):
+def _name_cluster(centroid_vector, mood_labels):
     TOP_MOODS_IN_NAME = 3
-    OTHER_FEATURE_THRESHOLD_FOR_NAME = 0.5
+    OTHER_FEATURE_THRESHOLD_FOR_NAME = MOOD_SCORE_MATCH_THRESHOLD
     MAX_OTHER_FEATURES_IN_NAME = 2
 
-    if scaler:
-        vec = centroid_vector.reshape(1, -1)
-        if pca_enabled and pca_model:
-            vec = pca_model.inverse_transform(vec)
-        interpreted_vector = scaler.inverse_transform(vec)[0]
-    else:
-        interpreted_vector = centroid_vector
+    interpreted_vector = centroid_vector
 
     tempo_val = interpreted_vector[0]
     mood_values = interpreted_vector[2 : 2 + len(mood_labels)]
@@ -1085,37 +1076,6 @@ def _name_cluster(centroid_vector, pca_model, pca_enabled, mood_labels, scaler):
     final_name = f"{base_name}{appended_other_features_str}"
 
     return final_name, details
-
-
-def get_job_result_safely(job_id, parent_task_id, task_type="child task"):
-    from flask_app import app
-
-    try:
-        job = Job.fetch(job_id, connection=redis_conn)
-        if job.is_finished and isinstance(job.result, dict):
-            return job.result
-    except NoSuchJobError:
-        logger.warning(f"[{parent_task_id}] Job {job_id} not in RQ. Checking DB.")
-        with app.app_context():
-            task_info = get_task_info_from_db(job_id)
-            if task_info and task_info.get('status') in [TASK_STATUS_SUCCESS, JobStatus.FINISHED]:
-                try:
-                    details = json.loads(task_info.get('details'))
-                    batch_result = details.get('full_best_result_from_batch') or details.get(
-                        'full_result'
-                    )
-                    if batch_result:
-                        return {
-                            "status": "SUCCESS",
-                            "best_result_from_batch": batch_result,
-                            "iterations_completed_in_batch": details.get(
-                                "iterations_completed_in_batch", 0
-                            ),
-                            "final_subset_track_ids": details.get("final_subset_track_ids", []),
-                        }
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning(f"Could not parse result from DB for job {job_id}")
-    return None
 
 
 def _fill_balanced_quotas(quotas, capacities, remaining):

@@ -8,13 +8,14 @@
 
 """Parameter generation and model fitting in clustering_helper.
 
-Covers the random/mutated parameter builders for each clustering method, data
-scaling, and the model-application path that runs the chosen algorithm.
+Covers the random/mutated parameter builders for each clustering method, the
+L2 row normalization that puts the model on cosine, and the model-application
+path that runs the chosen algorithm.
 
 Main Features:
 * _mutate_param clamps to min/max for ints and floats
 * Random and mutated parameters for kmeans, dbscan, gmm, and spectral stay in range
-* _prepare_and_scale_data honors the embeddings flag; _apply_clustering_model runs
+* _prepare_and_normalize_data honors the embeddings flag; _apply_clustering_model runs
   kmeans/dbscan and rejects invalid params; stratified subset excludes prior ids
 """
 
@@ -25,7 +26,7 @@ from tasks.clustering_helper import (
     _mutate_param,
     _generate_random_parameters,
     _mutate_parameters,
-    _prepare_and_scale_data,
+    _prepare_and_normalize_data,
     _apply_clustering_model,
     _get_stratified_song_subset,
     _get_track_primary_genre,
@@ -33,28 +34,6 @@ from tasks.clustering_helper import (
 
 
 class TestMutateParam:
-    def test_mutate_param_integer_within_bounds(self):
-        random.seed(42)
-        value = 10
-        min_val = 5
-        max_val = 15
-        delta = 2
-
-        mutated = _mutate_param(value, min_val, max_val, delta, is_float=False)
-
-        assert min_val <= mutated <= max_val
-
-    def test_mutate_param_float_within_bounds(self):
-        random.seed(42)
-        value = 0.5
-        min_val = 0.1
-        max_val = 1.0
-        delta = 0.1
-
-        mutated = _mutate_param(value, min_val, max_val, delta, is_float=True)
-
-        assert min_val <= mutated <= max_val
-
     def test_mutate_param_clamps_at_max(self):
         value = 98
         min_val = 0
@@ -174,34 +153,34 @@ class TestMutateParameters:
         assert 2 <= dbscan_params['min_samples'] <= 10
 
 
-class TestPrepareAndScaleData:
+class TestPrepareAndNormalizeData:
     def test_uses_embeddings_when_enabled(self):
         X_feat = np.random.rand(50, 20)
         X_embed = np.random.rand(50, 128)
 
-        scaled_data, scaler = _prepare_and_scale_data(X_feat, X_embed, use_embeddings=True)
+        normalized_data = _prepare_and_normalize_data(X_feat, X_embed, use_embeddings=True)
 
-        assert scaled_data.shape == (50, 128)
+        assert normalized_data.shape == (50, 128)
 
     def test_uses_features_when_embeddings_disabled(self):
         X_feat = np.random.rand(50, 20)
         X_embed = np.random.rand(50, 128)
 
-        scaled_data, scaler = _prepare_and_scale_data(X_feat, X_embed, use_embeddings=False)
+        normalized_data = _prepare_and_normalize_data(X_feat, X_embed, use_embeddings=False)
 
-        assert scaled_data.shape == (50, 20)
+        assert normalized_data.shape == (50, 20)
 
-    def test_scales_data_correctly(self):
+    def test_gives_every_row_unit_length_so_the_model_sees_cosine(self):
         X_feat = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
 
-        scaled_data, scaler = _prepare_and_scale_data(X_feat, None, use_embeddings=False)
+        normalized_data = _prepare_and_normalize_data(X_feat, None, use_embeddings=False)
 
-        mean = np.mean(scaled_data, axis=0)
-        assert np.allclose(mean, 0, atol=1e-10)
+        row_norms = np.linalg.norm(normalized_data, axis=1)
+        assert np.allclose(row_norms, 1.0, atol=1e-6)
 
 
 class TestApplyClusteringModel:
-    @patch('tasks.clustering_helper.USE_GPU_CLUSTERING', False)
+    @patch('tasks.clustering_helper.clustering_use_gpu', lambda: False)
     def test_applies_kmeans_successfully(self):
         data = np.random.rand(50, 10)
         method_config = {'method': 'kmeans', 'params': {'n_clusters': 5}}
@@ -212,7 +191,7 @@ class TestApplyClusteringModel:
         assert len(labels) == 50
         assert len(set(labels)) <= 5
 
-    @patch('tasks.clustering_helper.USE_GPU_CLUSTERING', False)
+    @patch('tasks.clustering_helper.clustering_use_gpu', lambda: False)
     def test_applies_dbscan_successfully(self):
         data = np.random.rand(50, 10)
         method_config = {'method': 'dbscan', 'params': {'eps': 0.5, 'min_samples': 3}}
@@ -222,7 +201,7 @@ class TestApplyClusteringModel:
         assert labels is not None
         assert len(labels) == 50
 
-    @patch('tasks.clustering_helper.USE_GPU_CLUSTERING', False)
+    @patch('tasks.clustering_helper.clustering_use_gpu', lambda: False)
     def test_rejects_invalid_kmeans_params(self):
         data = np.random.rand(50, 10)
         method_config = {'method': 'kmeans', 'params': {'n_clusters': 1}}
@@ -233,23 +212,6 @@ class TestApplyClusteringModel:
 
 
 class TestGetStratifiedSongSubset:
-    def test_stratified_sampling_balances_genres(self):
-        genre_map = {
-            'Rock': [
-                {'item_id': 'r1', 'mood_vector': 'Rock:0.8,Pop:0.2'},
-                {'item_id': 'r2', 'mood_vector': 'Rock:0.9,Jazz:0.1'},
-            ],
-            'Pop': [
-                {'item_id': 'p1', 'mood_vector': 'Pop:0.7,Rock:0.3'},
-            ],
-        }
-        target_per_genre = 2
-
-        subset = _get_stratified_song_subset(genre_map, target_per_genre)
-
-        assert isinstance(subset, list)
-        assert len(subset) >= 0
-
     def test_rotation_keeps_the_subset_at_the_exact_configured_size(self, monkeypatch):
         from tasks import clustering_helper
 
@@ -321,13 +283,6 @@ class TestGetStratifiedSongSubset:
 
 
 class TestGetTrackPrimaryGenre:
-    def test_returns_genre_from_mood_vector(self):
-        track_data = {'mood_vector': 'Rock:0.8,Pop:0.2'}
-
-        genre = _get_track_primary_genre(track_data)
-
-        assert genre in ['Rock', '__other__']
-
     def test_returns_other_when_no_stratified_genre(self):
         track_data = {'mood_vector': 'UnknownMood:0.9'}
 

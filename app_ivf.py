@@ -29,11 +29,11 @@ import app_server_context
 # Import the new config option
 from config import (
     SIMILARITY_ELIMINATE_DUPLICATES_DEFAULT,
+    SIMILARITY_DEFAULT_N_RESULTS,
     SIMILARITY_RADIUS_DEFAULT,
     MOOD_CENTROIDS_FILE,
 )
-from app_helper import serialize_neighbor_results
-from error import error_manager
+from app_helper import serialize_neighbor_results, index_error_body
 from error.error_dictionary import ERR_INDEX_EMPTY, UNKNOWN_ERROR_CODE
 from tasks.ivf_manager import (
     find_nearest_neighbors_by_id,
@@ -48,26 +48,17 @@ logger = logging.getLogger(__name__)
 _UNEXPECTED_ERROR_MSG = "An unexpected error occurred."
 
 
-# Build a structured error body (error_code/error_class/error_message) while keeping
-# a stable, user-facing 'error' string so API consumers can key on the numeric code
-# without changing the human-readable text the UI already renders.
-def _index_error_body(code, message):
-    payload = error_manager.build(code)
-    payload["error"] = message
-    return payload
-
-
 # Map a neighbor-search exception to the shared JSON error response (one contract,
 # reused by every similarity mode). A not-loaded/empty index surfaces ERR_INDEX_EMPTY.
 def _neighbor_search_error_response(ctx, exc, is_runtime):
     if is_runtime:
         logger.exception(f"Runtime error finding neighbors for {ctx}: {exc}")
-        body = _index_error_body(
+        body = index_error_body(
             ERR_INDEX_EMPTY, "The similarity search service is currently unavailable."
         )
         return jsonify(body), 503
     logger.exception(f"Unexpected error finding neighbors for {ctx}: {exc}")
-    body = _index_error_body(UNKNOWN_ERROR_CODE, _UNEXPECTED_ERROR_MSG)
+    body = index_error_body(UNKNOWN_ERROR_CODE, _UNEXPECTED_ERROR_MSG)
     return jsonify(body), 500
 
 
@@ -164,7 +155,10 @@ def similarity_page():
               type: string
     """
     return render_template(
-        'similarity.html', title='AudioMuse-AI - Playlist from Similar Song', active='similarity'
+        'similarity.html',
+        title='AudioMuse-AI - Playlist from Similar Song',
+        active='similarity',
+        similarity_n_default=SIMILARITY_DEFAULT_N_RESULTS,
     )
 
 
@@ -286,7 +280,7 @@ def search_tracks_endpoint():
         return jsonify(results)
     except Exception:
         logger.exception("Error during track search")
-        return jsonify(_index_error_body(UNKNOWN_ERROR_CODE, "An error occurred during search.")), 500
+        return jsonify(index_error_body(UNKNOWN_ERROR_CODE, "An error occurred during search.")), 500
 
 
 @ivf_bp.route('/api/mood_centroids', methods=['GET'])
@@ -348,7 +342,7 @@ def get_similar_tracks_endpoint():
         description: The number of similar tracks to return.
         schema:
           type: integer
-          default: 10
+          default: 50
       - name: eliminate_duplicates
         in: query
         description: If 'true', limits the number of songs per artist in the results. If 'false', this is disabled. If the parameter is omitted, the server's default behavior is used.
@@ -392,7 +386,7 @@ def get_similar_tracks_endpoint():
     item_id = request.args.get('item_id')
     title = request.args.get('title')
     artist = request.args.get('artist')
-    num_neighbors = request.args.get('n', 10, type=int)
+    num_neighbors = request.args.get('n', SIMILARITY_DEFAULT_N_RESULTS, type=int)
     num_neighbors = max(1, num_neighbors)
 
     # Optional mood centroid parameters
@@ -586,13 +580,13 @@ def get_max_distance_endpoint():
     except RuntimeError:
         logger.exception(f"Runtime error computing max distance for {item_id}")
         return jsonify(
-            _index_error_body(
+            index_error_body(
                 ERR_INDEX_EMPTY, "The similarity search service is currently unavailable."
             )
         ), 503
     except Exception:
         logger.exception(f"Unexpected error computing max distance for {item_id}")
-        return jsonify(_index_error_body(UNKNOWN_ERROR_CODE, _UNEXPECTED_ERROR_MSG)), 500
+        return jsonify(index_error_body(UNKNOWN_ERROR_CODE, _UNEXPECTED_ERROR_MSG)), 500
 
 
 @ivf_bp.route('/api/track', methods=['GET'])
@@ -636,7 +630,7 @@ def get_track_endpoint():
         return jsonify({"error": "Missing 'item_id' parameter."}), 400
 
     try:
-        from app_helper import get_score_data_by_ids
+        from database import get_score_data_by_ids
 
         # Accept either the server's provider id or a canonical id on input, and
         # never echo the internal fp_ id back: scope_results rewrites the response
@@ -659,7 +653,7 @@ def get_track_endpoint():
         return jsonify(scoped[0]), 200
     except Exception:
         logger.exception(f"Unexpected error fetching track {item_id}")
-        return jsonify(_index_error_body(UNKNOWN_ERROR_CODE, _UNEXPECTED_ERROR_MSG)), 500
+        return jsonify(index_error_body(UNKNOWN_ERROR_CODE, _UNEXPECTED_ERROR_MSG)), 500
 
 
 @ivf_bp.route('/api/create_playlist', methods=['POST'])

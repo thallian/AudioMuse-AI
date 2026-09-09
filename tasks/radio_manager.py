@@ -25,8 +25,8 @@ Main Features:
 * Upserts each playlist, falling back to create_playlist when the provider does
   not support create_or_replace_playlist, and returns a created/failed summary.
 * Reports progress through an optional ``report`` callback: the cron tick passes
-  one that heartbeats its task_status row, so a run that outlives the RQ janitor's
-  orphan grace period is not mistaken for a row with nothing behind it.
+  one that heartbeats its task_status row, so a run that outlives the queue
+  maintenance grace period is not mistaken for a row with nothing behind it.
 """
 
 import logging
@@ -93,9 +93,17 @@ def run_radio_playlists(server_scope="all", report=None):
                         if not item_ids:
                             raise ValueError("no tracks available on this server")
                         try:
-                            create_or_replace_playlist(playlist_name, item_ids)
+                            if create_or_replace_playlist(playlist_name, item_ids) is None:
+                                raise RuntimeError(
+                                    f"Media server reported failure upserting "
+                                    f"radio playlist '{playlist_name}'"
+                                )
                         except NotImplementedError:
-                            create_playlist(playlist_name, item_ids)
+                            if create_playlist(playlist_name, item_ids) is None:
+                                raise RuntimeError(
+                                    f"Media server reported failure creating "
+                                    f"radio playlist '{playlist_name}'"
+                                ) from None
                         created += 1
                         logger.info(
                             "Radio playlist '%s' upserted on %s with %d tracks.",

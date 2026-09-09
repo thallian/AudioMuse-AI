@@ -11,15 +11,16 @@
 Single PyInstaller executable that acts either as the top-level supervisor
 (default, holding a single-instance lock and opening the web UI) or, when
 invoked with ``--role=``, as one of the child processes it re-spawns: the
-Flask/waitress server or an RQ worker/janitor/restart-listener.
+Flask/waitress server or a queue worker/maintenance/control-listener.
 
 Main Features:
-* Runs Flask via waitress or launches a named RQ role in-process.
+* Runs Flask via waitress or launches a named queue role in-process.
 * Enforces single-instance startup with an flock-based supervisor lock.
+* Hands multiprocessing/loky spawn payloads to ``native_common.frozen_children``
+  instead of re-entering the supervisor as a stray copy of the app.
 """
 
 import os
-import runpy
 import signal
 import subprocess
 import sys
@@ -27,53 +28,14 @@ import threading
 import time
 import webbrowser
 
+import service_roles
+from native_common import frozen_children
+
 WEB_URL = "http://127.0.0.1:8000"
 
 
-def _role_from_argv():
-    for arg in sys.argv[1:]:
-        if arg.startswith("--role="):
-            return arg.split("=", 1)[1]
-    return None
-
-
-def _command_from_argv():
-    for arg in sys.argv[1:]:
-        if not arg.startswith("-"):
-            return arg
-    return None
-
-
-def _run_flask():
-    import waitress
-    import app as app_module
-
-    waitress.serve(
-        app_module.app,
-        host="0.0.0.0",
-        port=8000,
-        threads=8,
-        max_request_body_size=6 * 1024 * 1024 * 1024,
-        channel_timeout=300,
-    )
-
-
 def _run_role(role):
-    sys.argv = [a for a in sys.argv if not a.startswith("--role=")]
-    if role == "flask":
-        _run_flask()
-    elif role == "worker-high":
-        runpy.run_module("rq_worker_high_priority", run_name="__main__")
-    elif role == "worker-default":
-        runpy.run_module("rq_worker", run_name="__main__")
-    elif role == "janitor":
-        runpy.run_module("rq_janitor", run_name="__main__")
-    elif role == "restart-listener":
-        import restart_listener
-
-        restart_listener.main()
-    else:
-        raise SystemExit(f"Unknown role: {role}")
+    service_roles.run_role(role, service_roles.serve_flask)
 
 
 _INSTANCE_LOCK = None
@@ -231,18 +193,10 @@ def _refuse_root_for_stack():
 
 
 def main():
-    if "--run-restore" in sys.argv:
-        i = sys.argv.index("--run-restore")
-        from app_backup import _run_restore_runner
-
-        sys.exit(_run_restore_runner(sys.argv[i + 1], sys.argv[i + 2]))
-
-    role = _role_from_argv()
-    if role:
-        _run_role(role)
+    if frozen_children.dispatch_child_invocation(_run_role):
         return
 
-    command = _command_from_argv()
+    command = service_roles.command_from_argv()
     if command in (None, "start"):
         _refuse_root_for_stack()
         open_browser = os.environ.get("AUDIOMUSE_OPEN_BROWSER", "1") != "0"

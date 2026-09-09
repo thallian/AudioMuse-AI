@@ -69,6 +69,8 @@ import config
 
 MAX_AUDIO_SECONDS = float(config.get_config('LYRICS_MAX_AUDIO_SECONDS', '240'))
 
+from cpu_budget import usable_cpu_count
+
 from config import LYRICS_MIN_CHARS_FOR_EMBEDDING as MIN_CHARS_FOR_EMBEDDING
 from config import LYRICS_ASR_MIN_AVG_LOGPROB as ASR_MIN_AVG_LOGPROB
 from config import LYRICS_ASR_NON_ENGLISH_MIN_LOGPROB as ASR_NON_ENGLISH_MIN_LOGPROB
@@ -194,7 +196,7 @@ MUSIC_ANALYSIS_AXES = {
 
 
 def get_lyrics_threads() -> int:
-    cpus = os.cpu_count() or 2
+    cpus = usable_cpu_count() or os.cpu_count() or 2
     return max(2, cpus // 2)
 
 
@@ -216,14 +218,6 @@ def _apply_thread_env(num_threads: int) -> None:
 
 _axis_label_map: Optional[Dict] = None
 _axis_embeddings: Optional[Dict] = None
-
-
-def load_asr_model(num_threads: Optional[int] = None):
-    threads = num_threads or get_lyrics_threads()
-    _apply_thread_env(threads)
-    from ._asr_backend import get_asr_backend
-
-    return get_asr_backend().load_whisper_model()
 
 
 def load_topic_embedding_model(model_name: Optional[str] = None):

@@ -18,10 +18,13 @@ Main Features:
   by tempo and top moods
 * sanitize_for_json unwraps numpy types; postprocessing applies min-size filter,
   title/artist dedup, and top-N diverse playlist selection
+* Finished batches are absorbed on the parent connection that also writes the
+  progress, and a failed write rolls the reap and every absorbed key back
+  together, the two stop counters and the evolving subset included
 """
 
 import numpy as np
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 from collections import defaultdict
 
 
@@ -124,34 +127,78 @@ class TestEarlyStopCounting:
             },
         }
 
-    def _run_monitor(self, monkeypatch, batch_results, initial_check=False, top_n=10):
+    @staticmethod
+    def _state(top_n=10):
+        return {
+            'runs_completed': 0, 'total_runs': 100, 'best_score': -1.0,
+            'best_result': None, 'elite_solutions': [], 'last_subset_ids': [],
+            'failed_batches': 0, 'stale_batches': 0, 'job_prefix': 'p',
+            'top_n_clustering_playlist': top_n, 'batches_launched': 0,
+        }
+
+    @staticmethod
+    def _reaped_rows(batch_results):
+        import config
+
+        rows = []
+        for i, result in enumerate(batch_results):
+            status = config.TASK_STATUS_SUCCESS if result else config.TASK_STATUS_FAILURE
+            details = {}
+            if result:
+                details = {
+                    'iterations_completed_in_batch': result['iterations_completed_in_batch'],
+                    'full_best_result_from_batch': result['best_result_from_batch'],
+                }
+            rows.append({
+                'task_id': f'p_batch_{i}', 'status': status,
+                'sub_type_identifier': f'Batch_{i}', 'details': details,
+            })
+        return rows
+
+    @staticmethod
+    def _patch_reap(monkeypatch, reap):
+        from tasks import clustering
+
+        db = MagicMock()
+        monkeypatch.setattr(clustering, 'get_db', lambda: db)
+        monkeypatch.setattr(clustering.taskqueue, 'reap_finished_children', reap)
+        return db
+
+    @staticmethod
+    def _persisted(_message):
+        return True
+
+    def _run_monitor(self, monkeypatch, batch_results, top_n=10):
+        from tasks import clustering
+
+        rows = self._reaped_rows(batch_results)
+        self._patch_reap(monkeypatch, lambda _pid, conn=None: rows)
+        state = self._state(top_n)
+        clustering._absorb_finished_batches(state, 'p', self._persisted)
+        return state
+
+    def test_a_batch_from_another_server_phase_is_not_credited_to_this_one(
+        self, monkeypatch
+    ):
         from tasks import clustering
         import config
 
-        children = []
-        results = {}
-        for i, result in enumerate(batch_results):
-            status = config.TASK_STATUS_SUCCESS if result else config.TASK_STATUS_FAILURE
-            children.append({
-                'task_id': f'p_batch_{i}', 'status': status,
-                'sub_type_identifier': f'Batch_{i}', 'details': None,
-            })
-            results[f'p_batch_{i}'] = result
-        monkeypatch.setattr(clustering, 'get_child_tasks_from_db', lambda pid: children)
-        monkeypatch.setattr(
-            clustering, 'get_job_result_safely',
-            lambda job_id, pid, task_type: results[job_id],
+        self._patch_reap(
+            monkeypatch,
+            lambda _pid, conn=None: [{
+                'task_id': 'p_s9_batch_0', 'status': config.TASK_STATUS_SUCCESS,
+                'sub_type_identifier': 'Batch_0',
+                'details': {'iterations_completed_in_batch': 20},
+            }],
         )
-        state = {
-            'runs_completed': 0, 'total_runs': 100, 'best_score': -1.0,
-            'best_result': None, 'active_jobs': {}, 'elite_solutions': [],
-            'last_subset_ids': [], 'processed_job_ids': set(),
-            'batch_start_times': {}, 'failed_batches': set(),
-            'timed_out_batches': set(), 'job_prefix': 'p',
-            'stale_batches': 0, 'top_n_clustering_playlist': top_n,
-        }
-        clustering._monitor_and_process_batches(state, 'p', initial_check=initial_check)
-        return state
+        state = self._state()
+
+        clustering._absorb_finished_batches(state, 'p', self._persisted)
+
+        assert state['runs_completed'] == 0, (
+            'reap returns every finished child of the parent, so a batch belonging to '
+            'a different server phase must not be counted into this one'
+        )
 
     def test_three_batches_without_a_better_result_mark_the_search_stale(self, monkeypatch):
         state = self._run_monitor(
@@ -178,14 +225,32 @@ class TestEarlyStopCounting:
         )
         assert state['stale_batches'] == 2
 
-    def test_recovery_scans_do_not_count_stale_batches(self, monkeypatch):
-        state = self._run_monitor(
-            monkeypatch,
-            [self._batch_result(10), self._batch_result(9),
-             self._batch_result(8), self._batch_result(7)],
-            initial_check=True,
+    def test_a_batch_is_credited_exactly_once_because_reaping_deletes_its_row(
+        self, monkeypatch
+    ):
+        from tasks import clustering
+        import config
+
+        rows = [{
+            'task_id': 'p_batch_0', 'status': config.TASK_STATUS_SUCCESS,
+            'sub_type_identifier': 'Batch_0',
+            'details': {'iterations_completed_in_batch': 20},
+        }]
+
+        def reap(_pid, conn=None):
+            drained, rows[:] = list(rows), []
+            return drained
+
+        self._patch_reap(monkeypatch, reap)
+        state = self._state()
+
+        clustering._absorb_finished_batches(state, 'p', self._persisted)
+        clustering._absorb_finished_batches(state, 'p', self._persisted)
+
+        assert state['runs_completed'] == 20, (
+            'the row is deleted as it is reaped, so there is no processed-id set to '
+            'keep and nothing to double count'
         )
-        assert state['stale_batches'] == 0
 
     def test_an_explicit_zero_keep_all_target_is_not_coerced_to_the_default(self, monkeypatch):
         from tasks import clustering
@@ -201,6 +266,143 @@ class TestEarlyStopCounting:
         self._run_monitor(monkeypatch, [self._batch_result(10)], top_n=0)
         assert seen_targets
         assert all(target == 0 for target in seen_targets)
+
+    def test_the_child_row_is_deleted_on_the_same_connection_the_progress_is_written_on(
+        self, monkeypatch
+    ):
+        from tasks import clustering
+
+        seen = {}
+        rows = self._reaped_rows([self._batch_result(10)])
+
+        def reap(_pid, conn=None):
+            seen['conn'] = conn
+            return rows
+
+        db = self._patch_reap(monkeypatch, reap)
+        state = self._state()
+
+        absorbed = clustering._absorb_finished_batches(state, 'p', self._persisted)
+
+        assert absorbed == 1
+        assert seen['conn'] is db, (
+            'the reap must run on the parent connection that also writes the absorbed '
+            'runs, so a parent that dies between the two cannot lose a finished batch '
+            'whose row is already gone'
+        )
+
+    def test_a_progress_write_that_fails_rolls_the_reap_back_and_forgets_the_batch(
+        self, monkeypatch
+    ):
+        from tasks import clustering
+
+        rows = self._reaped_rows([self._batch_result(10)])
+        db = self._patch_reap(monkeypatch, lambda _pid, conn=None: rows)
+        state = self._state()
+
+        absorbed = clustering._absorb_finished_batches(state, 'p', lambda _message: False)
+
+        assert absorbed == 0
+        assert db.rollback.called, (
+            'the reaped row must come back so the next pass can absorb it again'
+        )
+        assert state['runs_completed'] == 0
+        assert state['best_score'] == -1.0
+        assert state['best_result'] is None
+        assert state['elite_solutions'] == [], (
+            'in-memory state that was never persisted must be rolled back with the '
+            'row, otherwise the batch is counted but its result is lost'
+        )
+
+    def test_a_rolled_back_reap_restores_the_stop_counters_and_the_subset_too(
+        self, monkeypatch
+    ):
+        from tasks import clustering
+        import config
+
+        resumed_result = {
+            'fitness_score': 5.0, 'parameters': {'method': 'kmeans'},
+            'named_playlists': {f'P{i}': list(range(25)) for i in range(8)},
+        }
+        rows = [
+            {
+                'task_id': 'p_batch_0', 'status': config.TASK_STATUS_FAILURE,
+                'sub_type_identifier': 'Batch_0', 'details': {},
+            },
+            {
+                'task_id': 'p_batch_1', 'status': config.TASK_STATUS_SUCCESS,
+                'sub_type_identifier': 'Batch_1',
+                'details': {
+                    'iterations_completed_in_batch': 20,
+                    'final_subset_track_ids': ['x', 'y'],
+                    'full_best_result_from_batch': {
+                        'fitness_score': 10.0, 'parameters': {'method': 'kmeans'},
+                        'named_playlists': {
+                            f'P{i}': list(range(25)) for i in range(8)
+                        },
+                    },
+                },
+            },
+        ]
+        db = self._patch_reap(monkeypatch, lambda _pid, conn=None: rows)
+        state = self._state()
+        state.update({
+            'runs_completed': 40,
+            'best_score': 5.0,
+            'best_result': resumed_result,
+            'elite_solutions': [{'score': 5.0, 'params': {'method': 'kmeans'}}],
+            'failed_batches': 2,
+            'stale_batches': 1,
+            'last_subset_ids': ['a'],
+        })
+
+        absorbed = clustering._absorb_finished_batches(state, 'p', lambda _message: False)
+
+        assert absorbed == 0
+        assert db.rollback.called
+        assert state['runs_completed'] == 40
+        assert state['best_score'] == 5.0
+        assert state['best_result'] is resumed_result
+        assert state['elite_solutions'] == [
+            {'score': 5.0, 'params': {'method': 'kmeans'}}
+        ]
+        assert state['failed_batches'] == 2, (
+            'the failure was never recorded anywhere, so keeping its increment would '
+            'double count it toward CLUSTERING_MAX_FAILED_BATCHES and stop the '
+            'launches of a run that has not failed that often'
+        )
+        assert state['stale_batches'] == 1, (
+            'the better result that reset this counter was rolled back with it, so a '
+            'kept value trips CLUSTERING_EARLY_STOP_BATCHES against evidence that no '
+            'longer exists and truncates the search'
+        )
+        assert state['last_subset_ids'] == ['a'], (
+            'the subset the discarded batch ended on was never persisted, so the next '
+            'batch must keep evolving from the one that was'
+        )
+
+    def test_a_reap_that_finds_nothing_ends_its_transaction_without_writing_progress(
+        self, monkeypatch
+    ):
+        from tasks import clustering
+
+        messages = []
+
+        def persist(message):
+            messages.append(message)
+            return True
+
+        db = self._patch_reap(monkeypatch, lambda _pid, conn=None: [])
+        state = self._state()
+
+        absorbed = clustering._absorb_finished_batches(state, 'p', persist)
+
+        assert absorbed == 0
+        assert messages == []
+        assert db.commit.called, (
+            'the drain loop reaps every few seconds, so a pass with nothing to absorb '
+            'must not leave the parent connection idle in transaction'
+        )
 
 
 class TestSubsetExactSize:
@@ -363,52 +565,50 @@ class TestDbscanOversizeSplit:
 
 
 class TestDataPreparationAndScaling:
-    def test_prepare_and_scale_data_with_features(self):
-        from tasks.clustering_helper import _prepare_and_scale_data
+    def test_prepare_and_normalize_data_with_features(self):
+        from tasks.clustering_helper import _prepare_and_normalize_data
 
         x_feat = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
         x_embed = None
 
-        scaled_data, scaler = _prepare_and_scale_data(x_feat, x_embed, use_embeddings=False)
+        normalized_data = _prepare_and_normalize_data(x_feat, x_embed, use_embeddings=False)
 
-        assert scaled_data is not None
-        assert scaler is not None
-        assert scaled_data.shape == x_feat.shape
+        assert normalized_data is not None
+        assert normalized_data.shape == x_feat.shape
 
-        assert np.abs(scaled_data.mean(axis=0)).max() < 0.1
-        assert np.abs(scaled_data.std(axis=0) - 1.0).max() < 0.1
+        assert np.allclose(np.linalg.norm(normalized_data, axis=1), 1.0, atol=1e-6)
 
-    def test_prepare_and_scale_data_with_embeddings(self):
-        from tasks.clustering_helper import _prepare_and_scale_data
+    def test_prepare_and_normalize_data_with_embeddings(self):
+        from tasks.clustering_helper import _prepare_and_normalize_data
 
         x_feat = np.array([[1.0, 2.0], [3.0, 4.0]])
         x_embed = np.array([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8], [0.9, 1.0, 1.1, 1.2]])
 
-        scaled_data, _ = _prepare_and_scale_data(x_feat, x_embed, use_embeddings=True)
+        normalized_data = _prepare_and_normalize_data(x_feat, x_embed, use_embeddings=True)
 
-        assert scaled_data is not None
-        assert scaled_data.shape == x_embed.shape
-        assert scaled_data.shape[1] == 4
+        assert normalized_data is not None
+        assert normalized_data.shape == x_embed.shape
+        assert normalized_data.shape[1] == 4
 
-    def test_prepare_and_scale_data_returns_none_for_empty(self):
-        from tasks.clustering_helper import _prepare_and_scale_data
+    def test_prepare_and_normalize_data_returns_none_for_empty(self):
+        from tasks.clustering_helper import _prepare_and_normalize_data
 
         x_feat = np.array([])
         x_embed = None
 
-        result = _prepare_and_scale_data(x_feat, x_embed, use_embeddings=False)
+        result = _prepare_and_normalize_data(x_feat, x_embed, use_embeddings=False)
 
-        assert result == (None, None)
+        assert result is None
 
-    def test_prepare_and_scale_data_returns_none_for_zero_rows(self):
-        from tasks.clustering_helper import _prepare_and_scale_data
+    def test_prepare_and_normalize_data_returns_none_for_zero_rows(self):
+        from tasks.clustering_helper import _prepare_and_normalize_data
 
         x_feat = np.empty((0, 5))
         x_embed = None
 
-        result = _prepare_and_scale_data(x_feat, x_embed, use_embeddings=False)
+        result = _prepare_and_normalize_data(x_feat, x_embed, use_embeddings=False)
 
-        assert result == (None, None)
+        assert result is None
 
 
 class TestFeatureCentroidCalculation:
@@ -499,8 +699,8 @@ class TestTrackPrimaryGenre:
 
 
 class TestGenreMapPreparation:
-    @patch('tasks.clustering.STRATIFIED_GENRES', ['rock', 'pop', 'jazz', 'metal'])
-    def test_prepare_genre_map_basic(self):
+    @patch('tasks.clustering_helper.STRATIFIED_GENRES', ['rock', 'pop', 'jazz', 'metal'])
+    def test_prepare_genre_map_groups_by_primary_genre_from_stratified_list(self):
         from tasks.clustering import _prepare_genre_map
 
         rows = [
@@ -508,6 +708,7 @@ class TestGenreMapPreparation:
             {'item_id': '2', 'mood_vector': 'rock:0.8,jazz:0.2'},
             {'item_id': '3', 'mood_vector': 'pop:0.9,rock:0.1'},
             {'item_id': '4', 'mood_vector': 'jazz:0.7,rock:0.3'},
+            {'item_id': '5', 'mood_vector': 'electronic:0.9,rock:0.1'},
         ]
 
         genre_map = _prepare_genre_map(rows)
@@ -515,7 +716,8 @@ class TestGenreMapPreparation:
         assert 'rock' in genre_map
         assert 'pop' in genre_map
         assert 'jazz' in genre_map
-        assert len(genre_map['rock']) == 2
+        assert 'electronic' not in genre_map
+        assert len(genre_map['rock']) == 3
         assert len(genre_map['pop']) == 1
         assert len(genre_map['jazz']) == 1
 
@@ -887,51 +1089,7 @@ class TestMinimumSizeFilter:
         assert len(result['named_playlists']) == 0
 
 
-class TestSelectTopNDiversePlaylists:
-    def test_select_top_n_diverse_basic(self):
-        from tasks.clustering_postprocessing import select_top_n_diverse_playlists
-
-        best_result = {
-            'named_playlists': {
-                f'Playlist {i}': [{'item_id': f'song{j}'} for j in range(20)] for i in range(5)
-            },
-            'playlist_centroids': {f'Playlist {i}': [float(i), float(i)] for i in range(5)},
-            'playlist_to_centroid_vector_map': {
-                f'Playlist {i}': np.array([float(i), float(i)]) for i in range(5)
-            },
-        }
-
-        result = select_top_n_diverse_playlists(best_result, n=3)
-
-        assert len(result['named_playlists']) == 3
-        assert len(result['playlist_centroids']) == 3
-        assert len(result['playlist_to_centroid_vector_map']) == 3
-
-    def test_select_top_n_diverse_preserves_largest_first(self):
-        from tasks.clustering_postprocessing import select_top_n_diverse_playlists
-
-        best_result = {
-            'named_playlists': {
-                'Small': [{'item_id': f'song{i}'} for i in range(10)],
-                'Large': [{'item_id': f'song{i}'} for i in range(100)],
-                'Medium': [{'item_id': f'song{i}'} for i in range(50)],
-            },
-            'playlist_centroids': {
-                'Small': [1.0, 1.0],
-                'Large': [2.0, 2.0],
-                'Medium': [3.0, 3.0],
-            },
-            'playlist_to_centroid_vector_map': {
-                'Small': np.array([1.0, 1.0]),
-                'Large': np.array([2.0, 2.0]),
-                'Medium': np.array([3.0, 3.0]),
-            },
-        }
-
-        result = select_top_n_diverse_playlists(best_result, n=2)
-
-        assert 'Large' in result['named_playlists']
-
+class TestSelectDiversePlaylists:
     def test_default_strategy_returns_two_top_variants_and_four_other_genres(
         self, monkeypatch
     ):
@@ -1041,7 +1199,7 @@ class TestSelectTopNDiversePlaylists:
         assert 'Soul Near' not in result['named_playlists']
 
     def test_limit_is_a_hard_cap_and_short_candidate_sets_are_returned_whole(self):
-        from tasks.clustering_postprocessing import select_top_n_diverse_playlists
+        from tasks.clustering_postprocessing import select_diverse_playlists_with_genre_coverage
 
         many = {
             'named_playlists': {
@@ -1057,8 +1215,12 @@ class TestSelectTopNDiversePlaylists:
             for key, value in many.items()
         }
 
-        assert len(select_top_n_diverse_playlists(many, 10)['named_playlists']) == 10
-        assert len(select_top_n_diverse_playlists(short, 10)['named_playlists']) == 4
+        assert len(
+            select_diverse_playlists_with_genre_coverage(many, 10)['named_playlists']
+        ) == 10
+        assert len(
+            select_diverse_playlists_with_genre_coverage(short, 10)['named_playlists']
+        ) == 4
 
     def test_naming_receives_recent_names_from_previous_runs(self, monkeypatch):
         from tasks import clustering
@@ -1169,30 +1331,8 @@ class TestSelectTopNDiversePlaylists:
         assert result['Happy Pop_automatic'] == [('song-1', 'Song 1', 'Artist')]
         assert result['Happy Pop (2)_automatic'] == [('song-2', 'Song 2', 'Artist')]
 
-    def test_select_top_n_skips_when_n_too_large(self):
-        from tasks.clustering_postprocessing import select_top_n_diverse_playlists
-
-        best_result = {
-            'named_playlists': {
-                'P1': [{'item_id': 'song1'}],
-                'P2': [{'item_id': 'song2'}],
-            },
-            'playlist_centroids': {
-                'P1': [1.0],
-                'P2': [2.0],
-            },
-            'playlist_to_centroid_vector_map': {
-                'P1': np.array([1.0]),
-                'P2': np.array([2.0]),
-            },
-        }
-
-        result = select_top_n_diverse_playlists(best_result, n=10)
-
-        assert len(result['named_playlists']) == 2
-
-    def test_select_top_n_skips_when_n_zero(self):
-        from tasks.clustering_postprocessing import select_top_n_diverse_playlists
+    def test_limit_zero_returns_the_original_result(self):
+        from tasks.clustering_postprocessing import select_diverse_playlists_with_genre_coverage
 
         best_result = {
             'named_playlists': {'P1': [{'item_id': 'song1'}]},
@@ -1200,12 +1340,12 @@ class TestSelectTopNDiversePlaylists:
             'playlist_to_centroid_vector_map': {'P1': np.array([1.0])},
         }
 
-        result = select_top_n_diverse_playlists(best_result, n=0)
+        result = select_diverse_playlists_with_genre_coverage(best_result, limit=0)
 
         assert result == best_result
 
-    def test_select_top_n_empty_result(self):
-        from tasks.clustering_postprocessing import select_top_n_diverse_playlists
+    def test_empty_candidate_map_returns_the_original_result(self):
+        from tasks.clustering_postprocessing import select_diverse_playlists_with_genre_coverage
 
         best_result = {
             'named_playlists': {},
@@ -1213,7 +1353,7 @@ class TestSelectTopNDiversePlaylists:
             'playlist_to_centroid_vector_map': {},
         }
 
-        result = select_top_n_diverse_playlists(best_result, n=5)
+        result = select_diverse_playlists_with_genre_coverage(best_result, limit=5)
 
         assert result == best_result
 
@@ -1225,9 +1365,7 @@ class TestClusterNaming:
         centroid = np.array([0.8, 0.6, 0.9, 0.1, 0.2])
         mood_labels = ['rock', 'pop', 'jazz']
 
-        name, details = _name_cluster(
-            centroid, pca_model=None, pca_enabled=False, mood_labels=mood_labels, scaler=None
-        )
+        name, details = _name_cluster(centroid, mood_labels)
 
         assert isinstance(name, str)
         assert 'Fast' in name
@@ -1240,7 +1378,7 @@ class TestClusterNaming:
         centroid = np.array([0.2, 0.4, 0.5, 0.3, 0.2])
         mood_labels = ['chill', 'relaxed', 'ambient']
 
-        name, _ = _name_cluster(centroid, None, False, mood_labels, None)
+        name, _ = _name_cluster(centroid, mood_labels)
 
         assert 'Slow' in name
 
@@ -1250,7 +1388,7 @@ class TestClusterNaming:
         centroid = np.array([0.5, 0.5, 0.4, 0.4, 0.2])
         mood_labels = ['pop', 'dance', 'electronic']
 
-        name, _ = _name_cluster(centroid, None, False, mood_labels, None)
+        name, _ = _name_cluster(centroid, mood_labels)
 
         assert 'Medium' in name
 
@@ -1260,82 +1398,257 @@ class TestClusterNaming:
         centroid = np.array([0.6, 0.5, 0.9, 0.8, 0.1])
         mood_labels = ['rock', 'pop', 'jazz']
 
-        name, details = _name_cluster(centroid, None, False, mood_labels, None)
+        name, details = _name_cluster(centroid, mood_labels)
 
         assert 'Rock' in name or 'Pop' in name
 
         assert len(details) == 3
 
-    def test_name_cluster_returns_correct_structure(self):
-        from tasks.clustering_helper import _name_cluster
 
-        centroid = np.array([0.5, 0.5, 0.4, 0.4, 0.3])
-        mood_labels = ['mood1', 'mood2', 'mood3']
-
-        result = _name_cluster(centroid, None, False, mood_labels, None)
-
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-        name, details = result
-        assert isinstance(name, str)
-        assert isinstance(details, dict)
+def _batch_launch_args():
+    return (
+        'kmeans', 2, 4, 0.1, 0.5, 2, 5, 2, 4, 2, 4, 2, 4, 50,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 5, True,
+    )
 
 
-class TestBatchFailureHandlerRetryAwareness:
-    def test_batch_handler_leaves_the_row_live_when_rq_still_has_retries(
-        self, monkeypatch
-    ):
-        import tasks.clustering as clustering
-        from rq.exceptions import AbandonedJobError
+def _batch_launch_state():
+    return {
+        'active_jobs': {},
+        'batch_start_times': {},
+        'elite_solutions': [],
+        'last_subset_ids': [],
+        'job_prefix': 'parent-1_s0',
+    }
 
-        writes = []
-        monkeypatch.setattr(
-            clustering, 'save_task_status',
-            lambda *a, **k: writes.append((a, k)),
-        )
-        job = Mock()
-        job.id = 'parent-1_s0_batch_0'
-        job.retries_left = 2
-        job.kwargs = {'parent_task_id': 'parent-1', 'batch_id_str': 'Batch_0'}
 
-        err = AbandonedJobError('worker died')
-        clustering.batch_task_failure_handler(
-            job, object(), AbandonedJobError, err, None
-        )
+def test_a_batch_row_left_by_a_previous_attempt_is_left_to_finish(monkeypatch):
+    import tasks.clustering as clustering
+    from contextlib import nullcontext
 
-        assert writes == []
+    monkeypatch.setattr(clustering, 'main_task_start_lock', nullcontext)
+    monkeypatch.setattr(
+        clustering, 'get_task_info_from_db', lambda _task_id: {'status': 'RUNNING'}
+    )
 
-    def test_batch_handler_fails_the_row_only_once_retries_are_exhausted(
-        self, monkeypatch
-    ):
-        import sys
-        import types
+    def enqueue(_func, **_kwargs):
+        raise clustering.taskqueue.TaskNotQueued('already exists')
 
-        from flask import Flask
+    monkeypatch.setattr(clustering.taskqueue, 'enqueue', enqueue)
 
-        import tasks.clustering as clustering
+    assert clustering._launch_batch_job(
+        _batch_launch_state(), 'parent-1', 0, 10, 'genre-token', 5,
+        *_batch_launch_args(),
+    ) is True, (
+        'the row is already queued, so the launch has nothing left to do and the '
+        'parent tracks it through live_children like any other batch'
+    )
 
-        fake_flask_app = types.ModuleType('flask_app')
-        fake_flask_app.app = Flask('batch-failure-handler-test')
-        monkeypatch.setitem(sys.modules, 'flask_app', fake_flask_app)
 
-        writes = []
-        monkeypatch.setattr(
-            clustering, 'save_task_status',
-            lambda task_id, task_type, status, **k: writes.append(
-                (task_id, task_type, status, k.get('parent_task_id'))
-            ),
-        )
-        job = Mock()
-        job.id = 'parent-1_s0_batch_0'
-        job.retries_left = None
-        job.kwargs = {'parent_task_id': 'parent-1', 'batch_id_str': 'Batch_0'}
+def test_a_run_resumes_from_its_own_row_instead_of_rescanning_its_children():
+    import tasks.clustering as clustering
+    import json
 
-        err = RuntimeError('boom')
-        clustering.batch_task_failure_handler(
-            job, object(), RuntimeError, err, None
-        )
+    task_info = {'details': json.dumps({
+        'total_runs': 100, 'runs_completed': 40, 'batches_launched': 3,
+        'server_idx': 1, 'elite_solutions': [{'score': 7.5}],
+    })}
 
-        assert writes == [
-            ('parent-1_s0_batch_0', 'clustering_batch', 'FAILURE', 'parent-1')
-        ]
+    resumed = clustering._resumable_progress(task_info, 100)
+
+    assert resumed['runs_completed'] == 40
+    assert resumed['batches_launched'] == 3
+    assert resumed['server_idx'] == 1
+    assert resumed['elite_solutions'] == [{'score': 7.5}]
+
+
+def test_a_crashed_run_resumes_with_the_winning_result_it_had_found():
+    import tasks.clustering as clustering
+    import json
+
+    task_info = {'details': json.dumps({
+        'total_runs': 100, 'runs_completed': 80, 'batches_launched': 4,
+        'best_score': 9.1, 'best_result': {'named_playlists': {'P1': ['a', 'b']}},
+    })}
+
+    resumed = clustering._resumable_progress(task_info, 100)
+
+    assert resumed['best_score'] == 9.1
+    assert resumed['best_result']['named_playlists'] == {'P1': ['a', 'b']}, (
+        'without it a crashed main task would have to redo the whole search'
+    )
+
+
+def test_the_persisted_result_drops_the_blobs_nothing_reads():
+    import tasks.clustering as clustering
+
+    kept = clustering._persistable_best_result({
+        'named_playlists': {'P1': ['a']},
+        'playlist_centroids': {'P1': [0.1]},
+        'playlist_to_centroid_vector_map': {'P1': [0.2]},
+        'playlist_primary_genres': {'P1': 'rock'},
+        'parameters': {'method': 'kmeans'},
+        'fitness_score': 9.1,
+        'pca_model_details': {'components': [[0.0] * 200] * 4},
+    })
+
+    assert 'pca_model_details' not in kept, (
+        'the PCA matrix is n_components x EMBEDDING_DIMENSION floats and nothing '
+        'reads it once the run is over'
+    )
+    assert kept['named_playlists'] == {'P1': ['a']}
+    assert kept['playlist_to_centroid_vector_map'] == {'P1': [0.2]}, (
+        'clustering_postprocessing does read this one'
+    )
+
+
+def test_a_run_whose_size_changed_does_not_resume_stale_progress():
+    import tasks.clustering as clustering
+    import json
+
+    task_info = {'details': json.dumps({
+        'total_runs': 100, 'runs_completed': 40, 'batches_launched': 3,
+    })}
+
+    assert clustering._resumable_progress(task_info, 200) is None, (
+        'the persisted counters are meaningless against a different run size'
+    )
+
+
+def test_a_first_attempt_has_nothing_to_resume():
+    import tasks.clustering as clustering
+    import json
+
+    task_info = {'details': json.dumps({
+        'total_runs': 100, 'runs_completed': 0, 'batches_launched': 0,
+    })}
+
+    assert clustering._resumable_progress(task_info, 100) is None
+
+
+def test_batches_from_an_earlier_server_phase_are_revoked_not_left_to_fail(monkeypatch):
+    import tasks.clustering as clustering
+
+    revoked = []
+    monkeypatch.setattr(
+        clustering, 'save_task_status',
+        lambda job_id, *_a, **_k: revoked.append(job_id),
+    )
+    monkeypatch.setattr(clustering.taskqueue, 'request_cancel', lambda _job_id: None)
+    monkeypatch.setattr(
+        clustering.taskqueue, 'live_children',
+        lambda _parent: [
+            {'task_id': 'p_s0_batch_1'},
+            {'task_id': 'p_s1_batch_7'},
+            {'task_id': 'p_s2_batch_2'},
+        ],
+    )
+
+    count = clustering._revoke_foreign_batches('p', 'p_s0')
+
+    assert count == 2
+    assert revoked == ['p_s1_batch_7', 'p_s2_batch_2'], (
+        'there is one shared payload slot per parent, so a batch queued for another '
+        'server phase can only fail once this phase overwrites the genre map'
+    )
+
+
+def test_cancelled_parent_cannot_enqueue_a_new_clustering_batch(monkeypatch):
+    import tasks.clustering as clustering
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(clustering, 'main_task_start_lock', nullcontext)
+    monkeypatch.setattr(clustering, 'get_task_info_from_db', lambda _task_id: None)
+    queue_calls = []
+    monkeypatch.setattr(
+        clustering.taskqueue, 'enqueue',
+        lambda func, **kwargs: queue_calls.append((func, kwargs)),
+    )
+
+    launched = clustering._launch_batch_job(
+        _batch_launch_state(), 'parent-1', 0, 10, 'genre-token', 5,
+        *_batch_launch_args(),
+    )
+
+    assert launched is False
+    assert queue_calls == []
+
+
+def test_clustering_batch_parent_check_and_enqueue_share_the_cancel_lock(monkeypatch):
+    import tasks.clustering as clustering
+
+    held = {'value': False}
+
+    class _Lock:
+        def __enter__(self):
+            held['value'] = True
+
+        def __exit__(self, *_args):
+            held['value'] = False
+
+    monkeypatch.setattr(clustering, 'main_task_start_lock', _Lock)
+    monkeypatch.setattr(
+        clustering,
+        'get_task_info_from_db',
+        lambda _task_id: {'status': 'RUNNING'},
+    )
+
+    def enqueue(_func, **kwargs):
+        assert held['value'] is True
+
+    monkeypatch.setattr(clustering.taskqueue, 'enqueue', enqueue)
+
+    assert clustering._launch_batch_job(
+        _batch_launch_state(), 'parent-1', 0, 10, 'genre-token', 5,
+        *_batch_launch_args(),
+    ) is True
+
+
+def test_batch_start_racing_the_cancel_wipe_never_recreates_a_child_row(monkeypatch):
+    import sys
+    import types
+    from contextlib import nullcontext
+    from flask import Flask
+    import tasks.clustering as clustering
+
+    fake_flask_app = types.ModuleType('flask_app')
+    fake_flask_app.app = Flask('cancelled-batch-start')
+    monkeypatch.setitem(sys.modules, 'flask_app', fake_flask_app)
+    job = Mock(id='parent-1_s0_batch_0', meta={})
+    monkeypatch.setattr(clustering.taskqueue, 'current_task_id', lambda: job.id)
+    parent_reads = iter([{'status': 'RUNNING'}, None])
+    monkeypatch.setattr(
+        clustering, 'get_task_info_from_db', lambda _task_id: next(parent_reads)
+    )
+    monkeypatch.setattr(clustering, 'main_task_start_lock', nullcontext)
+    writes = []
+    monkeypatch.setattr(
+        clustering, 'save_task_status', lambda *a, **k: writes.append((a, k))
+    )
+
+    result = clustering.run_clustering_batch_task(
+        batch_id_str='Batch_0',
+        start_run_idx=0,
+        num_iterations_in_batch=1,
+        genre_to_lightweight_track_data_map_json='{}',
+        target_songs_per_genre=1,
+        sampling_percentage_change_per_run=0.1,
+        clustering_method='kmeans',
+        active_mood_labels_for_batch=[],
+        num_clusters_min_max_tuple=(2, 3),
+        dbscan_params_ranges_dict={},
+        gmm_params_ranges_dict={},
+        spectral_params_ranges_dict={},
+        pca_params_ranges_dict={'components_min': 2, 'components_max': 3},
+        max_songs_per_cluster=50,
+        parent_task_id='parent-1',
+        score_weights_dict={},
+        elite_solutions_params_list_json='[]',
+        exploitation_probability=0.0,
+        mutation_config_json='{}',
+        initial_subset_track_ids_json='[]',
+        enable_clustering_embeddings_param=True,
+    )
+
+    assert result['status'] == 'REVOKED'
+    assert writes == []

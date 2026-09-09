@@ -19,6 +19,14 @@ Main Features:
 * build_and_store_index_streaming and the segmented-blob helpers: split large
   id maps and index payloads into row-sized fragments (SQL identifiers are
   regex-validated before interpolation), plus artist-metadata pack/unpack.
+* load_index_into_cache: the one loader the CLAP and lyrics search caches share,
+  so a change to how a cache is populated cannot land on only one of them.
+* load_segmented_blob reads the part names first and then one part per round
+  trip, so a multi-hundred-MB index never has every segment resident at once;
+  segmented_blob_length answers an existence/size probe in SQL, leaving the
+  blob bytes on the server, and segmented_blob_complete checks that every
+  segment of a partitioned blob is present without selecting the bytes, so a
+  truncated index is caught by its probe instead of crashing the loader.
 """
 
 from __future__ import annotations
@@ -36,10 +44,6 @@ import psycopg2
 import config
 
 logger = logging.getLogger(__name__)
-
-
-class EmptyIndexError(ValueError):
-    pass
 
 
 _STREAM_ITERSIZE = 5000
@@ -392,74 +396,6 @@ def store_ivf_index_segmented(
             )
 
 
-def rewrite_segmented_id_map(
-    cur,
-    target_table: str,
-    index_name: str,
-    rewrite_fn,
-    max_part_size_mb: Optional[int] = None,
-) -> bool:
-    _validate_sql_identifier(target_table, "table")
-    _validate_sql_identifier(index_name, "index_name")
-    mb = config.IVF_MAX_PART_SIZE_MB if max_part_size_mb is None else int(max_part_size_mb)
-    max_part_size = mb * 1024 * 1024
-
-    cur.execute(
-        f"SELECT id_map_json FROM {target_table} WHERE index_name = %s",
-        (index_name,),
-    )
-    single_row = cur.fetchone()
-    if single_row is not None:
-        old_json = single_row[0]
-        new_json = rewrite_fn(old_json)
-        if new_json == old_json:
-            return False
-        cur.execute(
-            f"UPDATE {target_table} SET id_map_json = %s WHERE index_name = %s",
-            (new_json, index_name),
-        )
-        return True
-
-    like_pattern = index_name.replace("_", r"\_") + r"\_%\_%"
-    cur.execute(
-        f"SELECT index_name, id_map_json FROM {target_table} WHERE index_name LIKE %s ESCAPE '\\'",
-        (like_pattern,),
-    )
-    seg_pattern = re.compile(rf"^{re.escape(index_name)}_(\d+)_(\d+)$")
-    parts = []
-    for name, frag in cur.fetchall() or []:
-        m = seg_pattern.match(name)
-        if m:
-            parts.append((int(m.group(1)), name, frag))
-    if not parts:
-        return False
-    parts.sort(key=lambda p: p[0])
-    num_parts = len(parts)
-
-    old_full = reassemble_segmented_id_map((p[0], p[2]) for p in parts)
-    new_full = rewrite_fn(old_full)
-    if new_full == old_full:
-        return False
-
-    new_frags = _split_text(new_full, max_part_size)
-    if len(new_frags) > num_parts:
-        raise ValueError(
-            f"rewritten id_map for '{index_name}' needs {len(new_frags)} part rows "
-            f"but the index has {num_parts}; rebuild the index instead of rewriting in place."
-        )
-    for position, (_, name, _) in enumerate(parts):
-        frag = new_frags[position] if position < len(new_frags) else ""
-        cur.execute(
-            f"UPDATE {target_table} SET id_map_json = %s WHERE index_name = %s",
-            (frag, name),
-        )
-    return True
-
-
-def build_id_map(item_ids: Iterable[str]) -> dict:
-    return {i: item_id for i, item_id in enumerate(item_ids)}
-
-
 def store_segmented_blob(
     db_conn,
     target_table: str,
@@ -513,6 +449,12 @@ def store_segmented_blob(
             )
 
 
+def _segment_parts_complete(total_expected, part_numbers):
+    return len(part_numbers) == total_expected and set(part_numbers) == set(
+        range(1, total_expected + 1)
+    )
+
+
 def load_segmented_blob(
     db_conn,
     target_table: str,
@@ -522,9 +464,7 @@ def load_segmented_blob(
     _validate_sql_identifier(name, "name")
 
     select_single_sql = f"SELECT blob_data FROM {target_table} WHERE name = %s"
-    select_segments_sql = (
-        f"SELECT name, blob_data FROM {target_table} WHERE name LIKE %s ESCAPE '\\'"
-    )
+    select_names_sql = f"SELECT name FROM {target_table} WHERE name LIKE %s ESCAPE '\\'"
     like_pattern = name.replace("_", r"\_") + r"\_%\_%"
     seg_pattern = re.compile(rf"^{re.escape(name)}_(\d+)_(\d+)$")
 
@@ -535,15 +475,15 @@ def load_segmented_blob(
             data = row[0]
             return bytes(data)
 
-        cur.execute(select_segments_sql, (like_pattern,))
-        rows = cur.fetchall()
+        cur.execute(select_names_sql, (like_pattern,))
+        seg_names = [r[0] for r in cur.fetchall()]
 
-    if not rows:
+    if not seg_names:
         return None
 
-    parts: List[Tuple[int, bytes]] = []
+    ordered: List[Tuple[int, str]] = []
     total_expected: Optional[int] = None
-    for row_name, row_blob in rows:
+    for row_name in seg_names:
         m = seg_pattern.match(row_name)
         if not m:
             continue
@@ -556,16 +496,103 @@ def load_segmented_blob(
                 f"Segment total mismatch for '{name}' in {target_table}: "
                 f"saw {total_expected} and {total}."
             )
-        parts.append((part_no, bytes(row_blob) if row_blob else b""))
+        ordered.append((part_no, row_name))
 
-    if total_expected is None or len(parts) != total_expected:
+    part_numbers = [part_no for part_no, _ in ordered]
+    if total_expected is None or not _segment_parts_complete(total_expected, part_numbers):
         raise ValueError(
             f"Incomplete segmented blob for '{name}' in {target_table}: "
-            f"expected {total_expected}, found {len(parts)}."
+            f"expected parts 1..{total_expected}, found {sorted(part_numbers)}."
         )
 
-    parts.sort(key=lambda p: p[0])
-    return b"".join(part_data for _, part_data in parts)
+    ordered.sort(key=lambda p: p[0])
+
+    buf = bytearray()
+    with db_conn.cursor() as cur:
+        for _part_no, part_name in ordered:
+            cur.execute(select_single_sql, (part_name,))
+            part_row = cur.fetchone()
+            if part_row is None:
+                raise ValueError(
+                    f"Segment '{part_name}' of '{name}' in {target_table} "
+                    f"disappeared between the name scan and the read."
+                )
+            if part_row[0]:
+                buf += part_row[0]
+            part_row = None
+    return bytes(buf)
+
+
+def segmented_blob_length(
+    db_conn,
+    target_table: str,
+    name: str,
+) -> Optional[int]:
+    _validate_sql_identifier(target_table, "table")
+    _validate_sql_identifier(name, "name")
+
+    like_pattern = name.replace("_", r"\_") + r"\_%\_%"
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            f"SELECT octet_length(blob_data) FROM {target_table} WHERE name = %s",
+            (name,),
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            return int(row[0])
+
+        cur.execute(
+            f"SELECT COALESCE(SUM(octet_length(blob_data)), 0) FROM {target_table} "
+            f"WHERE name LIKE %s ESCAPE '\\'",
+            (like_pattern,),
+        )
+        row = cur.fetchone()
+
+    if not row or not row[0]:
+        return None
+    return int(row[0])
+
+
+def segmented_blob_complete(
+    db_conn,
+    target_table: str,
+    name: str,
+) -> bool:
+    _validate_sql_identifier(target_table, "table")
+    _validate_sql_identifier(name, "name")
+
+    select_single_sql = (
+        f"SELECT 1 FROM {target_table} WHERE name = %s AND blob_data IS NOT NULL"
+    )
+    select_names_sql = f"SELECT name FROM {target_table} WHERE name LIKE %s ESCAPE '\\'"
+    like_pattern = name.replace("_", r"\_") + r"\_%\_%"
+    seg_pattern = re.compile(rf"^{re.escape(name)}_(\d+)_(\d+)$")
+
+    with db_conn.cursor() as cur:
+        cur.execute(select_single_sql, (name,))
+        if cur.fetchone():
+            return True
+        cur.execute(select_names_sql, (like_pattern,))
+        seg_names = [r[0] for r in cur.fetchall()]
+
+    total_expected: Optional[int] = None
+    part_numbers: List[int] = []
+    for row_name in seg_names:
+        m = seg_pattern.match(row_name)
+        if not m:
+            continue
+        part_no = int(m.group(1))
+        total = int(m.group(2))
+        if total_expected is None:
+            total_expected = total
+        elif total_expected != total:
+            return False
+        part_numbers.append(part_no)
+
+    if total_expected is None:
+        return False
+    return _segment_parts_complete(total_expected, part_numbers)
 
 
 _ARTIST_META_MAGIC = b"ARMD"
@@ -708,3 +735,23 @@ def unpack_artist_metadata(blob: bytes) -> Tuple[Dict[int, str], Dict[str, Dict]
         }
 
     return artist_map, artist_gmms
+
+
+def load_index_into_cache(table, dimension, metric, label, cache):
+    from database import get_db
+    from .paged_ivf import load_index_auto
+
+    try:
+        loaded = load_index_auto(get_db(), table, dimension, metric, label=label)
+        if loaded is None:
+            return False
+        index, id_map, reverse_id_map = loaded
+        cache['index'] = index
+        cache['id_map'] = id_map
+        cache['reverse_id_map'] = reverse_id_map
+        cache['loaded'] = True
+        logger.info("%s index loaded from database with %d items.", label, len(id_map))
+        return True
+    except Exception:
+        logger.exception("Failed to load %s index from DB", label)
+        return False

@@ -16,7 +16,7 @@ routes; this module provides the app-wide plumbing they all hang off.
 Main Features:
 * Core routes: health, `/analysis` landing page, generic task status/cancel/
   cancel-all, last-task and active-tasks polling, `/api/config`, `/api/playlists`.
-* Registers all feature blueprints and, on the Flask server only (never RQ
+* Registers all feature blueprints and, on the Flask server only (never queue
   workers), loads similarity indexes/caches and starts the background listener.
 """
 
@@ -28,21 +28,15 @@ import logging
 import threading
 import time
 import config
+from sanitization import sanitize_for_log
 
-# RQ imports
-from rq.job import Job
-from rq.exceptions import NoSuchJobError
-import rq_job_state
 from tasks.setup_manager import setup_manager
-
-# Redis client
-from redis import Redis
 
 # Swagger imports
 from flasgger import Swagger
 
 # Import configuration
-from config import TEMP_DIR, REDIS_URL, APP_VERSION, ENABLE_PROXY_FIX, JWT_SECRET
+from config import TEMP_DIR, APP_VERSION, ENABLE_PROXY_FIX, JWT_SECRET
 
 if ENABLE_PROXY_FIX:
     # Werkzeug import for reverse proxy support
@@ -50,29 +44,26 @@ if ENABLE_PROXY_FIX:
     from proxy_prefix import StripDuplicatedScriptName
 
 # --- Flask App Setup ---
-# The Flask instance lives in `flask_app` so RQ task modules can import it
+# The Flask instance lives in `flask_app` so task modules can import it
 # without creating a circular import back into this file.
 from flask_app import app
 
 # Import helper functions
 import app_server_context
+from app_helper import max_bound as _max_bound_filter
+from app_helper import min_bound as _min_bound_filter
 from app_helper import (
-    get_db,
-    close_db,
-    redis_conn,
-    get_task_info_from_db,
     revoke_inline_task_row,
     cancel_job_and_children_recursive,
-    coerce_db_details,
     sanitize_task_details,
 )
-from database import init_db
+from database import init_db, get_db, close_db, get_task_info_from_db, coerce_db_details
+from taskqueue.sql import CONTROL_TASK_TYPE
+from tasks.provider_migration_tasks import MIGRATION_PLANNER_TASK_TYPE
 from config import (
     TASK_STATUS_PENDING,
     TASK_STATUS_STARTED,
     TASK_STATUS_PROGRESS,
-    TASK_STATUS_SUCCESS,
-    TASK_STATUS_FAILURE,
     TASK_STATUS_REVOKED,
 )
 from app_auth import (
@@ -88,12 +79,17 @@ from error.error_dictionary import UNKNOWN_ERROR_CODE
 
 # NOTE: Annoy Manager import is moved to be local where used to prevent circular imports.
 
+# Queue rows the user never started. Both spellings come from the module that
+# WRITES them, because a rename that moved only one side left these filters
+# matching nothing: the handshake reappeared as a phantom dashboard task, and a
+# pending restart 409-blocked the next analysis or cleaning start.
+NON_USER_TASK_TYPES = (CONTROL_TASK_TYPE, MIGRATION_PLANNER_TASK_TYPE)
+
 logger = logging.getLogger(__name__)
 
 
 @app.errorhandler(AudioMuseError)
 def handle_audiomuse_error(err):
-    """Render any AudioMuseError raised by a synchronous route as a structured JSON body."""
     app.logger.error(
         "[%s] %s: %s", err.code, err.error_class, err.error_message, exc_info=err.cause or err
     )
@@ -103,13 +99,6 @@ def handle_audiomuse_error(err):
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(err):
-    """Return a safe structured JSON body for any otherwise-unhandled exception.
-
-    HTTP errors (404/405/...) pass through to their default rendering. Everything
-    else logs the full traceback to the container log only and returns the generic
-    UNKNOWN error, so a frontend calling res.json() never receives a Flask HTML 500
-    page or a raw stack trace.
-    """
     if isinstance(err, HTTPException):
         return err
     app.logger.exception("Unhandled exception during request")
@@ -144,9 +133,12 @@ def _get_jwt_secret():
     return _jwt_secret
 
 
+app.add_template_filter(_min_bound_filter, 'min_bound')
+app.add_template_filter(_max_bound_filter, 'max_bound')
+
+
 @app.context_processor
 def inject_globals():
-    """Injects global variables into all templates."""
     from config import CLAP_ENABLED, LYRICS_ENABLED
 
     # auth_role defaults to 'admin' (set by check_auth_needed), so when
@@ -210,6 +202,33 @@ def log_api_request():
         app.logger.info('API request: %s %s', request.method, request.path)
 
 
+@app.before_request
+def note_request_start():
+    if _is_worker:
+        return
+    try:
+        from tasks.memory_utils import note_request_started
+
+        g._heap_trim_counted = True
+        note_request_started()
+    except Exception:
+        app.logger.exception("Could not note the request start for the idle heap trim")
+
+
+@app.teardown_request
+def note_request_end(exc=None):
+    if _is_worker:
+        return
+    if not g.pop('_heap_trim_counted', False):
+        return
+    try:
+        from tasks.memory_utils import note_request_finished
+
+        note_request_finished()
+    except Exception:
+        app.logger.exception("Could not note the request finish for the idle heap trim")
+
+
 @app.route('/api/health')
 def health_check():
     """
@@ -251,12 +270,19 @@ def teardown_db(e=None):
         end_all_requests()
     except Exception:
         pass
+    if not _is_worker:
+        try:
+            from tasks.memory_utils import arm_idle_heap_trim
+
+            arm_idle_heap_trim()
+        except Exception:
+            logger.exception("Could not arm the idle heap trim")
 
 
 # Initialize the database schema when the application module is loaded.
 # This is safe because it doesn't import other application modules.
-# RQ workers import app.py too, but they should not perform schema bootstrapping.
-_is_worker = os.environ.get('AUDIOMUSE_ROLE') == 'worker'
+# queue workers import app.py too, but they should not perform schema bootstrapping.
+_is_worker = (os.environ.get('AUDIOMUSE_ROLE') or '').lower() == 'worker'
 if not _is_worker:
     with app.app_context():
         init_db()
@@ -365,7 +391,7 @@ if not _is_worker:
         # persisted and shared across all gunicorn workers.
         _jwt_secret = resolve_jwt_secret(setup_manager)
 else:
-    app.logger.info("RQ worker mode: skipping startup database schema bootstrap.")
+    app.logger.info("Worker mode: skipping startup database schema bootstrap.")
 
 import app_setup  # noqa: F401
 
@@ -395,7 +421,7 @@ def index():
 def get_task_status_endpoint(task_id):
     """
     Get the status of a specific task.
-    Retrieves status information from both RQ and the database.
+    Retrieves status information from the database.
     ---
     tags:
       - Status
@@ -438,7 +464,7 @@ def get_task_status_endpoint(task_id):
                   nullable: true
                   description: The type of the task as recorded in the database (e.g., main_analysis, album_analysis, main_clustering, clustering_batch).
       404:
-        description: Task ID not found in RQ or database.
+        description: Task ID not found in the database.
         content:
           application/json:
             schema:
@@ -451,59 +477,35 @@ def get_task_status_endpoint(task_id):
                   example: UNKNOWN
                 status_message:
                   type: string
-                  example: Task ID not found in RQ or DB.
+                  example: Task ID not found in the database.
     """
+    # One read. There is no second system holding a second opinion about this
+    # task, so there is nothing to merge and no rule needed for whose answer wins.
     response = {
         'task_id': task_id,
         'state': 'UNKNOWN',
-        'status_message': 'Task ID not found in RQ or DB.',
+        'status_message': 'Task ID not found.',
         'progress': 0,
         'details': {},
         'task_type_from_db': None,
         'running_time_seconds': 0,
     }
-    try:
-        job = Job.fetch(task_id, connection=redis_conn)
-        rq_status = rq_job_state.status_value(job.get_status(refresh=False))
-        response['state'] = rq_status  # e.g., queued, started, finished, failed
-        response['status_message'] = job.meta.get('status_message', rq_status)
-        response['progress'] = job.meta.get('progress', 0)
-        response['details'] = job.meta.get('details', {})
-        if rq_job_state.is_terminal_status(rq_status):
-            # RQ uses 'finished' for success; canceled/stopped read as cancellations.
-            response['status_message'] = {
-                'failed': "FAILED", 'finished': "SUCCESS",
-            }.get(rq_status, rq_status.upper())
-            if rq_status != 'failed':
-                response['progress'] = 100
-
-    except NoSuchJobError:
-        # If not in RQ, it might have been cleared or never existed. Check DB.
-        pass  # Will fall through to DB check
-
-    # Augment with DB data, DB is source of truth for persisted details
     db_task_info = get_task_info_from_db(task_id)
-    if db_task_info:
-        response['task_type_from_db'] = db_task_info.get('task_type')
-        response['running_time_seconds'] = db_task_info.get('running_time_seconds', 0)
-        # If RQ state is more final (e.g. failed/finished/stopped), prefer that, else use DB
-        if not rq_job_state.is_terminal_status(response['state']):
-            response['state'] = db_task_info.get(
-                'status', response['state']
-            )  # Use DB status if RQ is still active
-
-        response['progress'] = db_task_info.get('progress', response['progress'])
-        db_details = coerce_db_details(db_task_info.get('details'))
-        # Merge details: RQ meta (live) can override DB details (persisted)
-        response['details'] = {**db_details, **response['details']}
-
-        # If task is marked REVOKED in DB, this is the most accurate status for cancellation
-        if db_task_info.get('status') == TASK_STATUS_REVOKED:
-            response['state'] = 'REVOKED'
-            response['status_message'] = 'Task revoked.'
-            response['progress'] = 100
-    elif response['state'] == 'UNKNOWN':  # Not in RQ and not in DB
+    if not db_task_info:
         return jsonify(response), 404
+
+    details = coerce_db_details(db_task_info.get('details')) or {}
+    response['state'] = db_task_info.get('status') or 'UNKNOWN'
+    response['task_type_from_db'] = db_task_info.get('task_type')
+    response['running_time_seconds'] = db_task_info.get('running_time_seconds', 0)
+    response['progress'] = db_task_info.get('progress', 0)
+    response['details'] = details
+    response['status_message'] = (
+        details.get('status_message') or details.get('message') or response['state']
+    )
+    if response['state'] == TASK_STATUS_REVOKED:
+        response['status_message'] = details.get('message') or 'Task revoked.'
+        response['progress'] = 100
 
     response['details'] = sanitize_task_details(
         response.get('details'), response.get('state'), response.get('task_type_from_db')
@@ -521,7 +523,8 @@ def get_task_status_endpoint(task_id):
 def cancel_task_endpoint(task_id):
     """
     Cancel a specific task and its children.
-    Marks the task and its descendants as REVOKED in the database and attempts to stop/cancel them in RQ.
+    Marks the task and its descendants as REVOKED in the database and notifies
+    the queue workers to stop the process running it.
     ---
     tags:
       - Control
@@ -551,7 +554,7 @@ def cancel_task_endpoint(task_id):
       404:
         description: Task ID not found in the database.
     """
-    # An in-process task has no RQ job to stop, and the global cancel below is
+    # An in-process task has no queue job to stop, and the global cancel below is
     # destructive by design, so it gets a surgical revoke of its own row instead.
     inline_message = revoke_inline_task_row(task_id)
     if inline_message:
@@ -560,9 +563,25 @@ def cancel_task_endpoint(task_id):
         ), 200
 
     # Always perform cancel when the endpoint is invoked. No early returns.
-    cancelled_count = cancel_job_and_children_recursive(
-        task_id, reason=f"Cancellation requested for task {task_id} via API."
-    )
+    try:
+        cancelled_count = cancel_job_and_children_recursive(
+            task_id, reason=f"Cancellation requested for task {task_id} via API."
+        )
+    except Exception:
+        logger.exception(
+            "Cancellation of task %s could not be fully confirmed",
+            sanitize_for_log(task_id),
+        )
+        return jsonify(
+            {
+                "error": (
+                    "Cancellation could not be fully applied or confirmed; "
+                    "recovery tasks may remain active."
+                ),
+                "task_id": task_id,
+                "details": None,
+            }
+        ), 503
     return jsonify(
         {
             "message": f"Task {task_id} cancellation requested. {cancelled_count} cancellation actions attempted.",
@@ -605,33 +624,55 @@ def cancel_all_tasks_by_type_endpoint(task_type_prefix):
     """
     db = get_db()
     cur = db.cursor(cursor_factory=DictCursor)
-    # Exclude terminal statuses
-    terminal_statuses = (TASK_STATUS_SUCCESS, TASK_STATUS_FAILURE, TASK_STATUS_REVOKED)
     cur.execute(
-        "SELECT task_id, task_type FROM task_status WHERE task_type = %s AND status NOT IN %s",
-        (task_type_prefix, terminal_statuses),
+        "SELECT task_id, task_type FROM task_status WHERE task_type = %s "
+        "AND status NOT IN %s",
+        (task_type_prefix, config.TASK_STATUS_TERMINAL),
     )
     tasks_to_cancel = cur.fetchall()
     cur.close()
 
-    # Decide 404 BEFORE any destructive call: the cancel empties both queues and
-    # revokes every row, so running it first and then reporting "nothing found"
-    # (because RQ happened to hold no live job) would be a lie about a wipe that
-    # already happened.
+    # Decide 404 BEFORE any destructive call: the cancel empties the whole table
+    # and revokes every row, so running it first and then reporting "nothing
+    # found" would be a lie about a wipe that already happened.
     if not tasks_to_cancel:
         return jsonify(
             {"message": f"No active tasks of type '{task_type_prefix}' found to cancel."}
         ), 404
 
     cancelled_main_task_ids = [r['task_id'] for r in tasks_to_cancel]
-    total_cancelled_jobs = cancel_job_and_children_recursive(
-        cancelled_main_task_ids[0],
-        reason=f"Bulk cancellation for task type '{task_type_prefix}' via API.",
-    )
+    # cancel_job_and_children_recursive re-raises when the tombstone commit fails.
+    # Without this the generic handler answered UNKNOWN 500 with no
+    # cancelled_main_tasks, so the caller could not tell a partially applied
+    # cancel from an unknown failure. The sibling /api/cancel/<task_id> answers 503.
+    try:
+        total_cancelled_jobs = cancel_job_and_children_recursive(
+            cancelled_main_task_ids[0],
+            reason=f"Bulk cancellation for task type '{task_type_prefix}' via API.",
+        )
+    except Exception:
+        logger.exception(
+            "Bulk cancellation for %s could not be fully confirmed",
+            sanitize_for_log(task_type_prefix),
+        )
+        return jsonify(
+            {
+                "error": (
+                    "Cancellation could not be fully applied or confirmed; "
+                    "recovery tasks may remain active."
+                ),
+                "cancelled_main_tasks": cancelled_main_task_ids,
+                "details": None,
+            }
+        ), 503
 
     return jsonify(
         {
-            "message": f"Cancellation initiated for {len(cancelled_main_task_ids)} main tasks of type '{task_type_prefix}' and their children. Total jobs affected: {total_cancelled_jobs}.",
+            "message": (
+                f"Cancellation initiated for {len(cancelled_main_task_ids)} main tasks "
+                f"of type '{task_type_prefix}' and their children. "
+                f"Total jobs affected: {total_cancelled_jobs}."
+            ),
             "cancelled_main_tasks": cancelled_main_task_ids,
         }
     ), 200
@@ -675,13 +716,20 @@ def get_last_overall_task_status_endpoint():
     """
     db = get_db()
     cur = db.cursor(cursor_factory=DictCursor)
-    cur.execute("""
+    # Control-plane handshakes and migration planner runs are queue rows now, but
+    # they are not user tasks: showing one here made every task-polling page
+    # believe a restart request was "the last task".
+    cur.execute(
+        """
         SELECT task_id, task_type, status, progress, details, start_time, end_time
         FROM task_status
         WHERE parent_task_id IS NULL
+          AND task_type NOT IN %s
         ORDER BY timestamp DESC
         LIMIT 1
-    """)
+    """,
+        (NON_USER_TASK_TYPES,),
+    )
     last_task_row = cur.fetchone()
     cur.close()
 
@@ -745,15 +793,19 @@ def get_active_tasks_endpoint():
     db = get_db()
     cur = db.cursor(cursor_factory=DictCursor)
     non_terminal_statuses = (TASK_STATUS_PENDING, TASK_STATUS_STARTED, TASK_STATUS_PROGRESS)
+    # worker_control handshakes and migration planner runs are queue rows, not
+    # user tasks: without this filter a slow worker restart greyed out every
+    # Start button until the stale sweep failed the request row 30 minutes on.
     cur.execute(
         """
         SELECT task_id, parent_task_id, task_type, sub_type_identifier, status, progress, details, start_time, end_time
         FROM task_status
         WHERE parent_task_id IS NULL AND status IN %s
+          AND task_type NOT IN %s
         ORDER BY timestamp DESC
         LIMIT 1
     """,
-        (non_terminal_statuses,),
+        (non_terminal_statuses, NON_USER_TASK_TYPES),
     )
     active_main_task_row = cur.fetchone()
     cur.close()
@@ -921,114 +973,122 @@ def get_playlists_endpoint():
     return jsonify(app_server_context.group_playlist_rows_by_server(rows)), 200
 
 
-# --- Redis index reload listener (restored pre-e308673 logic, with map reload added) ---
+# --- Index reload listener over Postgres LISTEN/NOTIFY ---
 def listen_for_index_reloads():
-    """
-    Runs in a background thread to listen for messages on a Redis Pub/Sub channel.
-    When a 'reload' message is received, it triggers the in-memory IVF index and map to be reloaded.
-    This is the recommended pattern for inter-process communication in this architecture,
-    avoiding direct HTTP calls from workers to the web server.
-    """
-    # Create a new Redis connection for this thread.
-    # Sharing the main redis_conn object across threads is not recommended.
-    from taskqueue import redis_socket_options
+    from taskqueue.listen import Listener
+    from taskqueue.sql import CHANNEL_EVENT
 
-    thread_redis_conn = Redis.from_url(
-        REDIS_URL,
-        socket_connect_timeout=30,
-        socket_timeout=60,
-        health_check_interval=30,
-        retry_on_timeout=True,
-        **redis_socket_options(REDIS_URL),
-    )
-    pubsub = thread_redis_conn.pubsub()
-    pubsub.subscribe('index-updates')
-    logger.info(
-        "Background thread started. Listening for IVF index reloads on Redis channel 'index-updates'."
-    )
+    def _on_notify(_channel, payload):
+        logger.info("Received '%s' on the index-updates channel.", payload)
+        if payload != 'index-reload':
+            return
+        with app.app_context():
+            logger.info(
+                "Triggering in-memory IVF index and map reload from background listener."
+            )
+            try:
+                from tasks.ivf_manager import load_ivf_index_for_querying
 
-    for message in pubsub.listen():
-        # The first message is a confirmation of subscription, so we skip it.
-        if message['type'] == 'message':
-            message_data = message['data'].decode('utf-8')
-            logger.info(f"Received '{message_data}' message on 'index-updates' channel.")
-            if message_data == 'reload':
-                # We need the application context to access 'g' and the database connection.
-                with app.app_context():
-                    logger.info(
-                        "Triggering in-memory IVF index and map reload from background listener."
+                load_ivf_index_for_querying(force_reload=True)
+                from tasks.artist_gmm_manager import load_artist_index_for_querying
+
+                load_artist_index_for_querying(force_reload=True)
+                from database import load_map_projection, load_artist_projection
+
+                load_map_projection('main_map', force_reload=True)
+                load_artist_projection('artist_map', force_reload=True)
+                from app_map import build_map_cache
+
+                build_map_cache()
+
+                logger.info("Reloading CLAP embedding cache...")
+                from tasks.clap_text_search import refresh_clap_cache
+
+                clap_success = refresh_clap_cache()
+
+                try:
+                    from config import LYRICS_ENABLED
+
+                    if LYRICS_ENABLED:
+                        logger.info("Reloading Lyrics search cache...")
+                        from tasks.lyrics_manager import refresh_lyrics_cache
+
+                        lyrics_success = refresh_lyrics_cache()
+                    else:
+                        lyrics_success = False
+                except Exception:
+                    logger.exception("Lyrics cache reload failed")
+                    lyrics_success = False
+
+                try:
+                    logger.info("Reloading SemGrove merged index...")
+                    from tasks.sem_grove_manager import refresh_sem_grove_cache
+
+                    sg_success = refresh_sem_grove_cache()
+                except Exception:
+                    logger.exception("SemGrove cache reload failed")
+                    sg_success = False
+
+                try:
+                    from tasks.hyperbolic_manager import (
+                        is_hyperbolic_tree_cache_loaded,
+                        load_hyperbolic_tree_cache,
                     )
-                    try:
-                        from tasks.ivf_manager import load_ivf_index_for_querying
 
-                        load_ivf_index_for_querying(force_reload=True)
-                        from tasks.artist_gmm_manager import load_artist_index_for_querying
-
-                        load_artist_index_for_querying(force_reload=True)
-                        from database import load_map_projection, load_artist_projection
-
-                        load_map_projection('main_map', force_reload=True)
-                        load_artist_projection('artist_map', force_reload=True)
-                        # Rebuild the map JSON cache used by the /api/map endpoint
-                        from app_map import build_map_cache
-
-                        build_map_cache()
-
-                        # Reload CLAP cache (with logging)
-                        logger.info("Reloading CLAP embedding cache...")
-                        from tasks.clap_text_search import refresh_clap_cache
-
-                        clap_success = refresh_clap_cache()
-
-                        # Reload Lyrics cache (ivf index + axis matrix)
-                        try:
-                            from config import LYRICS_ENABLED
-
-                            if LYRICS_ENABLED:
-                                logger.info("Reloading Lyrics search cache...")
-                                from tasks.lyrics_manager import refresh_lyrics_cache
-
-                                lyrics_success = refresh_lyrics_cache()
-                            else:
-                                lyrics_success = False
-                        except Exception as e:
-                            logger.warning(f"Lyrics cache reload failed: {e}")
-                            lyrics_success = False
-
-                        # Reload SemGrove merged lyrics+audio index
-                        try:
-                            logger.info("Reloading SemGrove merged index...")
-                            from tasks.sem_grove_manager import refresh_sem_grove_cache
-
-                            sg_success = refresh_sem_grove_cache()
-                        except Exception as e:
-                            logger.warning(f"SemGrove cache reload failed: {e}")
-                            sg_success = False
-
+                    if is_hyperbolic_tree_cache_loaded():
+                        logger.info("Reloading Hyperbolic Explorer tree cache...")
+                        load_hyperbolic_tree_cache()
+                    else:
                         logger.info(
-                            f"In-memory reload complete: IVF OK, Artist OK, Maps OK, CLAP {'OK' if clap_success else 'X'}, Lyrics {'OK' if lyrics_success else 'X'}, SemGrove {'OK' if sg_success else 'X'}"
+                            "Hyperbolic Explorer tree cache is idle; skipping reload "
+                            "(lazy-loads fresh data on next /hyperbolic page open)."
                         )
-                    except Exception:
-                        logger.exception(
-                            "Error reloading indexes/maps from background listener"
-                        )
-            elif message_data == 'reload-artist':
-                # Reload artist similarity index only (legacy support)
-                with app.app_context():
-                    logger.info(
-                        "Triggering in-memory artist similarity index reload from background listener."
-                    )
-                    try:
-                        from tasks.artist_gmm_manager import load_artist_index_for_querying
+                    hyper_success = True
+                except Exception:
+                    logger.exception("Hyperbolic Explorer cache reload failed")
+                    hyper_success = False
 
-                        load_artist_index_for_querying(force_reload=True)
-                        logger.info(
-                            "In-memory artist similarity index reloaded successfully by background listener."
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Error reloading artist similarity index from background listener"
-                        )
+                try:
+                    from tasks.hyperbolic_index import load_hyperbolic_index
+
+                    load_hyperbolic_index(force_reload=True)
+                    logger.info("Reloading Hyperbolic Poincare index...")
+                    hyper_index_success = True
+                except Exception:
+                    logger.exception("Hyperbolic Poincare index reload failed")
+                    hyper_index_success = False
+
+                logger.info(
+                    "In-memory reload complete: IVF OK, Artist OK, Maps OK, CLAP %s, "
+                    "Lyrics %s, SemGrove %s, Hyperbolic %s, Poincare %s",
+                    'OK' if clap_success else 'X',
+                    'OK' if lyrics_success else 'X',
+                    'OK' if sg_success else 'X',
+                    'OK' if hyper_success else 'X',
+                    'OK' if hyper_index_success else 'X',
+                )
+            except Exception:
+                logger.exception("Error reloading indexes/maps from background listener")
+            finally:
+                # A reload replaces every index in place, so the whole previous
+                # generation plus each rebuild's scratch is garbage by now. Hand
+                # it back to the kernel instead of letting RSS ratchet up once
+                # per reload for the life of the process.
+                try:
+                    from tasks.memory_utils import release_memory_to_os
+
+                    release_memory_to_os()
+                except Exception:
+                    logger.exception("Index reload: heap release to the OS failed")
+
+    listener = Listener(
+        (CHANNEL_EVENT,),
+        _on_notify,
+        application_name=f"audiomuse-flask-events-{os.getpid()}",
+        name='index-events',
+    )
+    listener.start()
+    logger.info("Listening for index reloads on the %s channel.", CHANNEL_EVENT)
 
 
 # --- Blueprint Registration ---
@@ -1057,27 +1117,17 @@ def _register_blueprints(flask_app):
     from app_users import users_bp
     from app_sync import sync_bp
     from app_music_servers import music_servers_bp
+    from app_hyperbolic import hyperbolic_bp
 
     flask_app.register_blueprint(chat_bp, url_prefix='/chat')
-    flask_app.register_blueprint(clustering_bp)
-    flask_app.register_blueprint(analysis_bp)
-    flask_app.register_blueprint(cron_bp)
-    flask_app.register_blueprint(ivf_bp)
-    flask_app.register_blueprint(sonic_fingerprint_bp)
-    flask_app.register_blueprint(path_bp)
     flask_app.register_blueprint(external_bp, url_prefix='/external')
-    flask_app.register_blueprint(alchemy_bp)
-    flask_app.register_blueprint(map_bp)
-    flask_app.register_blueprint(artist_similarity_bp)
-    flask_app.register_blueprint(clap_search_bp)
-    flask_app.register_blueprint(lyrics_search_bp)
-    flask_app.register_blueprint(sem_grove_bp)
-    flask_app.register_blueprint(backup_bp)
-    flask_app.register_blueprint(migration_bp)
-    flask_app.register_blueprint(dashboard_bp)
-    flask_app.register_blueprint(users_bp)
-    flask_app.register_blueprint(sync_bp)
-    flask_app.register_blueprint(music_servers_bp)
+    for blueprint in (
+        clustering_bp, analysis_bp, cron_bp, ivf_bp, sonic_fingerprint_bp, path_bp,
+        alchemy_bp, map_bp, artist_similarity_bp, clap_search_bp, lyrics_search_bp,
+        sem_grove_bp, backup_bp, migration_bp, dashboard_bp, users_bp, sync_bp,
+        music_servers_bp, hyperbolic_bp,
+    ):
+        flask_app.register_blueprint(blueprint)
 
     try:
         from plugin.blueprint import plugins_bp
@@ -1111,8 +1161,8 @@ def _boot_plugins_web():
 if not _is_worker:
     _boot_plugins_web()
 
-# --- Startup: Load indexes and caches (Flask server only, NOT RQ workers) ---
-# RQ workers import app.py but should NOT load indexes or start background threads.
+# --- Startup: Load indexes and caches (Flask server only, NOT queue workers) ---
+# queue workers import app.py but should NOT load indexes or start background threads.
 try:
     os.makedirs(TEMP_DIR, exist_ok=True)
 except OSError:
@@ -1134,7 +1184,7 @@ if not _is_worker:
             logger.warning(f"Failed to load artist similarity index at startup: {e}")
         # Also try to load precomputed map projection into memory if available
         try:
-            from app_helper import load_map_projection
+            from database import load_map_projection
 
             load_map_projection('main_map')
             logger.info("In-memory map projection loaded at startup.")
@@ -1196,6 +1246,74 @@ if not _is_worker:
                 )
         except Exception as e:
             logger.debug(f"SemGrove cache not loaded at startup: {e}")
+        # Load the Hyperbolic Explorer Poincare index directory (band vectors
+        # stay on disk and are decoded on demand under a memory cap).
+        try:
+            from tasks.hyperbolic_index import load_hyperbolic_index
+
+            hyper_index_servers = load_hyperbolic_index()
+            if hyper_index_servers:
+                logger.info("Hyperbolic Poincare index loaded at startup.")
+            else:
+                logger.info(
+                    "Hyperbolic Poincare index not found at startup (run analysis to build it)."
+                )
+        except Exception as e:
+            logger.debug(f"Hyperbolic Poincare index not loaded at startup: {e}")
+
+        # Every load above streams a large directory blob out of Postgres and
+        # discards it once unpacked. Those frees land in the allocator's free
+        # lists, not back in the kernel, so without this the pod's RSS keeps the
+        # startup peak for the life of the process. One call, after all six.
+        try:
+            from tasks.memory_utils import release_memory_to_os
+
+            release_memory_to_os()
+        except Exception:
+            logger.exception("Startup index load: heap release to the OS failed")
+
+        def _log_startup_index_profile():
+            try:
+                import database as _db
+                import tasks.artist_gmm_manager as _artist_mgr
+                import tasks.ivf_manager as _ivf_mgr
+                from tasks.clap_text_search import get_clap_cache_size
+                from tasks.lyrics_manager import get_cache_stats as _lyrics_stats
+                from tasks.sem_grove_manager import get_sem_grove_stats as _sg_stats
+                from tasks.hyperbolic_index import get_hyperbolic_index_stats
+
+                audio = len(_ivf_mgr.id_map) if _ivf_mgr.id_map else 0
+                artist = len(_artist_mgr.artist_map) if _artist_mgr.artist_map else 0
+                map_proj = (
+                    len(_db.MAP_PROJECTION_CACHE.get('id_map') or ())
+                    if _db.MAP_PROJECTION_CACHE
+                    else 0
+                )
+                artist_proj = (
+                    len(_db.ARTIST_PROJECTION_CACHE.get('component_map') or ())
+                    if _db.ARTIST_PROJECTION_CACHE
+                    else 0
+                )
+                clap = get_clap_cache_size()
+                lyrics = _lyrics_stats()
+                sg = _sg_stats()
+                hyper = get_hyperbolic_index_stats()
+                logger.info(
+                    "Startup index profile: audio=%d artist=%d map=%d artist_proj=%d clap=%d "
+                    "lyrics=%d semgrove=%d hyper=%d",
+                    audio,
+                    artist,
+                    map_proj,
+                    artist_proj,
+                    clap,
+                    lyrics.get('song_count', 0),
+                    sg.get('song_count', 0),
+                    hyper.get('song_count', 0),
+                )
+            except Exception:
+                logger.exception("Startup index profile logging failed")
+
+        _log_startup_index_profile()
 
         def _start_map_init_background():
             try:
@@ -1204,12 +1322,22 @@ if not _is_worker:
                 logger.info('Starting background map JSON cache build.')
                 with app.app_context():
                     init_map_cache()
+                from tasks.memory_utils import release_memory_to_os
+
+                release_memory_to_os()
                 logger.info('Background map JSON cache build finished.')
             except Exception:
                 logger.exception('Background init_map_cache failed')
 
         t = threading.Thread(target=_start_map_init_background, daemon=True)
         t.start()
+
+        # The Hyperbolic Explorer tree cache is NOT loaded here: unlike the
+        # indexes above it is a fully materialized Python object tree whose RSS
+        # scales with catalogue size, so it lazy-loads on the first /hyperbolic
+        # page open (warmup_hyperbolic_tree_cache, called from the page and from
+        # the tree API) and auto-unloads after HYPERBOLIC_TREE_WARMUP_DURATION
+        # idle seconds instead of staying resident for the life of the process.
 
 # --- Start Background Listener Thread (Flask server only) ---
 if not _is_worker:
@@ -1220,7 +1348,12 @@ if not _is_worker:
     def _cron_manager_loop():
         try:
             import time as _time
-            from app_cron import run_due_cron_jobs, reap_interrupted_inline_runs
+            from app_cron import (
+                run_due_cron_jobs,
+                retry_due_cron_jobs,
+                reap_interrupted_inline_runs,
+                cron_retry_interval_seconds,
+            )
 
             # Inline cron runs (the alchemy radio) live in THIS process and nothing
             # else writes their final status, so a restart mid-run leaves a row that
@@ -1232,10 +1365,14 @@ if not _is_worker:
             except Exception:
                 app.logger.exception('cron manager startup reap failed')
 
+            last_retry_ts = _time.time()
             while True:
                 try:
                     with app.app_context():
                         run_due_cron_jobs()
+                        if _time.time() - last_retry_ts >= cron_retry_interval_seconds():
+                            retry_due_cron_jobs()
+                            last_retry_ts = _time.time()
                 except Exception:
                     app.logger.exception('cron manager failed')
                 # Sleep to the next minute boundary, not a flat 60s. A flat sleep
@@ -1288,8 +1425,17 @@ if not _is_worker:
 
     dashboard_stats_thread = threading.Thread(target=_dashboard_stats_refresher_loop, daemon=True)
     dashboard_stats_thread.start()
+
+    # Reclaim the dead rows autovacuum will never get to (its threshold counts
+    # ROWS, so a table of a few huge blobs never qualifies). Runs in the WEB
+    # process, not the worker: a restore stops Flask before psql replaces the
+    # database, so this daemon thread is already dead by the time a restore takes
+    # its ACCESS EXCLUSIVE locks. Hourly, on its own connection.
+    from taskqueue.maintenance import start_blob_reclaim_thread
+
+    start_blob_reclaim_thread(app)
 else:
-    logger.info('Running as RQ worker: skipping index loading, Redis listener, and cron thread.')
+    logger.info('Running as a queue worker: skipping index loading, the event listener and the cron thread.')
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=8000)

@@ -15,16 +15,17 @@ Main Features:
 * Minimum-size filter drops small playlists and keeps exact-threshold ones
 * Title/artist dedup normalizes remastered/explicit markers and is case-insensitive
 * Distance filtering drops near-duplicate vectors, falls back to title/artist dedup
-  when vectors are missing, and select_top_n_diverse picks the largest first
+  when vectors are missing, and diverse Top-N selection picks the largest first
 """
 
 import numpy as np
+import pytest
 from unittest.mock import MagicMock, patch
 from tasks.clustering_postprocessing import (
     apply_minimum_size_filter_to_clustering_result,
     apply_title_artist_deduplication,
     apply_distance_filtering_direct,
-    select_top_n_diverse_playlists,
+    select_diverse_playlists_with_genre_coverage,
 )
 
 
@@ -56,17 +57,32 @@ class TestMinimumSizeFilter:
 
         assert len(filtered["named_playlists"]) == 2
 
-    def test_handles_empty_playlists(self):
-        best_result = {"named_playlists": {}}
+    @pytest.mark.parametrize(
+        "result_without_playlists",
+        [None, {}, {"named_playlists": {}}],
+    )
+    def test_returns_the_caller_object_itself_when_there_are_no_playlists_to_filter(
+        self, result_without_playlists
+    ):
+        filtered = apply_minimum_size_filter_to_clustering_result(
+            result_without_playlists, min_size=10
+        )
+
+        assert filtered is result_without_playlists
+
+    def test_returns_a_new_result_with_an_empty_playlist_map_when_every_playlist_is_too_small(self):
+        songs = [("s1", "T1", "A1")] * 3
+        best_result = {
+            "named_playlists": {"Tiny": songs},
+            "playlist_centroids": {"Tiny": np.array([1.0, 0.0])},
+        }
 
         filtered = apply_minimum_size_filter_to_clustering_result(best_result, min_size=10)
 
+        assert filtered is not best_result
         assert filtered["named_playlists"] == {}
-
-    def test_handles_none_result(self):
-        filtered = apply_minimum_size_filter_to_clustering_result(None, min_size=10)
-
-        assert filtered is None
+        assert filtered["playlist_centroids"] == {}
+        assert best_result["named_playlists"] == {"Tiny": songs}
 
     def test_min_size_zero_keeps_all(self):
         best_result = {
@@ -160,24 +176,28 @@ class TestTitleArtistDeduplication:
 
         assert len(filtered) == 2
 
-    def test_handles_empty_list(self):
+    def test_returns_empty_for_an_empty_song_list_without_opening_a_cursor(self):
         mock_db = MagicMock()
 
         filtered = apply_title_artist_deduplication([], mock_db)
 
         assert filtered == []
+        mock_db.cursor.assert_not_called()
 
-    def test_handles_missing_song_details(self):
+    def test_skips_songs_with_no_score_row_and_keeps_the_ones_that_have_one(self):
         mock_db = MagicMock()
         mock_cursor = MagicMock()
-        mock_cursor.fetchall.return_value = []
+        mock_cursor.fetchall.return_value = [
+            {'item_id': 's2', 'title': 'Kept Song', 'author': 'Artist'},
+        ]
         mock_db.cursor.return_value.__enter__.return_value = mock_cursor
 
-        song_results = [{'item_id': 's1'}]
+        song_results = [{'item_id': 's1'}, {'item_id': 's2'}]
 
         filtered = apply_title_artist_deduplication(song_results, mock_db)
 
-        assert len(filtered) == 0
+        assert filtered == [{'item_id': 's2'}]
+        assert mock_cursor.execute.call_args[0][1] == (['s1', 's2'],)
 
 
 class TestDistanceFilteringDirect:
@@ -252,7 +272,7 @@ class TestDistanceFilteringDirect:
         assert filtered == song_results
 
 
-class TestSelectTopNDiversePlaylists:
+class TestSelectDiversePlaylists:
     def test_selects_diverse_playlists(self):
         best_result = {
             "playlist_to_centroid_vector_map": {
@@ -272,11 +292,11 @@ class TestSelectTopNDiversePlaylists:
             },
         }
 
-        selected = select_top_n_diverse_playlists(best_result, n=2)
+        selected = select_diverse_playlists_with_genre_coverage(best_result, limit=2)
 
         assert len(selected["named_playlists"]) == 2
 
-    def test_returns_all_when_n_exceeds_available(self):
+    def test_returns_all_when_limit_exceeds_available(self):
         best_result = {
             "playlist_to_centroid_vector_map": {
                 "Playlist 1": np.array([1.0, 0.0]),
@@ -292,7 +312,7 @@ class TestSelectTopNDiversePlaylists:
             },
         }
 
-        selected = select_top_n_diverse_playlists(best_result, n=5)
+        selected = select_diverse_playlists_with_genre_coverage(best_result, limit=5)
 
         assert len(selected["named_playlists"]) == 2
 
@@ -315,19 +335,12 @@ class TestSelectTopNDiversePlaylists:
             },
         }
 
-        selected = select_top_n_diverse_playlists(best_result, n=2)
+        selected = select_diverse_playlists_with_genre_coverage(best_result, limit=2)
 
         assert "Large" in selected["named_playlists"]
 
 
 class TestEdgeCases:
-    def test_minimum_size_filter_with_missing_key(self):
-        best_result = {}
-
-        filtered = apply_minimum_size_filter_to_clustering_result(best_result, min_size=10)
-
-        assert filtered is not None
-
     def test_title_dedup_with_unicode(self):
         mock_db = MagicMock()
         mock_cursor = MagicMock()

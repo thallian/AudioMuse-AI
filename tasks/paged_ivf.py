@@ -48,7 +48,10 @@ from psycopg2.extras import execute_values
 
 import config
 
+from cpu_budget import usable_cpu_count
+
 from . import ivf_quant as quant
+from .index_availability import active_availability_scope, build_availability_mask
 
 logger = logging.getLogger(__name__)
 
@@ -342,9 +345,6 @@ class _CellLruCache:
         self._cells[cell_id] = (ids, vecs)
         self._bytes += size
 
-    def has_cell(self, cell_id: int) -> bool:
-        return cell_id in self._cells
-
     def get_cell(self, cell_id: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         entry = self._cells.get(cell_id)
         if entry is not None:
@@ -447,11 +447,6 @@ class _GlobalCellCache:
                 old_ids, old_vecs = self._cells.pop(k)
                 self._bytes -= self._entry_bytes(old_ids, old_vecs)
 
-    def clear(self) -> None:
-        with self._lock:
-            self._cells.clear()
-            self._bytes = 0
-
     def resident_bytes(self) -> int:
         with self._lock:
             return self._bytes
@@ -500,10 +495,7 @@ _QUERY_THREAD_PREFIX = "ivf-query"
 
 
 def _query_worker_count() -> int:
-    try:
-        cpu = len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        cpu = os.cpu_count() or 1
+    cpu = usable_cpu_count() or os.cpu_count() or 1
     return max(cpu // 2, 1)
 
 
@@ -526,15 +518,6 @@ def _query_thread_pool():
 
 def _in_query_pool_thread() -> bool:
     return threading.current_thread().name.startswith(_QUERY_THREAD_PREFIX)
-
-
-def shutdown_query_pool() -> None:
-    global _QUERY_THREAD_POOL
-    with _QUERY_THREAD_POOL_LOCK:
-        pool = _QUERY_THREAD_POOL
-        _QUERY_THREAD_POOL = None
-    if pool is not None:
-        pool.shutdown(wait=True)
 
 
 _BLAS_LIMITER = None
@@ -569,37 +552,6 @@ def invalidate_availability_cache(server_id=None):
         sid = str(server_id)
         for key in [key for key in _AVAILABILITY_CACHE if key[1] == sid]:
             _AVAILABILITY_CACHE.pop(key, None)
-
-
-def active_availability_scope():
-    """Return the current request/job server, or None for union/background scope.
-
-    An unknown or disabled requested server maps to a fail-closed sentinel scope;
-    any other resolution error fails open to None (union scope).
-    """
-    try:
-        from tasks.mediaserver import context
-
-        active = context.active_server_id()
-        if active:
-            return str(active)
-    except Exception:
-        pass
-    try:
-        from flask import has_request_context
-
-        if not has_request_context():
-            return None
-        from app_server_context import resolve_request_server_id
-        from tasks.mediaserver import registry
-
-        requested = resolve_request_server_id()
-        return str(requested or registry.get_default_server_id() or '') or None
-    except ValueError:
-        return '__invalid_server__'
-    except Exception:
-        logger.exception("Could not resolve request availability scope")
-        return None
 
 
 def end_all_requests() -> None:
@@ -882,36 +834,7 @@ class PagedIvfIndex:
             cached = _AVAILABILITY_CACHE.get(key)
             if cached is not None and now - cached[0] < _AVAILABILITY_CACHE_TTL:
                 return cached[1]
-        conn = self._conn_factory()
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT is_default, updated_at FROM music_servers WHERE server_id = %s",
-                (server_id,),
-            )
-            row = cur.fetchone()
-            is_default = bool(row[0]) if row else False
-            token = str(row[1]) if row else None
-            if cached is not None and token is not None and token == cached[2]:
-                with _AVAILABILITY_CACHE_LOCK:
-                    _AVAILABILITY_CACHE[key] = (now, cached[1], token)
-                return cached[1]
-            cur.execute(
-                "SELECT item_id FROM track_server_map WHERE server_id = %s",
-                (server_id,),
-            )
-            available = {str(row[0]) for row in cur.fetchall()}
-        if is_default:
-            from tasks.simhash import is_fingerprint_id
-
-            available.update(
-                item_id for item_id in self._item_ids
-                if not is_fingerprint_id(item_id)
-            )
-        mask = np.fromiter(
-            (item_id in available for item_id in self._item_ids),
-            dtype=np.bool_,
-            count=self._n_items,
-        )
+        mask = build_availability_mask(server_id, self._item_ids, self._conn_factory)
         with _AVAILABILITY_CACHE_LOCK:
             stale_keys = [
                 cached_key for cached_key, cached_value in _AVAILABILITY_CACHE.items()
@@ -920,7 +843,7 @@ class PagedIvfIndex:
             ]
             for stale_key in stale_keys:
                 _AVAILABILITY_CACHE.pop(stale_key, None)
-            _AVAILABILITY_CACHE[key] = (now, mask, token)
+            _AVAILABILITY_CACHE[key] = (now, mask)
         return mask
 
     def __len__(self) -> int:
@@ -1049,9 +972,6 @@ class PagedIvfIndex:
 
     def _cell_distances(self, qp: np.ndarray, vecs: np.ndarray) -> np.ndarray:
         return quant.cell_distances(self._metric, self._storage_dtype, qp, vecs, self._normalized)
-
-    def _distances(self, q: np.ndarray, vecs: np.ndarray) -> np.ndarray:
-        return self._cell_distances(self._prep_query(q), vecs)
 
     def _distances_over_cells(self, q: np.ndarray, vecs_list: List[np.ndarray]) -> List[np.ndarray]:
         n_cells = len(vecs_list)
@@ -1552,11 +1472,14 @@ def build_and_store_paged_ivf(
 
 
 def has_paged_ivf(db_conn, index_name: str) -> bool:
-    from .index_build_helpers import load_segmented_blob
+    from .index_build_helpers import segmented_blob_complete, segmented_blob_length
 
     try:
-        blob = load_segmented_blob(db_conn, IVF_DIR_TABLE, f"{index_name}__ivf_dir")
-        return blob is not None and len(blob) >= _HEADER_SIZE
+        name = f"{index_name}__ivf_dir"
+        if not segmented_blob_complete(db_conn, IVF_DIR_TABLE, name):
+            return False
+        size = segmented_blob_length(db_conn, IVF_DIR_TABLE, name)
+        return size is not None and size >= _HEADER_SIZE
     except Exception:
         return False
 
@@ -1633,7 +1556,7 @@ def load_paged_ivf_index(
         return None
 
     if conn_factory is None:
-        from app_helper import get_db
+        from database import get_db
 
         conn_factory = get_db
 

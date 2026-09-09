@@ -5,9 +5,10 @@ var serverFields = {
         {name: 'JELLYFIN_TOKEN', label: 'Jellyfin API token', placeholder: 'your-api-token', tooltip: 'API key for that Jellyfin user. Create one in Jellyfin under Dashboard \u2192 API Keys.'}
     ],
     navidrome: [
-        {name: 'NAVIDROME_URL', label: 'Navidrome URL', placeholder: 'http://your-navidrome-server:4533', tooltip: 'Base URL of your Navidrome server, including http:// or https:// and the port.'},
-        {name: 'NAVIDROME_USER', label: 'Navidrome username', placeholder: 'your-username', tooltip: 'Username of a Navidrome account that can read the music library.'},
-        {name: 'NAVIDROME_PASSWORD', label: 'Navidrome password', placeholder: 'your-password', tooltip: 'Password for the Navidrome user above.'}
+        {name: 'NAVIDROME_URL', label: 'Navidrome / OpenSubsonic URL', placeholder: 'http://your-navidrome-server:4533', tooltip: 'Base URL of your Navidrome or other OpenSubsonic server, including http:// or https:// and the port.', required: true, authGroup: 'always'},
+        {name: 'NAVIDROME_USER', label: 'Username', placeholder: 'your-username', tooltip: 'OpenSubsonic username used with password authentication.', required: true, authGroup: 'password'},
+        {name: 'NAVIDROME_PASSWORD', label: 'Password', placeholder: 'your-password', tooltip: 'OpenSubsonic password used with username authentication.', required: true, authGroup: 'password'},
+        {name: 'NAVIDROME_API_KEY', label: 'OpenSubsonic API key', placeholder: 'your-api-key', tooltip: 'OpenSubsonic apiKeyAuthentication token. When this mode is selected, username/password are not sent (do not combine with u=).', required: true, authGroup: 'apikey'}
     ],
     lyrion: [
         {name: 'LYRION_URL', label: 'Lyrion URL', placeholder: 'http://your-lyrion-server:9000', tooltip: 'Base URL of your Lyrion (Logitech Media Server) instance, including http:// and the port.'}
@@ -262,6 +263,76 @@ function createInputField(field, value) {
     return row;
 }
 
+function detectNavidromeAuthMode(values, hasValueMap) {
+    values = values || {};
+    hasValueMap = hasValueMap || {};
+    var keyValue = values.NAVIDROME_API_KEY || '';
+    if (hasValueMap.NAVIDROME_API_KEY || (keyValue && keyValue !== '********')) {
+        return 'apikey';
+    }
+    return 'password';
+}
+
+function getNavidromeAuthMode() {
+    var selected = document.querySelector('input[name="navidrome_auth_mode"]:checked');
+    return selected ? selected.value : 'password';
+}
+
+function applyNavidromeAuthMode() {
+    var mode = getNavidromeAuthMode();
+    var rows = serverConfigFields.querySelectorAll('[data-auth-group]');
+    for (var row of rows) {
+        var group = row.dataset.authGroup;
+        var active = (group === 'always') || (group === mode);
+        row.style.display = active ? '' : 'none';
+        var input = row.querySelector('input, textarea, select');
+        if (!input) {
+            continue;
+        }
+        input.disabled = !active;
+        input.required = active && (group === 'always' || group === mode);
+        if (active && !input.value && input.dataset.originalValue) {
+            input.value = input.dataset.originalValue;
+        }
+    }
+    updateTestButtonState();
+}
+
+function renderNavidromeAuthModeSelector(initialMode) {
+    var row = document.createElement('div');
+    row.className = 'field-row';
+    row.id = 'navidrome-auth-mode-row';
+    var label = document.createElement('label');
+    label.textContent = 'Authentication method';
+    label.classList.add('required-label');
+    row.appendChild(label);
+
+    function addOption(value, text) {
+        var optLabel = document.createElement('label');
+        optLabel.style.display = 'flex';
+        optLabel.style.alignItems = 'center';
+        optLabel.style.gap = '0.5rem';
+        optLabel.style.fontWeight = '500';
+        optLabel.style.marginBottom = '0.35rem';
+        var input = document.createElement('input');
+        input.type = 'radio';
+        input.name = 'navidrome_auth_mode';
+        input.value = value;
+        input.checked = (initialMode === value);
+        input.addEventListener('change', applyNavidromeAuthMode);
+        optLabel.appendChild(input);
+        optLabel.appendChild(document.createTextNode(text));
+        row.appendChild(optLabel);
+    }
+
+    addOption('password', 'Username + password (classic OpenSubsonic / Navidrome)');
+    addOption('apikey', 'OpenSubsonic API key (apiKeyAuthentication)');
+    var hint = document.createElement('small');
+    hint.textContent = 'Choose one method. API key mode sends apiKey= and does not send u=/p=.';
+    row.appendChild(hint);
+    return row;
+}
+
 function renderServerFields(serverType, values, hasValueMap) {
     hasValueMap = hasValueMap || {};
     serverConfigFields.innerHTML = '';
@@ -270,13 +341,17 @@ function renderServerFields(serverType, values, hasValueMap) {
         return;
     }
     var fields = serverFields[serverType];
+    var authMode = (serverType === 'navidrome')
+        ? detectNavidromeAuthMode(values, hasValueMap)
+        : null;
+    var authModeRowInserted = false;
     fields.forEach(function(field) {
         var value = '';
         if (values[field.name]) {
             value = values[field.name];
         }
         var secret = false;
-        var secretKeys = ['NAVIDROME_PASSWORD', 'AUDIOMUSE_PASSWORD', 'API_TOKEN', 'JELLYFIN_TOKEN', 'EMBY_TOKEN', 'PLEX_TOKEN'];
+        var secretKeys = ['NAVIDROME_PASSWORD', 'NAVIDROME_API_KEY', 'AUDIOMUSE_PASSWORD', 'API_TOKEN', 'JELLYFIN_TOKEN', 'EMBY_TOKEN', 'PLEX_TOKEN'];
         for (var i = 0; i < secretKeys.length; i++) {
             if (secretKeys[i] === field.name) {
                 secret = true;
@@ -292,18 +367,29 @@ function renderServerFields(serverType, values, hasValueMap) {
                 hasValue = true;
             }
         }
+        if (serverType === 'navidrome' && field.authGroup === 'password' && !authModeRowInserted) {
+            serverConfigFields.appendChild(renderNavidromeAuthModeSelector(authMode));
+            authModeRowInserted = true;
+        }
         var fieldCopy = {
             name: field.name,
             label: field.label,
             placeholder: field.placeholder,
-            required: true,
+            required: field.required !== false,
             secret: secret,
             has_value: hasValue,
             tooltip: field.tooltip,
             originalValue: originalValues[field.name] !== undefined ? originalValues[field.name] : value
         };
-        serverConfigFields.appendChild(createInputField(fieldCopy, value));
+        var row = createInputField(fieldCopy, value);
+        if (field.authGroup) {
+            row.dataset.authGroup = field.authGroup;
+        }
+        serverConfigFields.appendChild(row);
     });
+    if (serverType === 'navidrome') {
+        applyNavidromeAuthMode();
+    }
     maybeRenderPlexPin(serverType);
     updateTestButtonState();
 }
@@ -338,10 +424,17 @@ var ADVANCED_SECTIONS = [
     {
         title: 'Audio Analysis',
         items: [
-            'NUM_RECENT_ALBUMS', 'TOP_N_MOODS', 'CLAP_ENABLED', 'CLAP_PYTHON_MULTITHREADS',
-            'PER_SONG_MODEL_RELOAD', 'CLAP_TOP_QUERIES_COUNT', 'CLAP_TEXT_SEARCH_WARMUP_DURATION',
-            'ENERGY_MIN', 'ENERGY_MAX', 'AUDIO_LOAD_TIMEOUT', 'REBUILD_INDEX_BATCH_SIZE',
-            'MAX_QUEUED_ANALYSIS_JOBS'
+            'NUM_RECENT_ALBUMS', 'TOP_N_MOODS', 'ANALYSIS_MONITOR_DB_INTERVAL',
+            'ANALYSIS_STALL_TIMEOUT_MINUTES', 'ANALYSIS_MAX_STALL_GIVE_UPS',
+            'CLAP_ENABLED', 'CLAP_PYTHON_MULTITHREADS', 'PER_SONG_MODEL_RELOAD',
+            'MUSICNN_BATCH_SIZE'
+        ]
+    },
+    {
+        title: 'Catalogue Identity & Chromaprint',
+        items: [
+            'CATALOGUE_ID_SCHEME_VERSION', 'CHROMAPRINT_COLLECTION_ENABLED',
+            'CHROMAPRINT_GATE_ENABLED', 'CHROMAPRINT_MATCH_THRESHOLD'
         ]
     },
     {
@@ -350,19 +443,45 @@ var ADVANCED_SECTIONS = [
             'ENABLE_CLUSTERING_EMBEDDINGS', 'CLUSTER_ALGORITHM', 'MAX_SONGS_PER_CLUSTER',
             'MAX_SONGS_PER_ARTIST', 'MAX_DISTANCE', 'CLUSTERING_RUNS', 'TOP_N_CLUSTERING_PLAYLIST',
             'MIN_PLAYLIST_SIZE_FOR_TOP_N', 'USE_GPU_CLUSTERING', 'CLUSTERING_CLEANING',
-            'ITERATIONS_PER_BATCH_JOB', 'MAX_CONCURRENT_BATCH_JOBS', 'DB_FETCH_CHUNK_SIZE',
-            'CLUSTERING_BATCH_TIMEOUT_MINUTES', 'CLUSTERING_MAX_FAILED_BATCHES',
-            'CLUSTERING_BATCH_CHECK_INTERVAL_SECONDS',
-            'TOP_N_ELITES', 'EXPLOITATION_START_FRACTION', 'EXPLOITATION_PROBABILITY_CONFIG',
-            'MUTATION_INT_ABS_DELTA', 'MUTATION_FLOAT_ABS_DELTA', 'MUTATION_KMEANS_COORD_FRACTION',
-            'TOP_K_MOODS_FOR_PURITY_CALCULATION', 'SCORE_WEIGHT_DIVERSITY', 'SCORE_WEIGHT_PURITY',
-            'SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY', 'SCORE_WEIGHT_OTHER_FEATURE_PURITY',
-            'SCORE_WEIGHT_SILHOUETTE', 'SCORE_WEIGHT_DAVIES_BOULDIN', 'SCORE_WEIGHT_CALINSKI_HARABASZ',
+            'CLUSTERING_SUBSET_SONGS', 'CLUSTERING_EARLY_STOP_BATCHES',
+            'CLUSTERING_STALL_TIMEOUT_MINUTES', 'CLUSTERING_MAX_STALL_GIVE_UPS'
+        ]
+    },
+    {
+        title: 'Clustering Auto-Calibration',
+        items: [
+            'CLUSTERING_AUTO_CALIBRATION', 'CLUSTERING_MAX_PLAYLIST_SONGS',
+            'CLUSTERING_CALIBRATION_MAX_TRIES'
+        ]
+    },
+    {
+        title: 'Clustering Algorithm Ranges',
+        items: [
             'NUM_CLUSTERS_MIN', 'NUM_CLUSTERS_MAX',
             'DBSCAN_EPS_MIN', 'DBSCAN_EPS_MAX', 'DBSCAN_MIN_SAMPLES_MIN', 'DBSCAN_MIN_SAMPLES_MAX',
             'GMM_N_COMPONENTS_MIN', 'GMM_N_COMPONENTS_MAX', 'GMM_COVARIANCE_TYPE',
             'SPECTRAL_N_CLUSTERS_MIN', 'SPECTRAL_N_CLUSTERS_MAX', 'SPECTRAL_N_NEIGHBORS',
-            'PCA_COMPONENTS_MIN', 'PCA_COMPONENTS_MAX',
+            'PCA_COMPONENTS_MIN', 'PCA_COMPONENTS_MAX'
+        ]
+    },
+    {
+        title: 'Clustering Evolutionary Search',
+        items: [
+            'TOP_N_ELITES', 'EXPLOITATION_START_FRACTION', 'EXPLOITATION_PROBABILITY_CONFIG',
+            'MUTATION_INT_ABS_DELTA', 'MUTATION_FLOAT_ABS_DELTA', 'MUTATION_KMEANS_COORD_FRACTION'
+        ]
+    },
+    {
+        title: 'Clustering Scoring Weights',
+        items: [
+            'TOP_K_MOODS_FOR_PURITY_CALCULATION', 'SCORE_WEIGHT_DIVERSITY', 'SCORE_WEIGHT_PURITY',
+            'SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY', 'SCORE_WEIGHT_OTHER_FEATURE_PURITY',
+            'SCORE_WEIGHT_SILHOUETTE', 'SCORE_WEIGHT_DAVIES_BOULDIN', 'SCORE_WEIGHT_CALINSKI_HARABASZ'
+        ]
+    },
+    {
+        title: 'Clustering Stratified Sampling',
+        items: [
             'MIN_SONGS_PER_GENRE_FOR_STRATIFICATION', 'STRATIFIED_SAMPLING_TARGET_PERCENTILE',
             'SAMPLING_PERCENTAGE_CHANGE_PER_RUN'
         ]
@@ -371,34 +490,50 @@ var ADVANCED_SECTIONS = [
         title: 'Similarity & IVF Index',
         items: [
             'SIMILARITY_ELIMINATE_DUPLICATES_DEFAULT', 'SIMILARITY_RADIUS_DEFAULT', 'IVF_METRIC',
-            'IVF_NPROBE', 'IVF_NLIST_MAX', 'IVF_TRAIN_POINTS_PER_CELL', 'IVF_MAX_CELL_MB',
+            'IVF_NPROBE', 'IVF_RERANK_OVERFETCH', 'IVF_NLIST_MAX', 'IVF_STORAGE_DTYPE',
+            'IVF_TRAIN_POINTS_PER_CELL', 'IVF_MAX_CELL_MB',
             'IVF_MAX_PART_SIZE_MB', 'IVF_QUERY_CACHE_MB', 'IVF_READ_BATCH_CELLS', 'IVF_GLOBAL_CACHE_MB',
             'IVF_PRELOAD_ALL', 'IVF_GLOBAL_CACHE_IDLE_SECONDS', 'IVF_RESULT_CACHE_SECONDS',
             'IVF_RESULT_CACHE_MAX', 'IVF_MAX_DISTANCE_NPROBE', 'IVF_DISK_CACHE_ENABLED',
-            'IVF_DISK_CACHE_IDLE_SECONDS'
+            'IVF_DISK_CACHE_IDLE_SECONDS', 'IVF_LAZY_LOAD_RETRY_SECONDS', 'INDEX_BUILD_WORKERS'
         ]
     },
     {
         title: 'Duplicate & Mood Filtering',
         items: [
-            'DUPLICATE_DISTANCE_THRESHOLD_COSINE', 'DUPLICATE_DISTANCE_THRESHOLD_COSINE_LYRICS',
-            'DUPLICATE_DISTANCE_THRESHOLD_EUCLIDEAN', 'DUPLICATE_DISTANCE_CHECK_LOOKBACK',
-            'MOOD_SIMILARITY_THRESHOLD', 'MOOD_SIMILARITY_ENABLE'
+            'DUPLICATE_DISTANCE_THRESHOLD_COSINE', 'DUPLICATE_DISTANCE_THRESHOLD_EUCLIDEAN',
+            'DUPLICATE_DISTANCE_THRESHOLD_COSINE_LYRICS',
+            'DUPLICATE_DISTANCE_THRESHOLD_COSINE_LYRICS_TEXT',
+            'DUPLICATE_DISTANCE_THRESHOLD_COSINE_LYRICS_AXIS',
+            'DUPLICATE_DISTANCE_THRESHOLD_HYPERBOLIC',
+            'DUPLICATE_DISTANCE_THRESHOLD_COSINE_CLAP',
+            'DUPLICATE_DISTANCE_CHECK_LOOKBACK',
+            'MOOD_SIMILARITY_THRESHOLD', 'MOOD_SIMILARITY_ENABLE', 'MOOD_SCORE_MATCH_THRESHOLD'
         ]
     },
     {
         title: 'Song Path',
         items: [
-            'PATH_DISTANCE_METRIC', 'PATH_DEFAULT_LENGTH', 'PATH_AVG_JUMP_SAMPLE_SIZE',
-            'PATH_CANDIDATES_PER_STEP', 'PATH_LCORE_MULTIPLIER', 'PATH_FIX_SIZE'
+            'PATH_DISTANCE_METRIC', 'PATH_DEFAULT_LENGTH', 'PATH_FIX_SIZE'
         ]
     },
     {
         title: 'Song Alchemy',
         items: [
-            'ALCHEMY_DEFAULT_N_RESULTS', 'ALCHEMY_MAX_N_RESULTS', 'ALCHEMY_TEMPERATURE',
-            'ALCHEMY_SUBTRACT_DISTANCE_ANGULAR', 'ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN',
-            'ALCHEMY_PLAYLIST_MAX_SONGS', 'ALCHEMY_PLAYLIST_MAX_CENTROIDS', 'ALCHEMY_MAX_ANCHOR_POINTS'
+            'ALCHEMY_DEFAULT_N_RESULTS', 'ALCHEMY_MAX_N_RESULTS', 'ALCHEMY_TEMPERATURE'
+        ]
+    },
+    {
+        title: 'Hyperbolic Explorer',
+        items: [
+            'HYPERBOLIC_DEFAULT_LIMIT', 'HYPERBOLIC_RADIAL_SPREAD',
+            'HYPERBOLIC_CANDIDATE_OVERFETCH', 'HYPERBOLIC_RADIUS_SCALE',
+            'HYPERBOLIC_RADIUS_PERCENTILE', 'HYPERBOLIC_TARGET_LEAF_SIZE',
+            'HYPERBOLIC_MIN_CLUSTER_SIZE', 'HYPERBOLIC_TREE_WARMUP_DURATION',
+            'HYPERBOLIC_JOURNEY_DEFAULT_LENGTH',
+            'HYPERBOLIC_JOURNEY_ANCESTRY_DIVE', 'HYPERBOLIC_JOURNEY_PATH_SAMPLES',
+            'HYPERBOLIC_INDEX_CACHE_MB',
+            'HYPERBOLIC_JOURNEY_CANDIDATES_PER_STEP'
         ]
     },
     {
@@ -420,11 +555,39 @@ var ADVANCED_SECTIONS = [
         ]
     },
     {
-        title: 'AI Naming & Chat',
+        title: 'AI Provider & Playlist Naming',
         items: [
             'AI_MODEL_PROVIDER', 'AI_REQUEST_TIMEOUT_SECONDS', 'MAX_SONGS_IN_AI_PROMPT',
             'OLLAMA_SERVER_URL', 'OLLAMA_MODEL_NAME', 'OPENAI_SERVER_URL', 'OPENAI_MODEL_NAME',
-            'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GEMINI_MODEL_NAME', 'MISTRAL_API_KEY', 'MISTRAL_MODEL_NAME'
+            'OPENAI_API_KEY', 'GEMINI_API_KEY', 'GEMINI_MODEL_NAME', 'MISTRAL_API_KEY',
+            'MISTRAL_MODEL_NAME', 'CLUSTER_NAMING_AI_HISTORY', 'PLAYLIST_NAME_HISTORY_ROUNDS'
+        ]
+    },
+    {
+        title: 'Instant Playlist & AI Tool-Calling',
+        items: [
+            'INSTANT_PLAYLIST_DEFAULT_N_RESULTS', 'INSTANT_PLAYLIST_MAX_N_RESULTS',
+            'MAX_SONGS_PER_ARTIST_PLAYLIST', 'PLAYLIST_ENERGY_ARC', 'AI_MAX_TOOL_CALLS',
+            'AI_TOOLCALL_TEMPERATURE', 'AI_TOOLCALL_TOP_P', 'AI_TOOLCALL_TOP_K',
+            'AI_TOOLCALL_MIN_P', 'AI_TOOLCALL_NUM_PREDICT'
+        ]
+    },
+    {
+        title: 'Cleaning & Scheduled Tasks',
+        items: [
+            'CLEANING_SAFETY_LIMIT', 'CLEANING_CATALOGUE', 'SWEEP_PRUNE_MIN_FETCH_RATIO',
+            'CRON_RETRY_MAX_MINUTES', 'CRON_RETRY_INTERVAL_MINUTES'
+        ]
+    },
+    {
+        title: 'Plugin System',
+        items: [
+            'PLUGINS_ENABLED', 'PLUGIN_DEFAULT_REPO_URL', 'PLUGIN_MAX_DOWNLOAD_MB',
+            'PLUGIN_ALLOW_PIP', 'PLUGIN_HTTP_CONNECT_TIMEOUT', 'PLUGIN_HTTP_READ_TIMEOUT',
+            'PLUGIN_HTTP_RETRIES', 'PLUGIN_HTTP_BACKOFF', 'PLUGIN_HTTP_FORCE_IPV4',
+            'PLUGIN_CATALOG_FETCH_WORKERS', 'PLUGIN_CATALOG_CACHE_TTL',
+            'PLUGIN_CATALOG_REFRESH_INTERVAL', 'PLUGIN_BOOT_DB_WAIT_SECONDS',
+            'PLUGIN_BOOT_DB_WAIT_INTERVAL'
         ]
     }
 ];
@@ -625,7 +788,7 @@ function loadSetupData() {
 
 function saveCurrentServerValues() {
     var currentServerType = document.getElementById('MEDIASERVER_TYPE').value;
-    var keys = ['JELLYFIN_URL', 'JELLYFIN_USER_ID', 'JELLYFIN_TOKEN', 'NAVIDROME_URL', 'NAVIDROME_USER', 'NAVIDROME_PASSWORD', 'LYRION_URL', 'EMBY_URL', 'EMBY_USER_ID', 'EMBY_TOKEN', 'PLEX_URL', 'PLEX_TOKEN'];
+    var keys = ['JELLYFIN_URL', 'JELLYFIN_USER_ID', 'JELLYFIN_TOKEN', 'NAVIDROME_URL', 'NAVIDROME_USER', 'NAVIDROME_PASSWORD', 'NAVIDROME_API_KEY', 'LYRION_URL', 'EMBY_URL', 'EMBY_USER_ID', 'EMBY_TOKEN', 'PLEX_URL', 'PLEX_TOKEN'];
     keys.forEach(function(key) {
         var input = document.getElementById(key);
         if (input) {
@@ -673,9 +836,22 @@ function splitLibraryList(value) {
     return String(value).split(',').map(function(s) { return s.trim(); }).filter(Boolean);
 }
 
+function navidromeCredsHaveSavedValues(secretHasValue, basicData) {
+    if (!basicData?.NAVIDROME_URL) {
+        return false;
+    }
+    var hasKey = !!secretHasValue?.NAVIDROME_API_KEY;
+    var hasUser = !!basicData.NAVIDROME_USER;
+    var hasPass = !!secretHasValue?.NAVIDROME_PASSWORD;
+    return hasKey || (hasUser && hasPass);
+}
+
 function providerCredsHaveSavedValues(serverType, secretHasValue, basicData) {
     var fields = serverFields[serverType];
     if (!fields) return false;
+    if (serverType === 'navidrome') {
+        return navidromeCredsHaveSavedValues(secretHasValue, basicData);
+    }
     for (var i = 0; i < fields.length; i++) {
         var name = fields[i].name;
         // For secret fields the server returns has_value=true when a value is
@@ -705,10 +881,14 @@ function fetchProviderLibraries(serverType, configOverride) {
     var configPayload = configOverride || collectConfigFromForm(true);
     // MEDIASERVER_TYPE may be dropped by collectConfigFromForm if unchanged.
     configPayload.MEDIASERVER_TYPE = serverType;
+    var librariesPayload = { config: configPayload };
+    if (serverType === 'navidrome') {
+        librariesPayload.navidrome_auth_mode = getNavidromeAuthMode();
+    }
     fetch('/api/setup/providers/libraries', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config: configPayload })
+        body: JSON.stringify(librariesPayload)
     }).then(function(resp) {
         return resp.json().then(function(data) {
             if (!resp.ok) {
@@ -963,10 +1143,14 @@ function testConnection() {
     testFeedback.style.display = 'block';
     testFeedback.textContent = 'Testing connection...';
     var config = collectConfigFromForm(true);
+    var payload = { config: config, test_connection: true };
+    if (document.getElementById('MEDIASERVER_TYPE').value === 'navidrome') {
+        payload.navidrome_auth_mode = getNavidromeAuthMode();
+    }
     fetch('/api/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config: config, test_connection: true })
+        body: JSON.stringify(payload)
     }).then(function(resp) {
         return resp.json().then(function(data) {
             if (!resp.ok) {
@@ -999,10 +1183,35 @@ function testConnection() {
     });
 }
 
+// /api/setup answers 200 even when the workers never acknowledged their restart:
+// the configuration is durable and Flask restarts either way, so the save is not
+// an error. The response says so with `worker_restart_acknowledged: false` plus
+// the warning text to show, and that used to be dropped on the floor - the page
+// said "Configuration saved" and redirected as if everything had applied. The
+// warning goes in its OWN element: the countdown owns `save-feedback` and
+// rewrites it every second, so anything written there is erased.
+var saveRestartWarning = null;
+
+function showSaveRestartWarning(text) {
+    if (!saveRestartWarning) {
+        saveRestartWarning = document.createElement('p');
+        saveRestartWarning.id = 'save-restart-warning';
+        saveRestartWarning.className = 'inline-feedback status-pending';
+        saveRestartWarning.style.margin = '0.5rem 0 0';
+        saveRestartWarning.style.width = '100%';
+        saveFeedback.parentNode.insertBefore(saveRestartWarning, saveFeedback.nextSibling);
+    }
+    saveRestartWarning.textContent = text;
+    saveRestartWarning.style.display = 'block';
+}
+
 setupForm.addEventListener('submit', function(event) {
     event.preventDefault();
     saveButton.disabled = true;
     saveFeedback.style.display = 'none';
+    if (saveRestartWarning) {
+        saveRestartWarning.style.display = 'none';
+    }
     var passwordInput = document.getElementById('AUDIOMUSE_PASSWORD');
     var confirmInput = document.getElementById('AUDIOMUSE_PASSWORD_CONFIRM');
     var passwordValue = '';
@@ -1033,10 +1242,14 @@ setupForm.addEventListener('submit', function(event) {
     if (mlValue !== null) {
         config.MUSIC_LIBRARIES = mlValue;
     }
-    fetch('/api/setup', {
+    var payload = { config: config };
+    if (document.getElementById('MEDIASERVER_TYPE').value === 'navidrome') {
+        payload.navidrome_auth_mode = getNavidromeAuthMode();
+    }
+    var saved = fetch('/api/setup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config: config })
+        body: JSON.stringify(payload)
     }).then(function(resp) {
         return resp.json().then(function(data) {
             if (!resp.ok) {
@@ -1044,20 +1257,27 @@ setupForm.addEventListener('submit', function(event) {
             }
             return data;
         });
-    }).then(function(data) {
-        saveFeedback.className = 'status-success inline-feedback';
-        saveFeedback.style.display = 'block';
-        var countdown = 20;
-        saveFeedback.textContent = 'Configuration saved. Redirecting in ' + countdown + ' seconds...';
-        var countdownInterval = setInterval(function() {
-            countdown -= 1;
-            if (countdown > 0) {
-                saveFeedback.textContent = 'Configuration saved. Redirecting in ' + countdown + ' seconds...';
-            } else {
-                clearInterval(countdownInterval);
-                if (window.appRedirect) { window.appRedirect('/'); } else { window.location.href = '/'; }
-            }
-        }, 1000);
+    });
+
+    // Started HERE, not in the success handler: /api/setup is held open for the
+    // whole worker restart, so counting down only once it answered meant the page
+    // froze and the countdown appeared when there was nothing left to wait for.
+    saveFeedback.className = 'status-success inline-feedback';
+    saveFeedback.style.display = 'block';
+    window.AudioMuseRestart.waitAndGo({
+        element: saveFeedback,
+        prefix: 'Configuration saved.',
+        target: '/',
+        until: saved
+    });
+
+    saved.then(function(data) {
+        if (data && data.worker_restart_acknowledged === false) {
+            showSaveRestartWarning(
+                data.warning
+                || 'The workers did not confirm their restart. Check the service logs.'
+            );
+        }
     }).catch(function(err) {
         saveFeedback.className = 'status-failure inline-feedback';
         saveFeedback.style.display = 'block';

@@ -27,7 +27,11 @@ Main Features:
   ``refresh_dashboard_stats()`` every 60s; the CHARTS block (Genres, Moods
   Coverage, Tempo) via ``refresh_dashboard_charts_stats()`` hourly, carrying its
   own ``charts_updated_at`` stamp so the UI can label it honestly.
-* LIVE tier: workers (Redis), recent tasks and cron (tiny tables) only.
+* LIVE tier: workers (pg_stat_activity), recent tasks and cron (tiny tables) only.
+* Both distribution pies count each song ONCE under its winning label. Summing
+  the raw per-song scores instead makes every slice converge on the same value
+  as the library grows, because the CLAP-derived mood scores share a large
+  constant offset (issue #826).
 """
 
 import json
@@ -38,8 +42,7 @@ from flask import Blueprint, render_template, jsonify, request
 from psycopg2.extras import DictCursor
 
 import config
-from database import get_db
-from taskqueue import redis_conn
+from database import get_db, like_contains_pattern
 from tasks.mediaserver import registry
 from tz_helper import LOCAL_TZ_FMT, UTC_NOW_SQL, to_local_str
 
@@ -70,7 +73,7 @@ def dashboard_page():
 # so there is nothing to leak. Deep pages are clamped by DASHBOARD_BROWSE_MAX_OFFSET
 # so a 1M-row table can never be walked end to end.
 
-_BROWSE_KINDS = ('songs', 'artists', 'albums')
+_BROWSE_KINDS = ('songs', 'artists', 'albums', 'unanalyzable')
 _BROWSE_FILTERS = ('all', 'unique', 'duplicates', 'orphan')
 _BROWSE_MIN_QUERY = 2
 
@@ -92,11 +95,10 @@ def browse_page():
     )
 
 
-def _browse_like(value):
-    # ILIKE contains-pattern with the user's own % / _ / \ escaped, so a search for
-    # "50%" matches a literal percent instead of acting as a wildcard.
-    escaped = value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
-    return '%' + escaped + '%'
+# ILIKE contains-pattern with the user's own % / _ / \ escaped, so a search for
+# "50%" matches a literal percent instead of acting as a wildcard. One shared
+# escaper (database.like_contains_pattern) serves browse and the ivf fuzzy match.
+_browse_like = like_contains_pattern
 
 
 def _browse_songs_sql(server_id, filt, q):
@@ -178,6 +180,26 @@ def _browse_albums_sql(server_id, q):
     return sql, params
 
 
+def _browse_unanalyzable_sql(server_id, q):
+    params = []
+    sql = (
+        "SELECT e.title, e.artist, e.duration_seconds, e.reason_code, "
+        "e.created_at, e.updated_at, ms.name "
+        "FROM analysis_exclusions e JOIN music_servers ms ON ms.server_id = e.server_id"
+    )
+    where = []
+    if server_id:
+        where.append("e.server_id = %s")
+        params.append(server_id)
+    if q:
+        where.append("(COALESCE(e.title, '') ILIKE %s OR COALESCE(e.artist, '') ILIKE %s)")
+        params.extend((_browse_like(q), _browse_like(q)))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY e.updated_at DESC NULLS LAST, e.title ASC, e.artist ASC"
+    return sql, params
+
+
 def _browse_serialize(kind, rows):
     out = []
     if kind == 'artists':
@@ -186,6 +208,17 @@ def _browse_serialize(kind, rows):
     elif kind == 'albums':
         for r in rows:
             out.append({'album_artist': r[0], 'album': r[1]})
+    elif kind == 'unanalyzable':
+        for r in rows:
+            out.append({
+                'title': r[0],
+                'artist': r[1],
+                'duration_seconds': float(r[2]) if r[2] is not None else None,
+                'reason_code': int(r[3]) if r[3] is not None else None,
+                'created_at': to_local_str(r[4]),
+                'updated_at': to_local_str(r[5]),
+                'server': r[6],
+            })
     else:
         for r in rows:
             item = {
@@ -231,6 +264,8 @@ def _browse_total(content, kind, server_id, server_name, filt, has_q):
         return content.get('distinct_artists')
     if kind == 'albums' and server_id is None:
         return content.get('distinct_albums')
+    if kind == 'unanalyzable' and server_id is None:
+        return content.get('unanalyzable_tracks')
     return None
 
 
@@ -283,6 +318,8 @@ def browse_api():
         sql, params = _browse_artists_sql(server_id, q)
     elif kind == 'albums':
         sql, params = _browse_albums_sql(server_id, q)
+    elif kind == 'unanalyzable':
+        sql, params = _browse_unanalyzable_sql(server_id, q)
     else:
         sql, params = _browse_songs_sql(server_id, filt, q)
 
@@ -320,8 +357,6 @@ def browse_api():
 
 
 def _safe_rollback(cur):
-    """Best-effort rollback on the connection backing this cursor so the next
-    query doesn't fail with 'current transaction is aborted'."""
     try:
         cur.connection.rollback()
     except Exception:
@@ -356,40 +391,26 @@ def _table_exists(cur, name):
 
 
 def _collect_workers():
-    """Return basic info about RQ workers. Only the columns rendered in
-    the Workers table of the dashboard are populated."""
-    workers_info = []
-    try:
-        from rq import Worker
+    import taskqueue
 
-        workers = Worker.all(connection=redis_conn)
-        for w in workers:
-            try:
-                state = w.get_state()
-            except Exception:
-                state = 'unknown'
-            try:
-                current_job = w.get_current_job()
-                current_job_id = current_job.id if current_job else None
-            except Exception:
-                current_job_id = None
-            workers_info.append(
-                {
-                    'hostname': getattr(w, 'hostname', None),
-                    'queues': [q.name for q in getattr(w, 'queues', [])],
-                    'state': state,
-                    'current_job_id': current_job_id,
-                    'successful_jobs': getattr(w, 'successful_job_count', 0),
-                    'failed_jobs': getattr(w, 'failed_job_count', 0),
-                }
-            )
-    except Exception as e:
-        logger.warning(f"dashboard: failed to enumerate RQ workers: {e}")
-    return workers_info
+    try:
+        return taskqueue.worker_snapshot()
+    except Exception:
+        logger.warning("dashboard: could not enumerate workers", exc_info=True)
+        return []
+
+
+def _collect_queue_backlog():
+    import taskqueue
+
+    try:
+        return taskqueue.queue_backlog()
+    except Exception:
+        logger.warning("dashboard: could not compute the queue backlog", exc_info=True)
+        return []
 
 
 def _collect_task_metrics(cur):
-    """Return the 10 most recent main tasks for the Recent Activity table."""
     recent = []
     if _table_exists(cur, 'task_history'):
         try:
@@ -541,6 +562,9 @@ def _collect_fast_metrics(cur):
         # A genuine subset of the catalogue: CLAP is a separate pass that runs
         # after analysis, so its percentage can really be < 100.
         'clap_indexed': _counted_or_none(cur, "SELECT COUNT(*) FROM clap_embedding"),
+        'unanalyzable_tracks': _counted_or_none(
+            cur, "SELECT COUNT(*) FROM analysis_exclusions"
+        ),
     }
     metrics['music_servers'] = _collect_music_server_metrics(
         cur, total_songs=metrics['total_songs']
@@ -564,7 +588,7 @@ def _collect_fast_metrics(cur):
         metrics[k] is None
         for k in (
             'total_songs', 'distinct_artists', 'distinct_albums',
-            'clap_indexed',
+            'clap_indexed', 'unanalyzable_tracks',
         )
     )
     return metrics
@@ -578,14 +602,23 @@ def _collect_charts_metrics(cur):
     # hourly cadence and one `charts_updated_at` stamp, kept off the 60s path.
     #
     #  - mood_dominant_counts: per-song dominant-label counts -> Genres chart.
-    #  - other_feature_totals: emotional mood scores summed across songs
+    #  - other_feature_dominant_counts: per-song dominant EMOTIONAL label counts
     #    (other_features column) -> Moods Coverage pie.
+    # BOTH are per-song argmax counts, never sums of the raw scores. The
+    # other_features values are CLAP audio-vs-text cosine similarities pushed
+    # through (sim+1)/2, and CLAP's modality gap pins every one of them into a
+    # narrow band well above 0, so summing them converged on N*mean(label) and
+    # drew all six slices at 1/6 +- <1% - the bigger the library, the MORE
+    # uniform the pie looked (issue #826). Taking the argmax cancels that shared
+    # offset, and counting each song exactly once makes the pie a real partition
+    # instead of six independent scores posing as parts of a whole.
     # Both columns are the plain `key:value,key:value` text produced by
     # save_track_analysis_and_embedding(), parsed directly (never JSON). A NAMED
     # server-side cursor streams the whole table in chunks so the web process
     # never buffers all rows at once (an unnamed cursor would).
     mood_dominant_counts = {}
-    other_feature_totals = {}
+    other_feature_dominant_counts = {}
+    tied_songs = 0
     complete = True
     try:
         with cur.connection.cursor(name='dash_mood_scan') as scan:
@@ -600,15 +633,35 @@ def _collect_charts_metrics(cur):
                 parsed = _parse_keyval(mv)
                 if not parsed:
                     continue
-                dom = max(parsed.items(), key=lambda kv: kv[1])[0]
-                mood_dominant_counts[dom] = mood_dominant_counts.get(dom, 0) + 1
+                dom = _dominant_label(parsed)
+                if dom:
+                    mood_dominant_counts[dom[0]] = mood_dominant_counts.get(dom[0], 0) + 1
+                else:
+                    tied_songs += 1
 
                 if of:
-                    of_parsed = _parse_keyval(of)
-                    for k, s in of_parsed.items():
-                        if k in ('tempo_normalized', 'energy_normalized'):
-                            continue
-                        other_feature_totals[k] = other_feature_totals.get(k, 0.0) + s
+                    emotional_scores = {
+                        k: s for k, s in _parse_keyval(of).items()
+                        if k not in ('tempo_normalized', 'energy_normalized')
+                    }
+                    top = _dominant_label(emotional_scores)
+                    # analyze_track writes ZERO_OTHER_FEATURES up front and only
+                    # refresh_other_features fills it in once CLAP lands, so an
+                    # all-zero row means "not scored yet", not "the least
+                    # danceable song in the library". Counting its argmax would
+                    # hand every un-CLAPped song to whichever label parses first.
+                    if top is None:
+                        tied_songs += 1
+                    elif top[1] > 0:
+                        other_feature_dominant_counts[top[0]] = (
+                            other_feature_dominant_counts.get(top[0], 0) + 1
+                        )
+        if tied_songs:
+            logger.info(
+                "dashboard: %d song(s) had no single strongest label and were left "
+                "out of the dominance counts rather than handed to whichever label "
+                "parses first", tied_songs,
+            )
     except Exception as e:
         logger.debug(f"dashboard: mood aggregation failed: {e}")
         _safe_rollback(cur)
@@ -616,12 +669,16 @@ def _collect_charts_metrics(cur):
 
     # Genre breakdown: dominant-mood counts from mood_vector (genre-like labels).
     top_genre = sorted(mood_dominant_counts.items(), key=lambda kv: kv[1], reverse=True)
-    # Moods Coverage: emotional mood vector (other_features):
-    # danceable / aggressive / happy / party / relaxed / sad.
-    emotional = sorted(other_feature_totals.items(), key=lambda kv: kv[1], reverse=True)
+    # Moods Coverage: how many songs each emotional label (danceable /
+    # aggressive / happy / party / relaxed / sad) actually WINS. `count`, not the
+    # old `score`: the key rename is deliberate, so a stale snapshot holding the
+    # summed scores renders the placeholder instead of the flat six-way pie.
+    emotional = sorted(
+        other_feature_dominant_counts.items(), key=lambda kv: kv[1], reverse=True
+    )
     metrics = {
         'top_genre': [{'label': k, 'count': int(v)} for k, v in top_genre],
-        'moods_coverage': [{'label': k, 'score': round(v, 2)} for k, v in emotional],
+        'moods_coverage': [{'label': k, 'count': int(v)} for k, v in emotional],
     }
 
     # Tempo profile: bucket songs into slow/medium/fast/very-fast. Always populate
@@ -661,13 +718,17 @@ def _collect_charts_metrics(cur):
     return metrics
 
 
+def _dominant_label(scores):
+    if not scores:
+        return None
+    best = max(scores.values())
+    winners = [label for label, score in scores.items() if score == best]
+    if len(winners) != 1:
+        return None
+    return winners[0], best
+
+
 def _parse_keyval(s):
-    """Parse a ``key:value,key:value`` string (as stored in the ``score``
-    table's ``mood_vector`` / ``other_features`` columns) into a dict of
-    ``{label: float}``. Invalid pairs are silently skipped. Designed to
-    be fast on large libraries: no JSON parsing, no per-pair try/except
-    on the hot path for well-formed values.
-    """
     out = {}
     if not s:
         return out
@@ -689,9 +750,6 @@ def _parse_keyval(s):
 
 
 def _collect_cron(cur):
-    """Scheduled rows. Every schedule is CATALOGUE scope: batch work always runs
-    against every configured music server, one server at a time, so there is no
-    per-row target to report."""
     rows = []
     try:
         cur.execute("""
@@ -734,9 +792,10 @@ def dashboard_summary():
       Two tiers, and only two. SNAPSHOT: the whole `content` block (every
       CATALOG aggregate plus the per-SERVER alignment counts) is read from the
       precomputed `dashboard_stats` singleton and is NEVER recomputed on a
-      request; `stats_updated_at` says when it was taken. LIVE: workers, recent
-      tasks and cron are cheap enough to recompute per request; `generated_at`
-      says when. A client must not present a LIVE timestamp over SNAPSHOT data.
+      request; `stats_updated_at` says when it was taken. LIVE: workers, the
+      per-queue backlog, recent tasks and cron are cheap enough to recompute per
+      request; `generated_at` says when. A client must not present a LIVE
+      timestamp over SNAPSHOT data.
     responses:
       200:
         description: Dashboard payload.
@@ -750,6 +809,10 @@ def dashboard_summary():
                 stats_updated_at:
                   type: string
                 workers:
+                  type: array
+                  items:
+                    type: object
+                queue_backlog:
                   type: array
                   items:
                     type: object
@@ -767,10 +830,11 @@ def dashboard_summary():
     db = get_db()
     cur = db.cursor(cursor_factory=DictCursor)
     try:
-        # LIVE tier only: three cheap reads. Everything heavy (every CATALOG
-        # aggregate and the per-SERVER alignment counts) comes precomputed out of
-        # the dashboard_stats singleton, so no scan of `score` can ever land on
-        # the request path.
+        # LIVE tier only: three cheap reads on this cursor, plus workers and the
+        # queue backlog below on their own connection. Everything heavy (every
+        # CATALOG aggregate and the per-SERVER alignment counts) comes precomputed
+        # out of the dashboard_stats singleton, so no scan of `score` can ever
+        # land on the request path.
         recent = _collect_task_metrics(cur)
         cron_rows = _collect_cron(cur)
         content, stats_updated_at = _load_dashboard_stats(cur)
@@ -778,12 +842,14 @@ def dashboard_summary():
         cur.close()
 
     workers = _collect_workers()
+    queue_backlog = _collect_queue_backlog()
 
     return jsonify(
         {
             'generated_at': time.strftime(LOCAL_TZ_FMT),
             'stats_updated_at': stats_updated_at,
             'workers': workers,
+            'queue_backlog': queue_backlog,
             'recent_tasks': recent,
             'content': content,
             'cron': cron_rows,
@@ -792,7 +858,6 @@ def dashboard_summary():
 
 
 def _load_dashboard_stats(cur):
-    """Read the singleton dashboard_stats row. Returns (content, updated_at_iso)."""
     try:
         cur.execute("SELECT updated_at, content FROM dashboard_stats WHERE id = 1")
         row = cur.fetchone()

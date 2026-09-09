@@ -17,10 +17,10 @@ Main Features:
 * Log-mel spectrogram front end, forced-language-token detection, and greedy or
   beam decoding with repetition-penalty, no-repeat-ngram and suppress-token
   logit shaping to curb hallucinated loops.
-* Rejects likely-garbage output via a zlib compression-ratio threshold and a
-  no-speech probability check, returning avg_logprob for upstream gating.
+* Rejects likely-garbage output via a zlib compression-ratio threshold,
+  returning avg_logprob for upstream gating.
 * Lazy thread-safe session load with a minimum-free-RAM guard (raises
-  WhisperLoadRefused) plus unload / reset_session hooks for memory reclaim.
+  WhisperLoadRefused) plus an unload hook for memory reclaim.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 import config
+from cpu_budget import usable_cpu_count
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +58,12 @@ WHISPER_COMPRESSION_RATIO_THRESHOLD = float(
 def _resolve_whisper_threads() -> int:
     raw = config.get_config('LYRICS_WHISPER_INTRA_OP_THREADS', '').strip()
     if raw == '':
-        cpu_count = os.cpu_count() or 1
+        cpu_count = usable_cpu_count() or os.cpu_count() or 1
         return max(1, cpu_count // 3)
     try:
         return max(0, int(raw))
     except ValueError:
-        cpu_count = os.cpu_count() or 1
+        cpu_count = usable_cpu_count() or os.cpu_count() or 1
         return max(1, cpu_count // 3)
 
 
@@ -79,10 +80,8 @@ WHISPER_FRAMES_PER_CHUNK = WHISPER_CHUNK_SAMPLES // HOP_LENGTH
 
 SOT_TOKEN_ID = 50258
 EOT_TOKEN_ID = 50257
-TRANSLATE_TOKEN_ID = 50358
 TRANSCRIBE_TOKEN_ID = 50359
 NO_TIMESTAMPS_TOKEN_ID = 50363
-NO_SPEECH_TOKEN_ID = 50362
 LANGUAGE_TOKEN_START = 50259
 LANGUAGE_TOKEN_END = 50358
 
@@ -266,7 +265,7 @@ class _OnnxWhisperPipeline:
         )
 
         try:
-            from tasks.analysis.song import create_onnx_session
+            from tasks.onnx_utils import create_onnx_session
 
             self.encoder_session = create_onnx_session(
                 str(encoder_path), sess_options=sess_opts, label='whisper_encoder'
@@ -829,7 +828,3 @@ def unload() -> bool:
             logger.exception("Error during ONNX memory pool reset on Whisper unload")
     logger.info("Whisper-small: pipeline unloaded (~1.5 GB freed)")
     return True
-
-
-def reset_session() -> None:
-    unload()

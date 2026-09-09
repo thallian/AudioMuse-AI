@@ -31,49 +31,53 @@ logger = logging.getLogger(__name__)
 
 
 def run_sonic_fingerprint_task(server_scope="all"):
-    """RQ entrypoint for the sonic_fingerprint cron row.
-
-    Cron used to run this inline on the Flask poll thread, so one unreachable
-    media server blocked every other scheduled job for the length of its timeout
-    and the run had no task_status row: invisible in the task list and impossible
-    to cancel. It runs on a worker now. The alchemy radio is the one cron task
-    that still runs inline, because it needs the index only Flask loads; it pays
-    for that with a heartbeat and a startup reap so it can never wedge a Start.
-
-    The playlist name is stable across runs so client-side "online first" sync
-    keeps tracking the same server playlist (issue #336).
-    """
     import time
 
     from flask_app import app
     from database import save_task_status
     from config import (
         SONIC_FINGERPRINT_CRON_PLAYLIST_NAME,
+        QUEUE_WEDGED_MAIN_TASK_MINUTES,
         TASK_STATUS_STARTED,
         TASK_STATUS_SUCCESS,
         TASK_STATUS_FAILURE,
     )
-    from rq import get_current_job
 
     from .mediaserver import create_or_replace_playlist, registry
     from .ivf_manager import create_playlist_from_ids
 
-    job = get_current_job()
-    task_id = job.id if job else None
     with app.app_context():
-        if task_id:
+        from .task_run import task_run_prologue, terminal_skip
+        from .recovery import row_heartbeat, slow_step_budget_minutes
+
+        claimed_task_id, task_id, task_info = task_run_prologue()
+        skip = terminal_skip(
+            task_id, claimed_task_id, task_info,
+            revoked_message="Sonic fingerprint was cancelled before execution.",
+            terminal_message="Sonic fingerprint task is already terminal.",
+        )
+        if skip is not None:
+            return skip
+        if claimed_task_id:
             save_task_status(
                 task_id, 'sonic_fingerprint', TASK_STATUS_STARTED, progress=0,
                 details={"message": "Building the sonic fingerprint playlist..."},
             )
         created = 0
         failed = []
+        current = ['resolving the server scope']
         try:
             servers = registry.servers_for_scope(server_scope)
             for server in servers:
                 server_name = server['name'] if server else 'default server'
+                current[0] = f"the sonic fingerprint for {server_name}"
                 try:
-                    with registry.bind(server):
+                    with registry.bind(server), row_heartbeat(
+                        claimed_task_id, lambda: current[0],
+                        stop_after_minutes=slow_step_budget_minutes(
+                            QUEUE_WEDGED_MAIN_TASK_MINUTES
+                        ),
+                    ):
                         fingerprint_results = generate_sonic_fingerprint()
                         if not fingerprint_results:
                             logger.warning(
@@ -85,9 +89,13 @@ def run_sonic_fingerprint_task(server_scope="all"):
                             row['item_id'] for row in fingerprint_results if 'item_id' in row
                         ]
                         try:
-                            create_or_replace_playlist(
+                            if create_or_replace_playlist(
                                 SONIC_FINGERPRINT_CRON_PLAYLIST_NAME, track_ids
-                            )
+                            ) is None:
+                                raise RuntimeError(
+                                    "Media server reported failure upserting the "
+                                    "sonic fingerprint playlist"
+                                )
                             name = SONIC_FINGERPRINT_CRON_PLAYLIST_NAME
                         except NotImplementedError:
                             name = f"Sonic Fingerprint (Cron {time.strftime('%Y-%m-%d')})"
@@ -128,7 +136,7 @@ def run_sonic_fingerprint_task(server_scope="all"):
 
 
 def generate_sonic_fingerprint(num_neighbors=None, user_creds=None):
-    from app_helper import get_tracks_by_ids
+    from database import get_tracks_by_ids
 
     logger.info("Generating sonic fingerprint...")
 
@@ -146,10 +154,6 @@ def generate_sonic_fingerprint(num_neighbors=None, user_creds=None):
     canonical_by_provider = canonical_input_ids(
         provider_ids, ms_context.active_server_id()
     )
-    # Two provider FILES of one song now resolve to the SAME canonical id, so the
-    # top-played list can carry it twice: weighting it once per copy double-counted
-    # it in the centroid. Dedupe in play-count order and keep the FIRST (highest
-    # ranked) provider id for it, not the last.
     provider_by_canonical = {}
     for pid in provider_ids:
         provider_by_canonical.setdefault(canonical_by_provider.get(pid, pid), pid)

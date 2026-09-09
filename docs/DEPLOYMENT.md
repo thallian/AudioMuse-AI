@@ -1,6 +1,6 @@
 # Deployment strategy
 
-From `v1.0.0`, only PostgreSQL, Redis, and `TZ` must still be configured via environment variables. All other configuration values are managed through the browser Setup Wizard and stored in the database. For compatibility with older installations, environment variables are imported into the database automatically on first startup. The Setup Wizard is the landing page on a clean installation and is also available later from the menu under Administration > Setup Wizard.
+From `v1.0.0`, only PostgreSQL and `TZ` must still be configured via environment variables. All other configuration values are managed through the browser Setup Wizard and stored in the database. For compatibility with older installations, environment variables are imported into the database automatically on first startup. The Setup Wizard is the landing page on a clean installation and is also available later from the menu under Administration > Setup Wizard.
 
 ## Contents
 
@@ -42,7 +42,7 @@ This section covers direct deployment with the `deployment/*.yaml` manifests.
   * Set database secrets in the matching secret object (mandatory; env-only):
     * `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`
   * Ensure cluster connection values are correct (mandatory; env-only):
-    * `POSTGRES_HOST`, `POSTGRES_PORT`, `REDIS_URL`
+    * `POSTGRES_HOST`, `POSTGRES_PORT`
   * Optional: set the timezone with `TZ`
 
 * **Deploy:**
@@ -63,7 +63,10 @@ AudioMuse-AI provides two Docker Compose examples:
 - `deployment/docker-compose.yaml` - any music server, CPU only.
 - `deployment/docker-compose-nvidia.yaml` - any music server, GPU with fallback to CPU.
 
-Both files start the whole stack: Flask, one worker, Redis and PostgreSQL.
+Both files start the whole stack: Flask, one worker and PostgreSQL.
+
+**Note on CPU limits:**
+If you cap the stack with `--cpus`, `--cpuset-cpus`, `deploy.resources.limits.cpus` or a systemd `CPUQuota`, the worker and ONNX analysis thread caps are sized from that limit (keeping a small bare minimum) instead of the host's core count. Without any limit they keep using the full host CPU, so behavior on native Linux, macOS and Windows installs is unchanged.
 
 **Prerequisites:**
 * Docker and Docker Compose installed
@@ -90,10 +93,9 @@ Both files start the whole stack: Flask, one worker, Redis and PostgreSQL.
    * Change host ports only if the defaults are already in use on your machine (optional):
      ```env
      POSTGRES_PORT=5432
-     REDIS_PORT=6379
      FRONTEND_PORT=8000
      ```
-   All other values (database name, internal ports, Redis URL) are hardcoded in the compose file and do not need to be set.
+   All other values (database name, internal ports) are hardcoded in the compose file and do not need to be set.
 
 3. **Start the services:**
    ```bash
@@ -113,14 +115,14 @@ Both files start the whole stack: Flask, one worker, Redis and PostgreSQL.
    ```
 
 **Note:**
-> If you use LMS, create and use the Subsonic API token instead of a password. Other Subsonic-compatible servers may require the same token-based auth.
+> If you use LMS, create and use the OpenSubsonic API token instead of a password. Other OpenSubsonic-compatible servers may require the same token-based auth.
 
 **Remote worker tip:**
-A worker on separate hardware runs the same image with `SERVICE_TYPE=worker`. It only needs to reach the main server, so set `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` and `REDIS_URL` to the main server values instead of the local container names. Worker-only compose examples are kept in `deployment/deprecated/`.
+A worker on separate hardware runs the same image with `SERVICE_TYPE=worker`. It only needs to reach the main server, so set `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB` to the main server values instead of the local container names. Worker-only compose examples are kept in `deployment/test/`: `docker-compose-cpu-worker-test.yaml` and `docker-compose-nvidia-worker-test.yaml`, alongside a `.env.example` that already points `POSTGRES_HOST` at a remote server. They build the image from the repository, so replace the `build:` block with `image: ghcr.io/neptunehub/audiomuse-ai:latest` to run the published image instead.
 
 ## Local Deployment MacOS
 
-The native MacOS package is shipped as a release asset for Apple Silicon only. It bundles the entire app, embedded PostgreSQL, Redis, and the browser UI so you do not need Docker or an external database for local use.
+The native MacOS package is shipped as a release asset for Apple Silicon only. It bundles the entire app, embedded PostgreSQL and the browser UI so you do not need Docker or an external database for local use.
 
 **Prerequisites:**
 * Apple Silicon Mac (M1/M2/M3/M4)
@@ -150,7 +152,7 @@ The native MacOS package is shipped as a release asset for Apple Silicon only. I
 
 ## Local Deployment Linux
 
-The native Linux packages are provided as `.deb` and `.rpm` release assets for x86_64 and aarch64. These packages bundle the full app, embedded PostgreSQL, Redis, and the web UI.
+The native Linux packages are provided as `.deb` and `.rpm` release assets for x86_64 and aarch64. These packages bundle the full app, embedded PostgreSQL and the web UI.
 
 **Prerequisites:**
 * A Linux distribution compatible with the packaged binaries
@@ -193,7 +195,7 @@ Replace `<arch>` with the release artifact for your CPU (`x86_64` or `aarch64`).
 
 ## Local Deployment Windows
 
-The native Windows package is shipped as a release asset for x86_64 only: a portable ZIP archive (`AudioMuse-AI-amd64-windows.zip`). It bundles the full app, embedded PostgreSQL, Redis, and the web UI, so you do not need Docker or an external database for local use.
+The native Windows package is shipped as a release asset for x86_64 only: a portable ZIP archive (`AudioMuse-AI-amd64-windows.zip`). It bundles the full app, embedded PostgreSQL and the web UI, so you do not need Docker or an external database for local use.
 
 **Prerequisites:**
 * Windows 10 or 11 (x86_64)
@@ -244,7 +246,7 @@ These files are configured to automatically update AudioMuse-AI using the [lates
     ```
 2.  **Review and Customize:**
 
-    The `audiomuse-ai-postgres.container` and `audiomuse-redis.container` files are pre-configured with default credentials and settings suitable for local testing. <BR>
+    The `audiomuse-postgres.container` file is pre-configured with default credentials and settings suitable for local testing. <BR>
     You will need to edit environment variables within `audiomuse-ai-worker.container` and `audiomuse-ai-flask.container` files to reflect your personal credentials and environment.
 
     Once you've customized the unit files, you will need to copy all of them into a systemd container directory, such as `/etc/containers/systemd/user/`.<BR>
@@ -254,7 +256,7 @@ These files are configured to automatically update AudioMuse-AI using the [lates
     systemctl --user daemon-reload
     systemctl --user start audiomuse-pod
     ```
-    The first command reloads systemd (generating the systemd service files) and the second command starts all AudioMuse services (Flask app, RQ worker, Redis, PostgreSQL).
+    The first command reloads systemd (generating the systemd service files) and the second command starts all AudioMuse services (Flask app, queue worker, PostgreSQL).
 
 4.  **Access the Application:**
     Once the containers are up, you can access the web UI at `http://localhost:8000`.

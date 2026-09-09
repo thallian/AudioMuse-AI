@@ -16,7 +16,7 @@ Main Features:
 * Update, delete, and unknown-radio 404 handling.
 * Run generates playlists for enabled radios only, upserts, and isolates failures.
 * Run scope: the endpoint targets the selected server, and the similarity index
-  is loaded on demand so a run on an RQ worker still finds tracks.
+  is loaded on demand so a run on a queue worker still finds tracks.
 """
 
 import pytest
@@ -95,18 +95,30 @@ class TestCreateRadioValidation:
         mock_create.assert_not_called()
 
     @patch('database.create_alchemy_radio')
-    def test_missing_temperature_returns_400(self, mock_create, client):
+    def test_missing_temperature_falls_back_to_the_configured_default(
+        self, mock_create, client
+    ):
+        mock_create.return_value = {'id': 1}
         response = client.post('/api/radios', json={'anchor_id': 5, 'n_results': 100})
-        assert response.status_code == 400
-        assert response.get_json() == {'error': 'Radio temperature is required'}
-        mock_create.assert_not_called()
+        assert response.status_code == 200
+        assert mock_create.call_args.args[1] == config.ALCHEMY_TEMPERATURE
 
     @patch('database.create_alchemy_radio')
-    def test_missing_n_results_returns_400(self, mock_create, client):
+    def test_missing_n_results_falls_back_to_the_configured_default(
+        self, mock_create, client
+    ):
+        mock_create.return_value = {'id': 1}
         response = client.post('/api/radios', json={'anchor_id': 5, 'temperature': 1.0})
-        assert response.status_code == 400
-        assert response.get_json() == {'error': 'Radio number of results is required'}
-        mock_create.assert_not_called()
+        assert response.status_code == 200
+        assert mock_create.call_args.args[2] == config.ALCHEMY_DEFAULT_N_RESULTS
+
+    @patch('database.create_alchemy_radio')
+    def test_only_an_anchor_is_required_to_create_a_radio(self, mock_create, client):
+        mock_create.return_value = {'id': 1}
+        response = client.post('/api/radios', json={'anchor_id': 5})
+        assert response.status_code == 200
+        assert mock_create.call_args.args[1] == config.ALCHEMY_TEMPERATURE
+        assert mock_create.call_args.args[2] == config.ALCHEMY_DEFAULT_N_RESULTS
 
     @patch('database.create_alchemy_radio')
     def test_non_numeric_temperature_returns_400(self, mock_create, client):
@@ -141,13 +153,29 @@ class TestCreateRadioValidation:
         mock_create.assert_not_called()
 
     @patch('database.create_alchemy_radio')
-    def test_n_results_out_of_range_returns_400(self, mock_create, client):
-        for bad_value in (0, config.ALCHEMY_MAX_N_RESULTS + 1):
+    def test_n_results_below_one_returns_400(self, mock_create, client):
+        for bad_value in (0, -1):
             response = client.post(
                 '/api/radios', json={'anchor_id': 5, 'temperature': 1.0, 'n_results': bad_value}
             )
             assert response.status_code == 400
         mock_create.assert_not_called()
+
+    @patch('database.create_alchemy_radio')
+    def test_n_results_above_the_frontend_maximum_is_accepted(self, mock_create, client):
+        mock_create.return_value = {
+            'id': 1, 'anchor_id': 5, 'temperature': 1.0,
+            'n_results': config.ALCHEMY_MAX_N_RESULTS + 500,
+        }
+        response = client.post(
+            '/api/radios',
+            json={
+                'anchor_id': 5, 'temperature': 1.0,
+                'n_results': config.ALCHEMY_MAX_N_RESULTS + 500,
+            },
+        )
+        assert response.status_code in (200, 201)
+        assert mock_create.call_args.args[2] == config.ALCHEMY_MAX_N_RESULTS + 500
 
     @patch('database.create_alchemy_radio')
     def test_valid_payload_creates_radio(self, mock_create, client):
@@ -184,11 +212,29 @@ class TestCreateRadioValidation:
 
 
 class TestUpdateRadio:
+    @patch('database.get_alchemy_radios')
     @patch('database.update_alchemy_radio')
-    def test_missing_settings_returns_400(self, mock_update, client):
+    def test_omitted_settings_keep_the_stored_values(self, mock_update, mock_list, client):
+        mock_list.return_value = [
+            {'id': 3, 'anchor_id': 1, 'temperature': 2.5, 'n_results': 77, 'enabled': True}
+        ]
+        mock_update.return_value = {'id': 3}
         response = client.put('/api/radios/3', json={'enabled': False})
-        assert response.status_code == 400
-        mock_update.assert_not_called()
+        assert response.status_code == 200
+        assert mock_update.call_args.args == (3, 2.5, 77, False)
+
+    @patch('database.get_alchemy_radios')
+    @patch('database.update_alchemy_radio')
+    def test_omitted_settings_on_an_unknown_radio_fall_back_to_the_defaults(
+        self, mock_update, mock_list, client
+    ):
+        mock_list.return_value = []
+        mock_update.return_value = None
+        response = client.put('/api/radios/3', json={'enabled': False})
+        assert response.status_code == 404
+        assert mock_update.call_args.args == (
+            3, config.ALCHEMY_TEMPERATURE, config.ALCHEMY_DEFAULT_N_RESULTS, False
+        )
 
     @patch('database.update_alchemy_radio')
     def test_unknown_radio_returns_404(self, mock_update, client):
@@ -347,6 +393,45 @@ class TestRunRadioPlaylists:
         assert summary['failed'] == ['Broken']
 
     @patch('database.get_alchemy_radios')
+    @patch('tasks.radio_manager.create_playlist')
+    @patch('tasks.radio_manager.create_or_replace_playlist')
+    @patch('tasks.radio_manager.song_alchemy')
+    def test_fallback_create_playlist_none_counts_radio_as_failed(
+        self, mock_alchemy, mock_upsert, mock_create, mock_get_radios
+    ):
+        from tasks.radio_manager import run_radio_playlists
+
+        mock_get_radios.return_value = [self._radio(1, 10, 'Chill')]
+        mock_alchemy.return_value = {'results': [{'item_id': 'a'}]}
+        mock_upsert.side_effect = NotImplementedError()
+        mock_create.return_value = None
+
+        summary = run_radio_playlists()
+
+        mock_create.assert_called_once_with('Chill', ['a'])
+        assert summary['playlists_created'] == 0
+        assert summary['failed'] == ['Chill']
+
+    @patch('database.get_alchemy_radios')
+    @patch('tasks.radio_manager.create_playlist')
+    @patch('tasks.radio_manager.create_or_replace_playlist')
+    @patch('tasks.radio_manager.song_alchemy')
+    def test_fallback_create_playlist_success_counts_radio_created(
+        self, mock_alchemy, mock_upsert, mock_create, mock_get_radios
+    ):
+        from tasks.radio_manager import run_radio_playlists
+
+        mock_get_radios.return_value = [self._radio(1, 10, 'Chill')]
+        mock_alchemy.return_value = {'results': [{'item_id': 'a'}]}
+        mock_upsert.side_effect = NotImplementedError()
+        mock_create.return_value = {'Id': 'p1'}
+
+        summary = run_radio_playlists()
+
+        assert summary['playlists_created'] == 1
+        assert summary['failed'] == []
+
+    @patch('database.get_alchemy_radios')
     @patch('tasks.radio_manager.create_or_replace_playlist')
     @patch('tasks.radio_manager.song_alchemy')
     def test_radio_with_no_results_creates_no_playlist(
@@ -398,9 +483,6 @@ class TestRunRadioPlaylists:
     def test_reports_progress_before_the_index_load_and_per_radio(
         self, mock_alchemy, _mock_upsert, mock_get_radios
     ):
-        """The cron run has no RQ job behind it, so its only proof of life is this
-        callback: the janitor fails an in-process row that stops reporting. The first
-        beat lands BEFORE the index load, the slowest step of the whole run."""
         from tasks.radio_manager import run_radio_playlists
 
         mock_get_radios.return_value = [
@@ -413,7 +495,10 @@ class TestRunRadioPlaylists:
         run_radio_playlists(report=lambda message, progress: beats.append((message, progress)))
 
         assert len(beats) == 3
-        assert 'index' in beats[0][0].lower()
+        assert 'index' in beats[0][0].lower(), (
+            'the index load is the slowest step of the run, so the first beat must '
+            'land before it or the maintenance pass fails a row that is still alive'
+        )
         assert [b[1] for b in beats] == [1, 50.0, 100.0]
         assert "Chill" in beats[1][0] and "Rock" in beats[2][0]
 

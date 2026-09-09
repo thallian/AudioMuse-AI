@@ -18,7 +18,7 @@ Main Features:
   free them independently to keep worker RSS low between jobs.
 * analyze_audio_file: segment audio, build mel spectrograms, and embed each track.
 * get_text_embedding(_batch) plus other-feature label embeddings for CLAP-derived
-  scalar features, cached in Redis to avoid re-encoding fixed label sets.
+  scalar features, cached on disk to avoid re-encoding fixed label sets.
 """
 
 import os
@@ -29,6 +29,8 @@ from typing import Tuple, Optional
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 
 import config
+
+from cpu_budget import usable_cpu_count
 
 try:
     from config import AUDIO_LOAD_TIMEOUT
@@ -70,8 +72,6 @@ def _static_shape_providers():
 
 
 def _prepared_model_bytes(model_path):
-    """Return the audio model with its symbolic time axis pinned to a static
-    shape, or None when the model has no symbolic dims. See _PREPARED_MODEL_PROVIDERS."""
     import onnx
     from onnxruntime.tools.onnx_model_utils import make_dim_param_fixed
 
@@ -105,7 +105,12 @@ def _clap_session_options(label):
         sess_options.inter_op_num_threads = 1
         logger.info("CLAP %s: Using Python threading, ONNX single-threaded", label)
     else:
-        logger.info("CLAP %s: Using ONNX Runtime automatic thread management", label)
+        threads = usable_cpu_count()
+        if threads is None:
+            logger.info("CLAP %s: Using ONNX Runtime automatic thread management", label)
+        else:
+            sess_options.intra_op_num_threads = threads
+            logger.info("CLAP %s: ONNX limited to %s threads", label, threads)
     return sess_options
 
 
@@ -127,17 +132,9 @@ def _load_audio_model():
 
     session = None
 
-    from tasks.analysis.song import resolve_providers
+    from tasks.onnx_utils import resolve_providers
 
-    provider_options = resolve_providers(
-        allow_coreml=True,
-        cuda_options={
-            'device_id': 0,
-            'arena_extend_strategy': 'kSameAsRequested',
-            'cudnn_conv_algo_search': 'DEFAULT',
-        },
-        label='clap',
-    )
+    provider_options = resolve_providers(allow_coreml=True, label='clap')
 
     def _create_session(model_input, providers, provider_opts):
         return ort.InferenceSession(
@@ -212,7 +209,7 @@ def _load_text_model():
     sess_options = _clap_session_options("Text")
 
     session = None
-    _is_worker = os.environ.get('AUDIOMUSE_ROLE') == 'worker'
+    _is_worker = (os.environ.get('AUDIOMUSE_ROLE') or '').lower() == 'worker'
 
     if not _is_worker:
         provider_options = [('CPUExecutionProvider', {})]
@@ -220,16 +217,9 @@ def _load_text_model():
             "CLAP text model: CPU only (Flask process) - thread-safe across request threads"
         )
     else:
-        from tasks.analysis.song import resolve_providers
+        from tasks.onnx_utils import resolve_providers
 
-        provider_options = resolve_providers(
-            cuda_options={
-                'device_id': 0,
-                'arena_extend_strategy': 'kSameAsRequested',
-                'cudnn_conv_algo_search': 'DEFAULT',
-            },
-            label='clap_text',
-        )
+        provider_options = resolve_providers(label='clap_text')
 
     try:
         session = ort.InferenceSession(
@@ -439,7 +429,7 @@ def compute_mel_spectrogram(audio_data: np.ndarray, sr: int = 48000) -> np.ndarr
     return mel.astype(np.float32)
 
 
-def analyze_audio_file(audio_path: str) -> Tuple[Optional[np.ndarray], float, int]:
+def analyze_audio_file(audio_path: str, native_audio=None, native_sr=None) -> Tuple[Optional[np.ndarray], float, int]:
     if not config.CLAP_ENABLED:
         return None, 0, 0
 
@@ -450,9 +440,12 @@ def analyze_audio_file(audio_path: str) -> Tuple[Optional[np.ndarray], float, in
         SEGMENT_LENGTH = _SEGMENT_LENGTH_SAMPLES
         HOP_LENGTH = 240000
 
-        from tasks.analysis import robust_load_audio_with_fallback
+        from tasks.analysis import resample_audio, robust_load_audio_with_fallback
 
-        audio_data, sr = robust_load_audio_with_fallback(audio_path, target_sr=SAMPLE_RATE)
+        if native_audio is not None and native_sr is not None:
+            audio_data = resample_audio(native_audio, native_sr, SAMPLE_RATE)
+        else:
+            audio_data, _sr = robust_load_audio_with_fallback(audio_path, target_sr=SAMPLE_RATE)
 
         if audio_data is None or audio_data.size == 0:
             logger.warning(f"Could not load audio for CLAP analysis: {audio_path}")
@@ -532,34 +525,10 @@ def analyze_audio_file(audio_path: str) -> Tuple[Optional[np.ndarray], float, in
 
 
 def get_text_embedding(query_text: str) -> Optional[np.ndarray]:
-    if not config.CLAP_ENABLED:
+    embeddings = get_text_embeddings_batch([query_text])
+    if embeddings is None or len(embeddings) == 0:
         return None
-
-    try:
-        session = get_clap_text_model()
-        tokenizer = get_tokenizer()
-
-        encoded = tokenizer(
-            query_text, max_length=77, padding='max_length', truncation=True, return_tensors='np'
-        )
-
-        input_ids = encoded['input_ids'].astype(np.int64)
-        attention_mask = encoded['attention_mask'].astype(np.int64)
-
-        onnx_inputs = {'input_ids': input_ids, 'attention_mask': attention_mask}
-
-        outputs = session.run(None, onnx_inputs)
-        text_embedding = outputs[0]
-
-        text_embedding = text_embedding[0]
-
-        text_embedding = text_embedding / np.linalg.norm(text_embedding)
-
-        return text_embedding
-
-    except Exception:
-        logger.exception(f"Failed to get text embedding for '{query_text}'")
-        return None
+    return embeddings[0]
 
 
 def get_text_embeddings_batch(query_texts: list) -> Optional[np.ndarray]:
@@ -604,7 +573,11 @@ def is_clap_available() -> bool:
     )
 
 
-def get_or_cache_other_feature_text_embeddings(redis_conn) -> Optional[dict]:
+def _other_feature_cache_path() -> str:
+    return os.path.join(config.CLAP_OTHER_FEATURES_CACHE_DIR, config.CLAP_OTHER_FEATURES_CACHE_FILE)
+
+
+def get_or_cache_other_feature_text_embeddings() -> Optional[dict]:
     if not config.CLAP_ENABLED:
         logger.warning("CLAP is disabled, cannot compute other feature text embeddings")
         return None
@@ -614,28 +587,24 @@ def get_or_cache_other_feature_text_embeddings(redis_conn) -> Optional[dict]:
         logger.debug("Using in-process cached CLAP text embeddings")
         return _label_text_embeddings_cache
 
-    cache_key = config.CLAP_OTHER_FEATURES_REDIS_KEY
-
+    cache_path = _other_feature_cache_path()
     try:
-        cached_blob = redis_conn.get(cache_key)
-        if cached_blob is not None:
-            import io
-
-            buf = io.BytesIO(cached_blob)
-            npz = np.load(buf)
+        if os.path.exists(cache_path):
+            npz = np.load(cache_path)
             result = {label: npz[label] for label in npz.files}
             missing = [lbl for lbl in config.OTHER_FEATURE_LABELS if lbl not in result]
             if not missing:
-                logger.info(f"Loaded CLAP text embeddings from Redis cache ({len(result)} labels)")
+                logger.info(
+                    "Loaded CLAP text embeddings from %s (%d labels)", cache_path, len(result)
+                )
                 _label_text_embeddings_cache = result
                 return result
-            else:
-                logger.warning(f"Cached embeddings missing labels: {missing}. Recomputing...")
-    except Exception as e:
-        logger.warning(f"Failed to read CLAP text embeddings from Redis: {e}")
+            logger.warning("Cached embeddings missing labels: %s. Recomputing...", missing)
+    except Exception:
+        logger.warning("Could not read the CLAP text embedding cache", exc_info=True)
 
     logger.info(
-        f"Computing CLAP text embeddings for config.OTHER_FEATURE_LABELS: {config.OTHER_FEATURE_LABELS}"
+        "Computing CLAP text embeddings for %s", config.OTHER_FEATURE_LABELS
     )
     try:
         embeddings = get_text_embeddings_batch(config.OTHER_FEATURE_LABELS)
@@ -646,15 +615,14 @@ def get_or_cache_other_feature_text_embeddings(redis_conn) -> Optional[dict]:
         result = {label: embeddings[i] for i, label in enumerate(config.OTHER_FEATURE_LABELS)}
         _label_text_embeddings_cache = result
         try:
-            import io
-
-            buf = io.BytesIO()
-            np.savez_compressed(buf, **result)
-            buf.seek(0)
-            redis_conn.set(cache_key, buf.read())
-            logger.info(f"Cached CLAP text embeddings in Redis ({buf.tell()} bytes)")
-        except Exception as e:
-            logger.warning(f"Failed to write text embeddings to Redis: {e}")
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            tmp_path = cache_path + '.tmp'
+            with open(tmp_path, 'wb') as cache_file:
+                np.savez_compressed(cache_file, **result)
+            os.replace(tmp_path, cache_path)
+            logger.info("Cached CLAP text embeddings at %s", cache_path)
+        except Exception:
+            logger.warning("Could not write the CLAP text embedding cache", exc_info=True)
         return result
     except Exception:
         logger.exception("Failed to compute CLAP text embeddings for other features")

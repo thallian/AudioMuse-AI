@@ -30,6 +30,8 @@ datas = [
     (os.path.join(ROOT, "static"), "static"),
     (os.path.join(ROOT, "model"), "model"),
     (os.path.join(ROOT, "mood_centroids_real_080_clap.json"), "."),
+    (os.path.join(ROOT, "genre_subgenre.json"), "."),
+    (os.path.join(ROOT, "dclap_sae_concepts.json"), "."),
     # The plugins admin page lives in the blueprint's own template folder; without
     # this entry every native build 500s with TemplateNotFound on /plugins.
     (os.path.join(ROOT, "plugin", "templates"), os.path.join("plugin", "templates")),
@@ -45,12 +47,11 @@ if USE_PGSERVER:
 if not USE_PGSERVER:
     datas += [(os.path.join(ROOT, cfg["vendor_dir"], "postgres", arch), "pgsql")]
 
-for _pkg in ("librosa", "resampy", "flasgger", "wn", "langdetect"):
+for _pkg in ("librosa", "soxr", "flasgger", "wn", "langdetect"):
     datas += collect_data_files(_pkg)
 datas += collect_data_files("transformers", include_py_files=False)
 
 binaries = [
-    (os.path.join(ROOT, cfg["vendor_dir"], "redis", arch, cfg["redis_bin"]), "."),
 ]
 for _pkg in ("av", "psycopg2"):
     binaries += collect_dynamic_libs(_pkg)
@@ -85,18 +86,17 @@ if USE_PGSERVER:
 
 hiddenimports = [
     "app",
-    "rq_worker",
-    "rq_worker_high_priority",
-    "rq_heartbeat_worker",
-    "rq_janitor",
-    "restart_listener",
+    "taskqueue",
+    "taskqueue.worker",
+    "taskqueue.maintenance",
+    "taskqueue.control",
     "waitress",
     "flasgger",
     "numkong",
     "numkong._numkong",
 ]
 hiddenimports += cfg["extra_hiddenimports"]
-for _mod in ("tasks", "lyrics", "sklearn", *cfg["collect_submodules"]):
+for _mod in ("tasks", "lyrics", "sklearn", "joblib", *cfg["collect_submodules"]):
     hiddenimports += collect_submodules(_mod)
 hiddenimports = list(dict.fromkeys(hiddenimports))
 

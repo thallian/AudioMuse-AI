@@ -20,6 +20,12 @@ Main Features:
 * select_diverse_playlists_with_genre_coverage: select a strict Top-N: two
   maximally separated playlists for each of the three most represented genres,
   then four mutually different non-top genres by max-min centroid distance.
+  That centroid distance stays EUCLIDEAN on purpose even though every song
+  level measure is cosine: the rows fed to the clustering model are already
+  L2-normalized, so between unit vectors ||a - b||^2 = 2 - 2*cos(a, b) and the
+  Euclidean spacing IS the cosine spacing; and once PCA has run the space is
+  mean-centred, which preserves Euclidean distance but leaves the origin
+  meaningless, so an angle measured from it would not be a cosine at all.
 """
 
 import logging
@@ -31,6 +37,18 @@ from psycopg2.extras import DictCursor
 
 
 logger = logging.getLogger(__name__)
+
+
+def _fetch_score_details(item_ids: list, db_conn):
+    details_map = {}
+    with db_conn.cursor(cursor_factory=DictCursor) as cur:
+        cur.execute(
+            "SELECT item_id, title, author FROM score WHERE item_id = ANY(%s)",
+            (item_ids,),
+        )
+        for row in cur.fetchall():
+            details_map[row['item_id']] = {'title': row['title'], 'author': row['author']}
+    return details_map
 
 
 def get_vectors_from_database(item_ids: list, db_conn):
@@ -58,7 +76,6 @@ def apply_distance_filtering_direct(song_results: list, db_conn, log_prefix=""):
         DUPLICATE_DISTANCE_THRESHOLD_EUCLIDEAN,
         IVF_METRIC,
     )
-
     if DUPLICATE_DISTANCE_CHECK_LOOKBACK <= 0:
         return song_results
 
@@ -83,12 +100,7 @@ def apply_distance_filtering_direct(song_results: list, db_conn, log_prefix=""):
         )
         return apply_title_artist_deduplication(song_results, db_conn, log_prefix)
 
-    details_map = {}
-    with db_conn.cursor(cursor_factory=DictCursor) as cur:
-        cur.execute("SELECT item_id, title, author FROM score WHERE item_id = ANY(%s)", (item_ids,))
-        rows = cur.fetchall()
-        for row in rows:
-            details_map[row['item_id']] = {'title': row['title'], 'author': row['author']}
+    details_map = _fetch_score_details(item_ids, db_conn)
 
     threshold = (
         DUPLICATE_DISTANCE_THRESHOLD_COSINE
@@ -210,13 +222,7 @@ def apply_title_artist_deduplication(song_results: list, db_conn, log_prefix="")
         return []
 
     item_ids = [s['item_id'] for s in song_results]
-    details_map = {}
-
-    with db_conn.cursor(cursor_factory=DictCursor) as cur:
-        cur.execute("SELECT item_id, title, author FROM score WHERE item_id = ANY(%s)", (item_ids,))
-        rows = cur.fetchall()
-        for row in rows:
-            details_map[row['item_id']] = {'title': row['title'], 'author': row['author']}
+    details_map = _fetch_score_details(item_ids, db_conn)
 
     seen_combinations = set()
     filtered_songs = []
@@ -290,9 +296,7 @@ def _dedupe_single_playlist(playlist_name, songs_list, db_conn, log_prefix):
         f"{log_prefix}SORTED ORDER - First 5 titles: {[song[1] for song in songs_sorted_by_title[:5]]}"
     )
 
-    song_results = [
-        {"item_id": item_id} for item_id, title, author in songs_sorted_by_title
-    ]
+    song_results = [{"item_id": song[0]} for song in songs_sorted_by_title]
 
     logger.debug(
         f"{log_prefix}Filtering playlist '{playlist_name}' with {len(song_results)} songs"
@@ -335,7 +339,7 @@ def _restrict_result_metadata(new_result, best_result, kept_names):
 
 def apply_duplicate_filtering_to_clustering_result(best_result, log_prefix=""):
     try:
-        from app_helper import get_db
+        from database import get_db
 
         if not best_result or not best_result.get("named_playlists"):
             logger.warning(
@@ -711,7 +715,3 @@ def select_diverse_playlists_with_genre_coverage(
     )
 
     return new_result
-
-
-def select_top_n_diverse_playlists(best_result, n):
-    return select_diverse_playlists_with_genre_coverage(best_result, n)

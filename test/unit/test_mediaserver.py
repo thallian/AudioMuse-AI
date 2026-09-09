@@ -17,7 +17,11 @@ Main Features:
 * Best-artist selection, field normalization and playlist/album/track parsing
 * getAllSongs pagination, list-libraries shape, and create-or-replace flows
 * Dispatcher validation and automatic-playlist deletion routing
+* Every provider's create_playlist returns the created playlist on success and
+  None on failure, so a caller may test the result instead of assuming success
 """
+
+import importlib
 
 import pytest
 from unittest.mock import Mock, MagicMock, patch
@@ -543,6 +547,7 @@ class TestNavidromeAuthParams:
 
         mock_config.NAVIDROME_USER = 'testuser'
         mock_config.NAVIDROME_PASSWORD = 'secret123'
+        mock_config.NAVIDROME_API_KEY = ''
         mock_config.APP_VERSION = '1.0.0'
 
         params = get_navidrome_auth_params()
@@ -552,6 +557,26 @@ class TestNavidromeAuthParams:
         hex_password = params['p'].replace('enc:', '')
         decoded = bytes.fromhex(hex_password).decode('utf-8')
         assert decoded == 'secret123'
+        assert 'apiKey' not in params
+
+    @patch('tasks.mediaserver.navidrome.config')
+    def test_prefers_opensubsonic_api_key(self, mock_config):
+        from tasks.mediaserver.navidrome import get_navidrome_auth_params
+
+        mock_config.NAVIDROME_USER = 'testuser'
+        mock_config.NAVIDROME_PASSWORD = 'secret123'
+        mock_config.NAVIDROME_API_KEY = 'oss-api-key'
+
+        params = get_navidrome_auth_params()
+
+        assert params == {
+            'apiKey': 'oss-api-key',
+            'v': '1.16.1',
+            'c': 'AudioMuse-AI',
+            'f': 'json',
+        }
+        assert 'u' not in params
+        assert 'p' not in params
 
     @patch('tasks.mediaserver.navidrome.config')
     def test_returns_empty_when_no_credentials(self, mock_config):
@@ -559,22 +584,196 @@ class TestNavidromeAuthParams:
 
         mock_config.NAVIDROME_USER = ''
         mock_config.NAVIDROME_PASSWORD = ''
+        mock_config.NAVIDROME_API_KEY = ''
 
         params = get_navidrome_auth_params()
 
         assert params == {}
 
+    @patch('tasks.mediaserver.navidrome.config')
+    def test_bound_password_server_ignores_global_api_key(self, mock_config):
+        from tasks.mediaserver import context
+        from tasks.mediaserver.navidrome import get_navidrome_auth_params
+
+        # Default / config projection still holds an apiKey from another server.
+        mock_config.NAVIDROME_USER = 'default-user'
+        mock_config.NAVIDROME_PASSWORD = 'default-pass'
+        mock_config.NAVIDROME_API_KEY = 'default-server-api-key'
+
+        secondary = {
+            'server_id': 'sec',
+            'name': 'Secondary Navidrome',
+            'server_type': 'navidrome',
+            'creds': {
+                'url': 'http://secondary:4533',
+                'user': 'sec-user',
+                'password': 'sec-pass',
+                'api_key': '',
+            },
+            'music_libraries': '',
+            'is_default': False,
+        }
+        with context.use_server(secondary):
+            params = get_navidrome_auth_params(
+                username='sec-user',
+                password='sec-pass',
+                api_key='',
+            )
+
+        assert params.get('u') == 'sec-user'
+        assert params.get('p', '').startswith('enc:')
+        assert 'apiKey' not in params
+
+    @patch('tasks.mediaserver.navidrome.config')
+    def test_bound_apikey_server_ignores_global_password(self, mock_config):
+        from tasks.mediaserver import context
+        from tasks.mediaserver.navidrome import get_navidrome_auth_params
+
+        mock_config.NAVIDROME_USER = 'default-user'
+        mock_config.NAVIDROME_PASSWORD = 'default-pass'
+        mock_config.NAVIDROME_API_KEY = ''
+
+        k7 = {
+            'server_id': 'k7',
+            'name': 'K7 OpenSubsonic',
+            'server_type': 'navidrome',
+            'creds': {
+                'url': 'http://k7:5001',
+                'user': '',
+                'password': '',
+                'api_key': 'k7-api-key',
+            },
+            'music_libraries': '',
+            'is_default': False,
+        }
+        with context.use_server(k7):
+            params = get_navidrome_auth_params(
+                username='',
+                password='',
+                api_key='k7-api-key',
+            )
+
+        assert params == {
+            'apiKey': 'k7-api-key',
+            'v': '1.16.1',
+            'c': 'AudioMuse-AI',
+            'f': 'json',
+        }
+
+    @patch('tasks.mediaserver.navidrome.requests.request')
+    @patch('tasks.mediaserver.navidrome.config')
+    def test_request_ex_bound_password_server_does_not_send_global_api_key(
+        self, mock_config, mock_request
+    ):
+        from tasks.mediaserver import context
+        from tasks.mediaserver.navidrome import _navidrome_request_ex
+
+        mock_config.NAVIDROME_URL = 'http://default:4533'
+        mock_config.NAVIDROME_USER = 'default-user'
+        mock_config.NAVIDROME_PASSWORD = 'default-pass'
+        mock_config.NAVIDROME_API_KEY = 'default-server-api-key'
+        mock_config.APP_VERSION = '1.0'
+
+        mock_response = Mock()
+        mock_response.json.return_value = {'subsonic-response': {'status': 'ok'}}
+        mock_response.raise_for_status = Mock()
+        mock_request.return_value = mock_response
+
+        secondary = {
+            'server_id': 'sec',
+            'name': 'Secondary',
+            'server_type': 'navidrome',
+            'creds': {
+                'url': 'http://secondary:4533',
+                'user': 'sec-user',
+                'password': 'sec-pass',
+                'api_key': '',
+            },
+            'music_libraries': '',
+            'is_default': False,
+        }
+        with context.use_server(secondary):
+            data, err = _navidrome_request_ex('ping')
+
+        assert err is None
+        assert data is not None
+        params = mock_request.call_args[1]['params']
+        assert params['u'] == 'sec-user'
+        assert 'apiKey' not in params
+        url = mock_request.call_args[0][1]
+        assert url.startswith('http://secondary:4533/')
+
+    def test_empty_creds_object_never_falls_back_to_global_config(self):
+        from tasks.mediaserver.navidrome import get_navidrome_auth_params
+
+        params = get_navidrome_auth_params(username='', password='', api_key='')
+
+        assert params == {}
+
+    @patch('tasks.mediaserver.navidrome.requests.request')
+    @patch('tasks.mediaserver.navidrome.config')
+    def test_request_ex_url_only_creds_does_not_send_default_api_key(
+        self, mock_config, mock_request
+    ):
+        from tasks.mediaserver.navidrome import _navidrome_request_ex
+
+        mock_config.NAVIDROME_URL = 'http://default:4533'
+        mock_config.NAVIDROME_USER = 'default-user'
+        mock_config.NAVIDROME_PASSWORD = 'default-pass'
+        mock_config.NAVIDROME_API_KEY = 'default-server-api-key'
+        mock_config.APP_VERSION = '1.0'
+
+        data, err = _navidrome_request_ex(
+            'ping', user_creds={'url': 'http://attacker.example.com'}
+        )
+
+        assert data is None
+        assert err['kind'] == 'config'
+        mock_request.assert_not_called()
+
+
+class TestNavidromeMissingRequiredCreds:
+    def test_api_key_only_is_complete(self):
+        from database import missing_required_creds
+
+        assert missing_required_creds(
+            'navidrome',
+            {'url': 'http://navidrome:4533', 'api_key': 'oss-key'},
+        ) == []
+
+    def test_user_password_only_is_complete(self):
+        from database import missing_required_creds
+
+        assert missing_required_creds(
+            'navidrome',
+            {'url': 'http://navidrome:4533', 'user': 'u', 'password': 'p'},
+        ) == []
+
+    def test_url_only_is_incomplete(self):
+        from database import missing_required_creds
+
+        missing = missing_required_creds('navidrome', {'url': 'http://navidrome:4533'})
+        assert 'user' in missing
+        assert 'password' in missing
+        assert 'url' not in missing
+
 
 class TestNavidromeRequest:
+    @staticmethod
+    def _password_config(mock_config, user='admin', password='password', version='1.0'):
+        mock_config.NAVIDROME_URL = 'http://navidrome:4533'
+        mock_config.NAVIDROME_USER = user
+        mock_config.NAVIDROME_PASSWORD = password
+        # MagicMock is truthy; unset NAVIDROME_API_KEY would pick the apiKey path.
+        mock_config.NAVIDROME_API_KEY = ''
+        mock_config.APP_VERSION = version
+
     @patch('tasks.mediaserver.navidrome.requests.request')
     @patch('tasks.mediaserver.navidrome.config')
     def test_constructs_correct_url_with_view_suffix(self, mock_config, mock_request):
         from tasks.mediaserver.navidrome import _navidrome_request
 
-        mock_config.NAVIDROME_URL = 'http://navidrome:4533'
-        mock_config.NAVIDROME_USER = 'admin'
-        mock_config.NAVIDROME_PASSWORD = 'password'
-        mock_config.APP_VERSION = '1.0'
+        self._password_config(mock_config)
 
         mock_response = Mock()
         mock_response.json.return_value = {'subsonic-response': {'status': 'ok'}}
@@ -592,13 +791,10 @@ class TestNavidromeRequest:
 
     @patch('tasks.mediaserver.navidrome.requests.request')
     @patch('tasks.mediaserver.navidrome.config')
-    def test_parses_subsonic_response_wrapper(self, mock_config, mock_request):
+    def test_parses_opensubsonic_response_wrapper(self, mock_config, mock_request):
         from tasks.mediaserver.navidrome import _navidrome_request
 
-        mock_config.NAVIDROME_URL = 'http://navidrome:4533'
-        mock_config.NAVIDROME_USER = 'admin'
-        mock_config.NAVIDROME_PASSWORD = 'password'
-        mock_config.APP_VERSION = '1.0'
+        self._password_config(mock_config)
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -619,13 +815,47 @@ class TestNavidromeRequest:
 
     @patch('tasks.mediaserver.navidrome.requests.request')
     @patch('tasks.mediaserver.navidrome.config')
+    def test_migration_target_creds_win_over_source_default_api_key(
+        self, mock_config, mock_request
+    ):
+        # Provider Migration passes the TARGET server's creds explicitly and
+        # never binds a server context (unlike the bound-secondary-server
+        # tests in TestNavidromeAuthParams). If the app's own default/source
+        # Navidrome server authenticates via apiKey, that key must not leak
+        # into a request meant for a different (password-auth) target.
+        from tasks.mediaserver.navidrome import _navidrome_request
+
+        mock_config.NAVIDROME_URL = 'http://source-navidrome:4533'
+        mock_config.NAVIDROME_USER = ''
+        mock_config.NAVIDROME_PASSWORD = ''
+        mock_config.NAVIDROME_API_KEY = 'source-api-key'
+        mock_config.APP_VERSION = '1.0'
+
+        mock_response = Mock()
+        mock_response.json.return_value = {'subsonic-response': {'status': 'ok'}}
+        mock_response.raise_for_status = Mock()
+        mock_request.return_value = mock_response
+
+        target_creds = {
+            'url': 'http://target-navidrome:4533',
+            'user': 'target_user',
+            'password': 'target_pass',
+        }
+        _navidrome_request('search3', user_creds=target_creds)
+
+        call_args = mock_request.call_args
+        url = call_args[0][1]
+        sent_params = call_args[1]['params']
+        assert url == 'http://target-navidrome:4533/rest/search3.view'
+        assert sent_params['u'] == 'target_user'
+        assert 'apiKey' not in sent_params
+
+    @patch('tasks.mediaserver.navidrome.requests.request')
+    @patch('tasks.mediaserver.navidrome.config')
     def test_checks_status_field_for_failure(self, mock_config, mock_request):
         from tasks.mediaserver.navidrome import _navidrome_request
 
-        mock_config.NAVIDROME_URL = 'http://navidrome:4533'
-        mock_config.NAVIDROME_USER = 'admin'
-        mock_config.NAVIDROME_PASSWORD = 'password'
-        mock_config.APP_VERSION = '1.0'
+        self._password_config(mock_config)
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -646,10 +876,7 @@ class TestNavidromeRequest:
     def test_includes_auth_params_in_request(self, mock_config, mock_request):
         from tasks.mediaserver.navidrome import _navidrome_request
 
-        mock_config.NAVIDROME_URL = 'http://navidrome:4533'
-        mock_config.NAVIDROME_USER = 'testuser'
-        mock_config.NAVIDROME_PASSWORD = 'secret'
-        mock_config.APP_VERSION = '2.0'
+        self._password_config(mock_config, user='testuser', password='secret', version='2.0')
 
         mock_response = Mock()
         mock_response.json.return_value = {'subsonic-response': {'status': 'ok'}}
@@ -665,16 +892,14 @@ class TestNavidromeRequest:
         assert params.get('p').startswith('enc:'), "Password not hex-encoded"
         assert params.get('f') == 'json', "Format must be json"
         assert 'extra' in params, "Custom params not passed through"
+        assert 'apiKey' not in params
 
     @patch('tasks.mediaserver.navidrome.requests.request')
     @patch('tasks.mediaserver.navidrome.config')
     def test_returns_none_on_http_error(self, mock_config, mock_request):
         from tasks.mediaserver.navidrome import _navidrome_request
 
-        mock_config.NAVIDROME_URL = 'http://navidrome:4533'
-        mock_config.NAVIDROME_USER = 'admin'
-        mock_config.NAVIDROME_PASSWORD = 'password'
-        mock_config.APP_VERSION = '1.0'
+        self._password_config(mock_config)
 
         mock_request.side_effect = requests.exceptions.RequestException("Connection refused")
 
@@ -688,6 +913,7 @@ class TestNavidromeAuthDetection:
         mock_config.NAVIDROME_URL = 'http://navidrome:4533'
         mock_config.NAVIDROME_USER = 'admin'
         mock_config.NAVIDROME_PASSWORD = 'password'
+        mock_config.NAVIDROME_API_KEY = ''
         mock_config.APP_VERSION = '1.0'
 
     @patch('tasks.mediaserver.navidrome.requests.request')
@@ -819,6 +1045,7 @@ class TestNavidromeAuthDetection:
         mock_config.NAVIDROME_URL = 'http://navidrome:4533'
         mock_config.NAVIDROME_USER = ''
         mock_config.NAVIDROME_PASSWORD = ''
+        mock_config.NAVIDROME_API_KEY = ''
 
         data, err = _navidrome_request_ex('search3')
 
@@ -1002,10 +1229,13 @@ class TestNavidromeGetTopPlayedSongsAlbumCap:
 
         result = get_top_played_songs(limit=20, user_creds={})
 
+        assert len(result) == 6
+
         per_album = {}
         for song in result:
             album = song['Id'].split('_')[0]
             per_album[album] = per_album.get(album, 0) + 1
+        assert set(per_album) == {'a1', 'a2', 'a3'}
         assert all(count <= 2 for count in per_album.values()), (
             f"Some album exceeded the cap of 2: {per_album}"
         )
@@ -1546,14 +1776,6 @@ class TestDispatcherAutomaticPlaylistDeletion:
         deleted_ids = [call[0][0] for call in mock_delete.call_args_list]
         assert 'nav1' in deleted_ids
         assert 'nav2' in deleted_ids
-
-
-class TestLyrionSelectBestArtist:
-    def test_artist_priority_order(self):
-        priority_fields = ['trackartist', 'contributor', 'artist', 'albumartist', 'band']
-
-        assert priority_fields[0] == 'trackartist', "trackartist should be highest priority"
-        assert priority_fields[-1] == 'band', "band should be lowest priority"
 
 
 class TestLyrionJsonRpcRequest:
@@ -2452,6 +2674,32 @@ class TestNavidromeCreateOrReplacePlaylist:
 
         assert result is None
 
+    @patch('tasks.mediaserver.navidrome._add_to_playlist', return_value=False)
+    @patch('tasks.mediaserver.navidrome._navidrome_request')
+    def test_new_playlist_overflow_failure_rolls_back_and_returns_none(
+        self, mock_request, _mock_add
+    ):
+        from tasks.mediaserver import navidrome
+
+        mock_request.side_effect = [
+            {'status': 'ok', 'playlist': {'id': 'new-pl', 'name': 'SF'}},
+            {'status': 'ok'},
+            {'status': 'ok'},
+        ]
+        item_ids = [
+            f'song-{index}'
+            for index in range(navidrome.NAVIDROME_API_BATCH_SIZE + 1)
+        ]
+
+        assert navidrome._create_playlist_batched('SF', item_ids) is None
+
+        delete_calls = [
+            call for call in mock_request.call_args_list
+            if call.args and call.args[0] == 'deletePlaylist'
+        ]
+        assert len(delete_calls) == 1
+        assert delete_calls[0].args[1] == {'id': 'new-pl'}
+
 
 class TestJellyfinCreateOrReplacePlaylist:
     @patch('tasks.mediaserver.jellyfin.requests')
@@ -2596,6 +2844,115 @@ class TestJellyfinCreateOrReplacePlaylist:
         assert result is None
         mock_create.assert_not_called()
 
+    @patch('tasks.mediaserver.jellyfin._add_items_to_playlist', return_value=False)
+    @patch('tasks.mediaserver.jellyfin.requests')
+    @patch('tasks.mediaserver.jellyfin.config')
+    def test_new_playlist_overflow_failure_returns_none(
+        self, mock_config, mock_requests, _mock_add
+    ):
+        from tasks.mediaserver import jellyfin
+
+        mock_config.JELLYFIN_URL = 'http://jf'
+        mock_config.JELLYFIN_USER_ID = 'admin-user'
+        mock_config.HEADERS = {'Authorization': 'MediaBrowser Token="t"'}
+        mock_requests.post.return_value.json.return_value = {'Id': 'new-jf', 'Name': 'SF'}
+        item_ids = [
+            f'song-{index}'
+            for index in range(jellyfin.JELLYFIN_PLAYLIST_BATCH_SIZE + 1)
+        ]
+
+        assert jellyfin._create_fresh_playlist('SF', item_ids) is None
+
+
+_DELEGATING_CREATORS = [
+    ('jellyfin', '_create_fresh_playlist'),
+    ('lyrion', '_create_playlist_batched'),
+    ('navidrome', '_create_playlist_batched'),
+    ('plex', '_create_playlist_batched'),
+]
+
+
+class TestCreatePlaylistReturnContract:
+    @pytest.mark.parametrize('provider,creator', _DELEGATING_CREATORS)
+    def test_returns_the_created_playlist_rather_than_none(self, provider, creator):
+        module = importlib.import_module(f'tasks.mediaserver.{provider}')
+        created = {'Id': 'p-1', 'Name': 'Mix'}
+
+        with patch.object(module, creator, return_value=created):
+            assert module.create_playlist('Mix', ['t1']) == created
+
+
+class TestJellyfinCreatePlaylist:
+    @patch('tasks.mediaserver.jellyfin._add_items_to_playlist', return_value=True)
+    @patch('tasks.mediaserver.jellyfin.requests')
+    @patch('tasks.mediaserver.jellyfin.config')
+    def test_overflow_tracks_are_added_instead_of_truncated(
+        self, mock_config, mock_requests, mock_add
+    ):
+        from tasks.mediaserver import jellyfin
+
+        mock_config.JELLYFIN_URL = 'http://jf'
+        mock_config.JELLYFIN_USER_ID = 'admin-user'
+        mock_config.HEADERS = {'Authorization': 'MediaBrowser Token="t"'}
+        post_resp = MagicMock()
+        post_resp.json.return_value = {'Id': 'new-jf', 'Name': 'Mix'}
+        mock_requests.post.return_value = post_resp
+        item_ids = [f'song-{i}' for i in range(jellyfin.JELLYFIN_PLAYLIST_BATCH_SIZE + 5)]
+
+        result = jellyfin.create_playlist('Mix', item_ids)
+
+        assert result['Id'] == 'new-jf'
+        posted = mock_requests.post.call_args[1]['json']['Ids']
+        assert len(posted) == jellyfin.JELLYFIN_PLAYLIST_BATCH_SIZE
+        assert mock_add.call_args[0][1] == item_ids[jellyfin.JELLYFIN_PLAYLIST_BATCH_SIZE:]
+
+    @patch('tasks.mediaserver.jellyfin.requests')
+    @patch('tasks.mediaserver.jellyfin.config')
+    def test_server_rejection_returns_none_instead_of_silent_success(
+        self, mock_config, mock_requests
+    ):
+        from tasks.mediaserver import jellyfin
+
+        mock_config.JELLYFIN_URL = 'http://jf'
+        mock_config.JELLYFIN_USER_ID = 'admin-user'
+        mock_config.HEADERS = {'Authorization': 'MediaBrowser Token="t"'}
+        post_resp = MagicMock()
+        post_resp.raise_for_status.side_effect = requests.exceptions.HTTPError('403')
+        mock_requests.post.return_value = post_resp
+
+        assert jellyfin.create_playlist('Mix', ['t1']) is None
+
+
+class TestEmbyCreatePlaylistReturnContract:
+    @patch('tasks.mediaserver.emby.requests')
+    @patch('tasks.mediaserver.emby.config')
+    def test_returns_the_created_playlist_rather_than_none(self, mock_config, mock_requests):
+        from tasks.mediaserver import emby
+
+        mock_config.EMBY_URL = 'http://emby'
+        mock_config.EMBY_USER_ID = 'user123'
+        mock_config.EMBY_TOKEN = 'tok'
+        mock_requests.utils.quote.side_effect = lambda value: value
+        mock_requests.post.return_value.json.return_value = {'Id': 'new-emby', 'Name': 'Mix'}
+
+        assert emby.create_playlist('Mix', ['t1'])['Id'] == 'new-emby'
+
+    @patch('tasks.mediaserver.emby.requests')
+    @patch('tasks.mediaserver.emby.config')
+    def test_server_rejection_returns_none(self, mock_config, mock_requests):
+        from tasks.mediaserver import emby
+
+        mock_config.EMBY_URL = 'http://emby'
+        mock_config.EMBY_USER_ID = 'user123'
+        mock_config.EMBY_TOKEN = 'tok'
+        mock_requests.utils.quote.side_effect = lambda value: value
+        mock_requests.exceptions = requests.exceptions
+        mock_requests.post.return_value.raise_for_status.side_effect = (
+            requests.exceptions.HTTPError('403')
+        )
+
+        assert emby.create_playlist('Mix', ['t1']) is None
+
 
 class TestEmbyCreateOrReplacePlaylist:
     @patch('tasks.mediaserver.emby.requests')
@@ -2652,6 +3009,51 @@ class TestEmbyCreateOrReplacePlaylist:
         result = create_or_replace_playlist('SF', ['n1'])
 
         assert result is None
+
+    @patch('tasks.mediaserver.emby._add_items_to_playlist', return_value=False)
+    @patch('tasks.mediaserver.emby.requests')
+    @patch('tasks.mediaserver.emby.get_playlist_by_name', return_value=None)
+    @patch('tasks.mediaserver.emby.config')
+    def test_new_playlist_overflow_failure_returns_none(
+        self, mock_config, _mock_get, mock_requests, _mock_add
+    ):
+        from tasks.mediaserver import emby
+
+        mock_config.EMBY_URL = 'http://emby'
+        mock_config.EMBY_USER_ID = 'admin-emby'
+        mock_config.EMBY_TOKEN = 'tok'
+        mock_requests.utils.quote.side_effect = lambda value: value
+        mock_requests.post.return_value.json.return_value = {
+            'Id': 'new-emby',
+            'Name': 'SF',
+        }
+        item_ids = [
+            f'song-{index}'
+            for index in range(emby.EMBY_PLAYLIST_BATCH_SIZE + 1)
+        ]
+
+        assert emby.create_or_replace_playlist('SF', item_ids) is None
+
+
+class TestLyrionCreatePlaylistBatched:
+    @patch('tasks.mediaserver.lyrion._add_to_playlist')
+    @patch('tasks.mediaserver.lyrion._jsonrpc_request')
+    def test_refuses_overwritten_playlist_response(self, mock_rpc, mock_add):
+        from tasks.mediaserver.lyrion import _create_playlist_batched
+
+        mock_rpc.return_value = {'overwritten_playlist_id': 77}
+
+        result = _create_playlist_batched('Managed', ['t1'])
+
+        assert result is None
+        mock_add.assert_not_called()
+
+    @patch('tasks.mediaserver.lyrion._add_to_playlist', return_value=False)
+    @patch('tasks.mediaserver.lyrion._jsonrpc_request', return_value={'playlist_id': 78})
+    def test_track_add_failure_is_not_reported_as_success(self, _mock_rpc, _mock_add):
+        from tasks.mediaserver.lyrion import _create_playlist_batched
+
+        assert _create_playlist_batched('Managed', ['t1']) is None
 
 
 class TestLyrionCreateOrReplacePlaylist:

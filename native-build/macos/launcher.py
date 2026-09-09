@@ -10,45 +10,31 @@
 
 Single frozen executable that runs as the menu-bar supervisor by default or,
 with ``--role=``, as one of its child processes: the Flask/waitress server or
-an RQ worker/janitor/restart-listener. It also applies the scipy longdouble
-warmup before the RQ fork to avoid the macOS newlocale crash. The
+a queue worker/maintenance/control-listener. It also applies the scipy longdouble
+warmup before the first analysis job to avoid the macOS newlocale crash. The
 Linux/Windows launchers are the platform-specific siblings.
 
 Main Features:
-* Runs Flask via waitress or launches a named RQ role in-process.
+* Runs Flask via waitress or launches a named queue role in-process.
 * Pins the numeric locale early and warms up scipy longdouble for every role
-  except janitor and restart-listener (macOS newlocale crash fix).
+  except maintenance and restart-listener (macOS newlocale crash fix).
+* Hands multiprocessing/loky spawn payloads to ``native_common.frozen_children``
+  and rejects any other unknown argv rather than starting a second menu bar.
 """
 
 import os
-import runpy
 import subprocess
 import sys
 import threading
 
-
-def _role_from_argv():
-    for arg in sys.argv[1:]:
-        if arg.startswith("--role="):
-            return arg.split("=", 1)[1]
-    return None
+import service_roles
+from native_common import frozen_children
 
 
-def _run_flask():
-    import waitress
-    import app as app_module
-
-    waitress.serve(
-        app_module.app,
-        host="0.0.0.0",
-        port=8000,
-        threads=8,
-        max_request_body_size=6 * 1024 * 1024 * 1024,
-        channel_timeout=300,
-    )
-
-
-_NO_LONGDOUBLE_WARMUP_ROLES = {"janitor", "restart-listener"}
+_NO_LONGDOUBLE_WARMUP_ROLES = {
+    service_roles.ROLE_MAINTENANCE,
+    service_roles.ROLE_RESTART_LISTENER,
+}
 
 
 def _run_role(role):
@@ -59,20 +45,7 @@ def _run_role(role):
             numeric_bootstrap.warmup_scipy_longdouble()
         except Exception:
             pass
-    if role == "flask":
-        _run_flask()
-    elif role == "worker-high":
-        runpy.run_module("rq_worker_high_priority", run_name="__main__")
-    elif role == "worker-default":
-        runpy.run_module("rq_worker", run_name="__main__")
-    elif role == "janitor":
-        runpy.run_module("rq_janitor", run_name="__main__")
-    elif role == "restart-listener":
-        import restart_listener
-
-        restart_listener.main()
-    else:
-        raise SystemExit(f"Unknown role: {role}")
+    service_roles.run_role(role, service_roles.serve_flask)
 
 
 _INSTANCE_LOCK = None
@@ -177,17 +150,16 @@ def main():
     except Exception:
         pass
 
-    if "--run-restore" in sys.argv:
-        i = sys.argv.index("--run-restore")
-        from app_backup import _run_restore_runner
+    if frozen_children.dispatch_child_invocation(_run_role):
+        return
 
-        sys.exit(_run_restore_runner(sys.argv[i + 1], sys.argv[i + 2]))
+    unknown = service_roles.command_from_argv()
+    if unknown is not None:
+        print(f"Unknown argument: {unknown}", file=sys.stderr)
+        print("Usage: AudioMuse-AI [--role=<role>]", file=sys.stderr)
+        sys.exit(2)
 
-    role = _role_from_argv()
-    if role:
-        _run_role(role)
-    else:
-        _run_menubar()
+    _run_menubar()
 
 
 if __name__ == "__main__":

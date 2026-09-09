@@ -21,29 +21,41 @@ Main Features:
   which only this process holds.
 * Each row is claimed atomically for its wall-clock minute, so a restart or a
   second web process cannot double-fire it.
+* A central queue guard makes analysis, clustering, sonic fingerprint, plugin
+  tasks (and the manual cleaning / provider migration starts) mutually
+  exclusive; a scheduled run blocked by a live queue-guard task is recorded in
+  `cron_retry` and re-attempted every `CRON_RETRY_INTERVAL_MINUTES` up to
+  `CRON_RETRY_MAX_MINUTES`, then recorded as a visible skip (fail-safe).
 * An inline run can never wedge the app: its task type is self-managed (no Start
-  ever 409s behind it), it heartbeats progress so the RQ janitor does not mistake
-  it for an orphan, and `reap_interrupted_inline_runs` fails at cron-thread startup
-  whatever a restart left non-terminal.
+  ever 409s behind it), it has no queue func so the maintenance reclaim cannot
+  mistake it for a dead worker's orphan, and `reap_interrupted_inline_runs` fails
+  at cron-thread startup whatever a restart left non-terminal.
 """
 
 from flask import Blueprint, render_template, jsonify, request
 from psycopg2.extras import DictCursor, Json
-from rq import Retry
 from database import (
     get_db,
     save_task_status,
-    get_active_main_task,
+    get_queue_blocking_task,
+    clean_up_previous_main_tasks,
+    main_task_start_lock,
+    record_cron_retry,
+    list_pending_cron_retries,
+    clear_cron_retry,
+    bump_cron_retry,
+    cron_retry_task_already_done,
     INLINE_FLASK_TASK_TYPES,
 )
-from taskqueue import rq_queue_high, rq_queue_default
+import taskqueue
 from config import (
-    TASK_STATUS_PENDING,
     TASK_STATUS_FAILURE,
     TASK_STATUS_STARTED,
     TASK_STATUS_PROGRESS,
     TASK_STATUS_SUCCESS,
     TASK_STATUS_REVOKED,
+    CRON_RETRY_MAX_MINUTES,
+    CRON_RETRY_INTERVAL_MINUTES,
 )
 import uuid
 import time
@@ -155,8 +167,22 @@ def get_cron_entries():
     )
     rows = cur.fetchall()
     cur.close()
+    now_ts = time.time()
+    retry_by_type = {
+        retry['task_type']: retry for retry in list_pending_cron_retries(conn=db)
+    }
     entries = []
     for r in rows:
+        retry = retry_by_type.get(r['task_type'])
+        if retry is not None and (retry['retry_until'] is None or retry['retry_until'] > now_ts):
+            retry_info = {
+                'retry_pending': True,
+                'retry_until': retry['retry_until'],
+                'retry_attempts': retry['attempts'],
+                'retry_blocker_task_type': retry['blocker_task_type'],
+            }
+        else:
+            retry_info = {'retry_pending': False}
         entries.append(
             {
                 'id': r['id'],
@@ -167,6 +193,7 @@ def get_cron_entries():
                 'last_run': r['last_run'],
                 'created_at': str(r['created_at']),
                 'options': r['options'] if isinstance(r['options'], dict) else {},
+                **retry_info,
             }
         )
     # Remove the special-case append for sonic_fingerprint; now handled by DB init
@@ -373,14 +400,6 @@ _CRON_FIELD_DOMAINS = (
 
 
 def _cron_expr_problem(expr):
-    """A human-readable reason ``expr`` can never fire, or None when it is valid.
-
-    Decided by running each field over its real domain through the SAME matcher the
-    scheduler uses, so the validator cannot drift from the thing it validates. Names
-    like MON or @daily are not supported: int() raises on them and _field_matches
-    swallows the error, so such a row would be stored, shown as active, and silently
-    never run.
-    """
     if not expr or not str(expr).strip():
         return "Enter a cron expression, or disable the schedule."
     parts = str(expr).strip().split()
@@ -431,13 +450,6 @@ def cron_matches_now(expr, ts=None):
 
 
 def _claim_cron_minute(db, row_id, minute_start):
-    """Claim ``row_id`` for the wall-clock minute starting at ``minute_start``.
-
-    True exactly once per row per minute, however many processes or restarts race
-    for it: the predicate on last_run makes the claim atomic. The row is marked run
-    BEFORE the work is enqueued, so a crash in between drops that occurrence rather
-    than duplicating it - the right trade for a batch task.
-    """
     cur = db.cursor()
     try:
         cur.execute(
@@ -453,15 +465,6 @@ def _claim_cron_minute(db, row_id, minute_start):
 
 
 def reap_interrupted_inline_runs():
-    """Fail every inline cron row left non-terminal by a web-process restart.
-
-    An inline run lives in the Flask process and nothing else writes its final
-    status, so a restart mid-run used to leave a STARTED row that no code path
-    ever resolved. Called once as the cron thread starts, where a live inline run
-    cannot exist: this process is the only one that runs them, and it is starting.
-    Skipping the interrupted occurrence is the accepted outcome - the row must not
-    outlive the process that owned it.
-    """
     db = get_db()
     cur = db.cursor(cursor_factory=DictCursor)
     try:
@@ -511,11 +514,7 @@ def _inline_progress_reporter(job_id, task_type):
         try:
             save_task_status(
                 job_id, task_type, TASK_STATUS_PROGRESS, progress=pct,
-                details={
-                    'message': message,
-                    'status_message': message,
-                    'log': [f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"],
-                },
+                details={'message': message, 'status_message': message},
             )
         except Exception:
             logger.debug("Cron: inline progress update failed (ignored)", exc_info=True)
@@ -523,13 +522,361 @@ def _inline_progress_reporter(job_id, task_type):
     return report
 
 
-def run_due_cron_jobs():
-    """Start every enabled cron row whose expression matches this minute.
+def _enqueue_cron_job(job_id, task_type, enqueue, *, conn=None):
+    with main_task_start_lock(conn=conn):
+        return _admit_and_enqueue_cron_job(job_id, task_type, enqueue, conn=conn)
 
-    Batch rows are enqueued so a slow media server cannot swallow a scheduling
-    window; the alchemy radio runs inline in this process, which is the only one
-    holding the in-memory similarity index it needs.
-    """
+
+def _admit_and_enqueue_cron_job(job_id, task_type, enqueue, *, conn):
+    active = get_queue_blocking_task(conn=conn)
+    if active:
+        logger.info(
+            "Cron: skipping %s, task %s is still %s",
+            task_type, active['task_id'], active['status'],
+        )
+        return 'blocked'
+
+    if task_type in ('main_analysis', 'main_clustering'):
+        try:
+            clean_up_previous_main_tasks()
+        except Exception:
+            logger.exception("Cron: could not archive previous main tasks; queueing anyway")
+
+    try:
+        enqueue()
+        # Commit before returning. The enqueue runs on the request connection so
+        # that the claim read and the queue row are one atomic act, which means
+        # nothing has committed it yet: a later cron row in the same tick raising
+        # into `db.rollback()` would otherwise throw this job away while last_run
+        # stayed advanced - the schedule fires, nothing runs, and the next
+        # occurrence is a minute later.
+        if conn is not None:
+            conn.commit()
+    except taskqueue.TaskAlreadyRunning:
+        logger.info("Cron: %s lost the race to another live main task.", task_type)
+        return 'blocked'
+    except Exception:
+        logger.exception("Cron: could not queue %s", task_type)
+        return 'failed'
+    logger.info("Cron: queued %s job %s", task_type, job_id)
+    return 'enqueued'
+
+
+_CRON_RETRY_TASK_TYPES = ('analysis', 'clustering', 'sonic_fingerprint')
+
+# Plugin cron rows are not in the fixed tuple above (their task_type is the
+# plugin's own dotted path, not a fixed name), but they are still admitted
+# through the same blocking=True queue guard, so a busy queue can starve them
+# exactly like the three fixed types - they get the same retry coverage via
+# the startswith('plugin.') checks below.
+_CRON_TASK_TYPE_TO_QUEUE_TYPE = {
+    'analysis': 'main_analysis',
+    'clustering': 'main_clustering',
+    'sonic_fingerprint': 'sonic_fingerprint',
+}
+
+
+def _cron_retry_eligible(task_type):
+    return task_type in _CRON_RETRY_TASK_TYPES or task_type.startswith('plugin.')
+
+
+def _queue_type_for_cron_task_type(task_type):
+    return _CRON_TASK_TYPE_TO_QUEUE_TYPE.get(task_type, task_type)
+
+
+def _dispatch_cron_row(db, r):
+    task_type = r['task_type']
+    # Batch work always covers every configured server, one server at
+    # a time. There is no per-schedule scope: a "default server only"
+    # schedule left every other server's exclusive songs unanalyzed
+    # and without playlists, silently.
+    server_scope = 'all'
+    job_id = str(uuid.uuid4())
+    if task_type == 'analysis':
+        return _enqueue_cron_job(
+            job_id,
+            'main_analysis',
+            lambda job_id=job_id, server_scope=server_scope: taskqueue.enqueue(
+                'tasks.analysis.run_analysis_task',
+                args=(0, TOP_N_MOODS),
+                kwargs={'server_scope': server_scope},
+                task_id=job_id,
+                task_type='main_analysis',
+                queue=taskqueue.QUEUE_HIGH,
+                details={"message": _ENQUEUED_BY_CRON},
+                conn=db,
+            ),
+            conn=db,
+        )
+    elif task_type == 'clustering':
+        clustering_kwargs = {
+            "clustering_method": CLUSTER_ALGORITHM,
+            "num_clusters_min": int(NUM_CLUSTERS_MIN),
+            "num_clusters_max": int(NUM_CLUSTERS_MAX),
+            "dbscan_eps_min": float(DBSCAN_EPS_MIN),
+            "dbscan_eps_max": float(DBSCAN_EPS_MAX),
+            "dbscan_min_samples_min": int(DBSCAN_MIN_SAMPLES_MIN),
+            "dbscan_min_samples_max": int(DBSCAN_MIN_SAMPLES_MAX),
+            "gmm_n_components_min": int(GMM_N_COMPONENTS_MIN),
+            "gmm_n_components_max": int(GMM_N_COMPONENTS_MAX),
+            "spectral_n_clusters_min": int(SPECTRAL_N_CLUSTERS_MIN),
+            "spectral_n_clusters_max": int(SPECTRAL_N_CLUSTERS_MAX),
+            "pca_components_min": int(PCA_COMPONENTS_MIN),
+            "pca_components_max": int(PCA_COMPONENTS_MAX),
+            "num_clustering_runs": int(CLUSTERING_RUNS),
+            "max_songs_per_cluster_val": int(MAX_SONGS_PER_CLUSTER),
+            "top_n_playlists_param": int(TOP_N_CLUSTERING_PLAYLIST),
+            "min_songs_per_genre_for_stratification_param": int(
+                MIN_SONGS_PER_GENRE_FOR_STRATIFICATION
+            ),
+            "stratified_sampling_target_percentile_param": int(
+                STRATIFIED_SAMPLING_TARGET_PERCENTILE
+            ),
+            "score_weight_diversity_param": float(SCORE_WEIGHT_DIVERSITY),
+            "score_weight_silhouette_param": float(SCORE_WEIGHT_SILHOUETTE),
+            "score_weight_davies_bouldin_param": float(SCORE_WEIGHT_DAVIES_BOULDIN),
+            "score_weight_calinski_harabasz_param": float(
+                SCORE_WEIGHT_CALINSKI_HARABASZ
+            ),
+            "score_weight_purity_param": float(SCORE_WEIGHT_PURITY),
+            "score_weight_other_feature_diversity_param": float(
+                SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY
+            ),
+            "score_weight_other_feature_purity_param": float(
+                SCORE_WEIGHT_OTHER_FEATURE_PURITY
+            ),
+            "ai_model_provider_param": AI_MODEL_PROVIDER,
+            "ollama_server_url_param": OLLAMA_SERVER_URL,
+            "ollama_model_name_param": OLLAMA_MODEL_NAME,
+            "openai_server_url_param": OPENAI_SERVER_URL,
+            "openai_model_name_param": OPENAI_MODEL_NAME,
+            "openai_api_key_param": OPENAI_API_KEY,
+            "gemini_api_key_param": GEMINI_API_KEY,
+            "gemini_model_name_param": GEMINI_MODEL_NAME,
+            "mistral_api_key_param": MISTRAL_API_KEY,
+            "mistral_model_name_param": MISTRAL_MODEL_NAME,
+            "top_n_moods_for_clustering_param": int(TOP_N_MOODS),
+            "enable_clustering_embeddings_param": bool(ENABLE_CLUSTERING_EMBEDDINGS),
+            "output_server_scope": server_scope,
+        }
+        return _enqueue_cron_job(
+            job_id,
+            'main_clustering',
+            lambda job_id=job_id, clustering_kwargs=clustering_kwargs: taskqueue.enqueue(
+                'tasks.clustering.run_clustering_task',
+                kwargs=clustering_kwargs,
+                task_id=job_id,
+                task_type='main_clustering',
+                queue=taskqueue.QUEUE_HIGH,
+                details={"message": _ENQUEUED_BY_CRON},
+                conn=db,
+            ),
+            conn=db,
+        )
+    elif task_type == 'alchemy_radio':
+        # Radios run INLINE, here in the Flask process, because they are an
+        # online feature: every radio queries the in-memory similarity index,
+        # and only this process loads it (app.py skips the load when
+        # AUDIOMUSE_ROLE=worker). Enqueued on a worker the index is absent, so
+        # every radio failed with "no tracks available on this server". This
+        # blocks the poll thread for the length of the run, which is the
+        # accepted trade for a schedule that fires once a day.
+        #
+        # Nothing else can write this row's final status, so it must never
+        # gate other work: alchemy_radio is in SELF_MANAGED_TASK_TYPES (so no
+        # Start ever 409s behind it), the run heartbeats its progress, and
+        # reap_interrupted_inline_runs fails whatever a restart left behind.
+        from tasks.radio_manager import run_radio_playlists
+
+        save_task_status(
+            job_id, task_type, TASK_STATUS_STARTED, progress=0,
+            details={"message": _STARTED_BY_CRON},
+        )
+        try:
+            summary = run_radio_playlists(
+                server_scope=server_scope,
+                report=_inline_progress_reporter(job_id, task_type),
+            )
+            save_task_status(
+                job_id, task_type, TASK_STATUS_SUCCESS, progress=100,
+                details=summary,
+            )
+            logger.info(
+                "Cron: ran radio playlists inline (job_id=%s, summary=%s)",
+                job_id, summary,
+            )
+            return 'enqueued'
+        except Exception:
+            logger.exception("Cron: radio playlist run failed")
+            db.rollback()
+            save_task_status(
+                job_id, task_type, TASK_STATUS_FAILURE, progress=100,
+                details={
+                    "error": "Radio playlist run failed; check the container logs."
+                },
+            )
+            return 'failed'
+    elif task_type == 'sonic_fingerprint':
+        # Enqueued, not run inline: this one walks the media server's play
+        # history per user, and doing that on the 60s poll thread let one
+        # unreachable provider swallow whole scheduling windows.
+        return _enqueue_cron_job(
+            job_id,
+            task_type,
+            lambda job_id=job_id, server_scope=server_scope, task_type=task_type: taskqueue.enqueue(
+                'tasks.sonic_fingerprint_manager.run_sonic_fingerprint_task',
+                kwargs={'server_scope': server_scope},
+                task_id=job_id,
+                task_type=task_type,
+                queue=taskqueue.QUEUE_DEFAULT,
+                details={"message": _ENQUEUED_BY_CRON},
+                conn=db,
+            ),
+            conn=db,
+        )
+    elif task_type.startswith('plugin.'):
+        from plugin.manager import plugin_manager
+
+        cron_task = plugin_manager.get_cron_task(task_type)
+        if not cron_task:
+            logger.warning(
+                f"Cron: no registered plugin task for {task_type}; skipping"
+            )
+            return 'no_handler'
+        queue = (
+            taskqueue.QUEUE_HIGH
+            if cron_task.get('queue') == 'high'
+            else taskqueue.QUEUE_DEFAULT
+        )
+        return _enqueue_cron_job(
+            job_id,
+            task_type,
+            lambda job_id=job_id, server_scope=server_scope, task_type=task_type, queue=queue, cron_task=cron_task: taskqueue.enqueue(
+                'plugin.manager.run_plugin_task',
+                args=(cron_task['dotted'],),
+                kwargs={
+                    'server_scope': server_scope,
+                    'task_claim_required': True,
+                },
+                task_id=job_id,
+                task_type=task_type,
+                queue=queue,
+                details={"message": _ENQUEUED_BY_CRON},
+                conn=db,
+            ),
+            conn=db,
+        )
+    return 'unknown'
+
+
+def _record_cron_retry(db, task_type):
+    if not _cron_retry_eligible(task_type):
+        return
+    now_ts = time.time()
+    blocker = get_queue_blocking_task(conn=db)
+    record_cron_retry(
+        task_type,
+        now_ts + CRON_RETRY_MAX_MINUTES * 60,
+        first_blocked_at=now_ts,
+        blocker_task_id=blocker['task_id'] if blocker else None,
+        blocker_task_type=blocker['task_type'] if blocker else None,
+        conn=db,
+    )
+
+
+def _cron_row_for_retry(db, task_type):
+    cur = db.cursor(cursor_factory=DictCursor)
+    try:
+        cur.execute(
+            "SELECT id, name, task_type, cron_expr, enabled, last_run, options "
+            "FROM cron WHERE task_type = %s AND enabled = true LIMIT 1",
+            (task_type,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+    finally:
+        cur.close()
+
+
+def _record_retry_expired(task_type, entry):
+    job_id = str(uuid.uuid4())
+    details = {
+        "message": f"Scheduled {task_type} did not run: it was blocked for over "
+                   f"{CRON_RETRY_MAX_MINUTES} minutes and never became free.",
+        "status_message": f"Blocked for over {CRON_RETRY_MAX_MINUTES} minutes; not run.",
+        "blocked_by": entry.get('blocker_task_type'),
+        "attempts": entry.get('attempts', 0),
+    }
+    try:
+        # The queue type (e.g. main_analysis), not the cron row's own name, so
+        # this failed row reads like every other analysis/clustering task
+        # instead of an unfamiliar bare "analysis"/"clustering" type.
+        save_task_status(
+            job_id, _queue_type_for_cron_task_type(task_type), TASK_STATUS_FAILURE,
+            progress=100, details=details,
+        )
+    except Exception:
+        logger.exception("Cron: could not record expired retry for %s", task_type)
+    logger.warning(
+        "Cron: %s expired in the retry list after %s minutes without running.",
+        task_type, CRON_RETRY_MAX_MINUTES,
+    )
+
+
+def _touch_cron_last_run(db, row_id):
+    try:
+        cur = db.cursor()
+        try:
+            cur.execute("UPDATE cron SET last_run = %s WHERE id = %s", (time.time(), row_id))
+            db.commit()
+        finally:
+            cur.close()
+    except Exception:
+        logger.exception("Cron: could not update last_run for cron row %s", row_id)
+
+
+def retry_due_cron_jobs():
+    pending = list_pending_cron_retries()
+    if not pending:
+        return 0
+    db = get_db()
+    now_ts = time.time()
+    for entry in pending:
+        task_type = entry['task_type']
+        if entry['retry_until'] is not None and now_ts >= entry['retry_until']:
+            clear_cron_retry(task_type, conn=db)
+            _record_retry_expired(task_type, entry)
+            continue
+        row = _cron_row_for_retry(db, task_type)
+        if row is None:
+            clear_cron_retry(task_type, conn=db)
+            continue
+        if cron_retry_task_already_done(task_type, entry.get('first_blocked_at'), conn=db):
+            clear_cron_retry(task_type, conn=db)
+            continue
+        result = _dispatch_cron_row(db, row)
+        if result == 'enqueued':
+            clear_cron_retry(task_type, conn=db)
+            # The claim earlier stamped last_run for the blocked attempt; a
+            # retried run actually happening now must move it forward too, or
+            # the Scheduled Tasks page keeps showing the old blocked timestamp.
+            _touch_cron_last_run(db, row['id'])
+        elif result == 'blocked':
+            blocker = get_queue_blocking_task(conn=db)
+            bump_cron_retry(
+                task_type,
+                blocker_task_id=blocker['task_id'] if blocker else None,
+                blocker_task_type=blocker['task_type'] if blocker else None,
+                conn=db,
+            )
+        elif result == 'no_handler':
+            clear_cron_retry(task_type, conn=db)
+        else:
+            bump_cron_retry(task_type, conn=db)
+    return len(pending)
+
+
+def run_due_cron_jobs():
     db = get_db()
     cur = db.cursor(cursor_factory=DictCursor)
     cur.execute(
@@ -551,225 +898,25 @@ def run_due_cron_jobs():
                 # dashboard's Last-run display.
                 if not _claim_cron_minute(db, r['id'], minute_start):
                     continue
-                task_type = r['task_type']
-                # Batch work always covers every configured server, one server at
-                # a time. There is no per-schedule scope: a "default server only"
-                # schedule left every other server's exclusive songs unanalyzed
-                # and without playlists, silently.
-                server_scope = 'all'
-                job_id = str(uuid.uuid4())
-                if task_type in ('analysis', 'clustering'):
-                    # The manual endpoints 409 while any main task is live; cron used
-                    # to enqueue regardless, so a nightly row could start a second
-                    # full run on top of one still in progress.
-                    active = get_active_main_task()
-                    if active:
-                        logger.info(
-                            "Cron: skipping %s, main task %s is still %s",
-                            task_type, active['task_id'], active['status'],
-                        )
-                        continue
-                if task_type == 'analysis':
-                    # mark queued in task_status
-                    save_task_status(
-                        job_id,
-                        f"main_{task_type}",
-                        TASK_STATUS_PENDING,
-                        details={"message": _ENQUEUED_BY_CRON},
-                    )
-                    try:
-                        rq_queue_high.enqueue(
-                            'tasks.analysis.run_analysis_task',
-                            args=(0, TOP_N_MOODS),
-                            kwargs={'server_scope': server_scope},
-                            job_id=job_id,
-                            description='Cron Analysis',
-                            job_timeout=-1,
-                            retry=Retry(max=3),
-                        )
-                        logger.info(f"Cron: enqueued analysis job {job_id}")
-                    except Exception:
-                        logger.exception("Cron: enqueue failed for analysis")
-                        save_task_status(
-                            job_id, f"main_{task_type}", TASK_STATUS_FAILURE,
-                            details={"error": "Could not enqueue the task (is Redis reachable?)"},
-                        )
-                elif task_type == 'clustering':
-                    # mark queued in task_status
-                    save_task_status(
-                        job_id,
-                        f"main_{task_type}",
-                        TASK_STATUS_PENDING,
-                        details={"message": _ENQUEUED_BY_CRON},
-                    )
-                    clustering_kwargs = {
-                        "clustering_method": CLUSTER_ALGORITHM,
-                        "num_clusters_min": int(NUM_CLUSTERS_MIN),
-                        "num_clusters_max": int(NUM_CLUSTERS_MAX),
-                        "dbscan_eps_min": float(DBSCAN_EPS_MIN),
-                        "dbscan_eps_max": float(DBSCAN_EPS_MAX),
-                        "dbscan_min_samples_min": int(DBSCAN_MIN_SAMPLES_MIN),
-                        "dbscan_min_samples_max": int(DBSCAN_MIN_SAMPLES_MAX),
-                        "gmm_n_components_min": int(GMM_N_COMPONENTS_MIN),
-                        "gmm_n_components_max": int(GMM_N_COMPONENTS_MAX),
-                        "spectral_n_clusters_min": int(SPECTRAL_N_CLUSTERS_MIN),
-                        "spectral_n_clusters_max": int(SPECTRAL_N_CLUSTERS_MAX),
-                        "pca_components_min": int(PCA_COMPONENTS_MIN),
-                        "pca_components_max": int(PCA_COMPONENTS_MAX),
-                        "num_clustering_runs": int(CLUSTERING_RUNS),
-                        "max_songs_per_cluster_val": int(MAX_SONGS_PER_CLUSTER),
-                        # Legacy RQ kwarg keeps rolling web/worker deploys compatible.
-                        "top_n_playlists_param": int(TOP_N_CLUSTERING_PLAYLIST),
-                        "min_songs_per_genre_for_stratification_param": int(
-                            MIN_SONGS_PER_GENRE_FOR_STRATIFICATION
-                        ),
-                        "stratified_sampling_target_percentile_param": int(
-                            STRATIFIED_SAMPLING_TARGET_PERCENTILE
-                        ),
-                        "score_weight_diversity_param": float(SCORE_WEIGHT_DIVERSITY),
-                        "score_weight_silhouette_param": float(SCORE_WEIGHT_SILHOUETTE),
-                        "score_weight_davies_bouldin_param": float(SCORE_WEIGHT_DAVIES_BOULDIN),
-                        "score_weight_calinski_harabasz_param": float(
-                            SCORE_WEIGHT_CALINSKI_HARABASZ
-                        ),
-                        "score_weight_purity_param": float(SCORE_WEIGHT_PURITY),
-                        "score_weight_other_feature_diversity_param": float(
-                            SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY
-                        ),
-                        "score_weight_other_feature_purity_param": float(
-                            SCORE_WEIGHT_OTHER_FEATURE_PURITY
-                        ),
-                        "ai_model_provider_param": AI_MODEL_PROVIDER,
-                        "ollama_server_url_param": OLLAMA_SERVER_URL,
-                        "ollama_model_name_param": OLLAMA_MODEL_NAME,
-                        "openai_server_url_param": OPENAI_SERVER_URL,
-                        "openai_model_name_param": OPENAI_MODEL_NAME,
-                        "openai_api_key_param": OPENAI_API_KEY,
-                        "gemini_api_key_param": GEMINI_API_KEY,
-                        "gemini_model_name_param": GEMINI_MODEL_NAME,
-                        "mistral_api_key_param": MISTRAL_API_KEY,
-                        "mistral_model_name_param": MISTRAL_MODEL_NAME,
-                        "top_n_moods_for_clustering_param": int(TOP_N_MOODS),
-                        "enable_clustering_embeddings_param": bool(ENABLE_CLUSTERING_EMBEDDINGS),
-                        "output_server_scope": server_scope,
-                    }
-                    try:
-                        rq_queue_high.enqueue(
-                            'tasks.clustering.run_clustering_task',
-                            kwargs=clustering_kwargs,
-                            job_id=job_id,
-                            description='Cron Clustering',
-                            job_timeout=-1,
-                            retry=Retry(max=3),
-                        )
-                        logger.info(f"Cron: enqueued clustering job {job_id}")
-                    except Exception:
-                        logger.exception("Cron: enqueue failed for clustering")
-                        save_task_status(
-                            job_id, f"main_{task_type}", TASK_STATUS_FAILURE,
-                            details={"error": "Could not enqueue the task (is Redis reachable?)"},
-                        )
-                elif task_type == 'alchemy_radio':
-                    # Radios run INLINE, here in the Flask process, because they are an
-                    # online feature: every radio queries the in-memory similarity index,
-                    # and only this process loads it (app.py skips the load when
-                    # AUDIOMUSE_ROLE=worker). Enqueued on a worker the index is absent, so
-                    # every radio failed with "no tracks available on this server". This
-                    # blocks the poll thread for the length of the run, which is the
-                    # accepted trade for a schedule that fires once a day.
-                    #
-                    # Nothing else can write this row's final status, so it must never
-                    # gate other work: alchemy_radio is in SELF_MANAGED_TASK_TYPES (so no
-                    # Start ever 409s behind it), the run heartbeats its progress, and
-                    # reap_interrupted_inline_runs fails whatever a restart left behind.
-                    from tasks.radio_manager import run_radio_playlists
-
-                    save_task_status(
-                        job_id, task_type, TASK_STATUS_STARTED, progress=0,
-                        details={"message": _STARTED_BY_CRON},
-                    )
-                    try:
-                        summary = run_radio_playlists(
-                            server_scope=server_scope,
-                            report=_inline_progress_reporter(job_id, task_type),
-                        )
-                        save_task_status(
-                            job_id, task_type, TASK_STATUS_SUCCESS, progress=100,
-                            details=summary,
-                        )
-                        logger.info(
-                            "Cron: ran radio playlists inline (job_id=%s, summary=%s)",
-                            job_id, summary,
-                        )
-                    except Exception:
-                        logger.exception("Cron: radio playlist run failed")
-                        db.rollback()
-                        save_task_status(
-                            job_id, task_type, TASK_STATUS_FAILURE, progress=100,
-                            details={
-                                "error": "Radio playlist run failed; check the container logs."
-                            },
-                        )
-                elif task_type == 'sonic_fingerprint':
-                    # Enqueued, not run inline: this one walks the media server's play
-                    # history per user, and doing that on the 60s poll thread let one
-                    # unreachable provider swallow whole scheduling windows.
-                    save_task_status(
-                        job_id,
-                        task_type,
-                        TASK_STATUS_PENDING,
-                        details={"message": _ENQUEUED_BY_CRON},
-                    )
-                    try:
-                        rq_queue_default.enqueue(
-                            'tasks.sonic_fingerprint_manager.run_sonic_fingerprint_task',
-                            kwargs={'server_scope': server_scope},
-                            job_id=job_id,
-                            description=f'Cron {task_type}',
-                            job_timeout=-1,
-                            retry=Retry(max=3),
-                        )
-                        logger.info(f"Cron: enqueued {task_type} job {job_id}")
-                    except Exception:
-                        logger.exception(f"Cron: enqueue failed for {task_type}")
-                        save_task_status(
-                            job_id, task_type, TASK_STATUS_FAILURE,
-                            details={"error": "Could not enqueue the task (is Redis reachable?)"},
-                        )
-                elif task_type.startswith('plugin.'):
-                    from plugin.manager import plugin_manager
-
-                    cron_task = plugin_manager.get_cron_task(task_type)
-                    if not cron_task:
-                        logger.warning(
-                            f"Cron: no registered plugin task for {task_type}; skipping"
-                        )
-                    else:
-                        save_task_status(
-                            job_id,
-                            task_type,
-                            TASK_STATUS_PENDING,
-                            details={"message": _ENQUEUED_BY_CRON},
-                        )
-                        queue = rq_queue_high if cron_task.get('queue') == 'high' else rq_queue_default
-                        try:
-                            queue.enqueue(
-                                'plugin.manager.run_plugin_task',
-                                args=(cron_task['dotted'],),
-                                kwargs={'server_scope': server_scope},
-                                job_id=job_id,
-                                description=f'Cron {task_type}',
-                                job_timeout=-1,
-                                retry=Retry(max=3),
-                            )
-                            logger.info(f"Cron: enqueued plugin task {task_type} job {job_id}")
-                        except Exception:
-                            logger.exception(f"Cron: enqueue failed for {task_type}")
-                            save_task_status(
-                                job_id, task_type, TASK_STATUS_FAILURE,
-                                details={"error": "Could not enqueue the task (is Redis reachable?)"},
-                            )
+                result = _dispatch_cron_row(db, r)
+                if result == 'blocked':
+                    _record_cron_retry(db, r['task_type'])
+                elif result == 'enqueued':
+                    # A later occurrence of the same task type ran: drop any
+                    # stale retry so it cannot duplicate this fresh run.
+                    clear_cron_retry(r['task_type'], conn=db)
         except Exception:
             db.rollback()
             logger.exception(f"Error processing cron row {r}")
     cur.close()
+
+
+def cron_retry_interval_seconds():
+    if CRON_RETRY_INTERVAL_MINUTES >= CRON_RETRY_MAX_MINUTES:
+        logger.warning(
+            "Cron: CRON_RETRY_INTERVAL_MINUTES (%s) is not below "
+            "CRON_RETRY_MAX_MINUTES (%s); clamping so a retry can still run.",
+            CRON_RETRY_INTERVAL_MINUTES, CRON_RETRY_MAX_MINUTES,
+        )
+        return max(1, CRON_RETRY_MAX_MINUTES - 1) * 60
+    return CRON_RETRY_INTERVAL_MINUTES * 60

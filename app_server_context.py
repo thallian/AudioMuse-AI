@@ -38,7 +38,7 @@ from flask import request
 
 logger = logging.getLogger(__name__)
 
-_SECRET_CRED_KEYS = ('token', 'password')
+_SECRET_CRED_KEYS = ('token', 'password', 'api_key')
 CRED_MASK = '__unchanged__'
 
 
@@ -76,13 +76,6 @@ def resolve_request_server_id(data=None):
     if server is None:
         raise ValueError(f"Unknown server '{requested}'")
     return server['server_id']
-
-
-def is_default_server(server_id):
-    from tasks.mediaserver import registry
-    if not server_id:
-        return True
-    return server_id == registry.get_default_server_id()
 
 
 def selected_server_scope(data=None):

@@ -8,21 +8,24 @@
 
 """Per-artist GMM fitting and soft-Chamfer similarity in artist_gmm_manager.
 
-Covers component selection, GMM parameter construction from track embeddings,
-the mode-to-mode divergence metric, and candidate reranking in find_similar_artists.
+Covers GMM parameter construction from track embeddings, the mode-to-mode
+divergence metric, and candidate reranking in find_similar_artists.
 
 Main Features:
-* select_optimal_gmm_components respects sample size and min/max bounds
 * fit_artist_gmm produces normalized weights, correct means shape, few-songs flag,
   and omits covariance fields
 * gmm_soft_chamfer_distance is zero for identical, scale-invariant, symmetric,
   and weight-sensitive; find_similar_artists reranks and excludes self
+* _fit_pending_artists refits in-process, loudly, when the worker pool cannot run
 """
 
+import logging
+
 import numpy as np
+import pytest
 from tasks.artist_gmm_manager import (
-    select_optimal_gmm_components,
     fit_artist_gmm,
+    get_representative_songs_for_component,
     GMM_N_COMPONENTS_MAX,
     gmm_soft_chamfer_distance,
     _cosine_distance_matrix,
@@ -31,69 +34,6 @@ from tasks.artist_gmm_manager import (
 
 def _gmm(means, weights):
     return {"means": [list(m) for m in means], "weights": list(weights)}
-
-
-class TestSelectOptimalGMMComponents:
-    def test_single_sample_returns_one_component(self):
-        embeddings = np.random.rand(1, 128)
-
-        n_components = select_optimal_gmm_components(embeddings)
-
-        assert n_components == 1
-
-    def test_two_samples_returns_valid_components(self):
-        embeddings = np.random.rand(2, 128)
-
-        n_components = select_optimal_gmm_components(embeddings)
-
-        assert 1 <= n_components <= 2
-
-    def test_small_dataset_respects_max_feasible(self):
-        embeddings = np.random.rand(4, 128)
-
-        n_components = select_optimal_gmm_components(embeddings)
-
-        assert n_components <= 4
-        assert n_components >= 1
-
-    def test_large_dataset_respects_sample_ratio(self):
-        embeddings = np.random.rand(50, 128)
-
-        n_components = select_optimal_gmm_components(embeddings)
-
-        assert 1 <= n_components <= 10
-
-    def test_respects_min_components_parameter(self):
-        embeddings = np.random.rand(50, 128)
-
-        n_components = select_optimal_gmm_components(embeddings, min_components=3, max_components=8)
-
-        assert n_components >= 1
-        assert n_components <= 8
-
-    def test_respects_max_components_parameter(self):
-        embeddings = np.random.rand(100, 128)
-
-        n_components = select_optimal_gmm_components(embeddings, min_components=2, max_components=5)
-
-        assert n_components <= 5
-        assert n_components >= 1
-
-    def test_deterministic_with_same_data(self):
-        np.random.seed(42)
-        embeddings = np.random.rand(30, 128)
-
-        n1 = select_optimal_gmm_components(embeddings)
-        n2 = select_optimal_gmm_components(embeddings)
-
-        assert n1 == n2
-
-    def test_high_dimensional_embeddings(self):
-        embeddings = np.random.rand(25, 512)
-
-        n_components = select_optimal_gmm_components(embeddings)
-
-        assert 1 <= n_components <= min(GMM_N_COMPONENTS_MAX, 25 // 5)
 
 
 class TestFitArtistGMM:
@@ -180,6 +120,14 @@ class TestFitArtistGMM:
 
         assert few_params['is_few_songs'] is True
         assert many_params['is_few_songs'] is False
+
+    def test_few_song_means_are_unit_normed_for_cosine(self):
+        embeddings = [np.random.rand(128) for _ in range(3)]
+
+        gmm_params = fit_artist_gmm("Cosine Artist", embeddings)
+
+        means = np.array(gmm_params['means'])
+        assert np.allclose(np.linalg.norm(means, axis=1), 1.0, atol=1e-5)
 
     def test_different_artists_different_gmms(self):
         np.random.seed(42)
@@ -307,27 +255,30 @@ class TestEdgeCases:
 
         assert gmm_params is None
 
-    def test_zero_dimensional_embeddings(self):
-        try:
-            embeddings = [np.array([]) for _ in range(5)]
-            gmm_params = fit_artist_gmm("Invalid Artist", embeddings)
-            assert (
-                gmm_params is None
-                or 'n_features' not in gmm_params
-                or gmm_params['n_features'] == 0
-            )
-        except Exception:
-            pass
+    def test_zero_dimensional_embeddings_return_none_instead_of_raising(self, caplog):
+        embeddings = [np.array([]) for _ in range(5)]
 
-    def test_mismatched_embedding_dimensions(self):
+        with caplog.at_level(logging.ERROR, logger="tasks.artist_gmm_manager"):
+            gmm_params = fit_artist_gmm("Invalid Artist", embeddings)
+
+        assert gmm_params is None
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "the fit failure must be logged at ERROR"
+        assert "Failed to fit GMM for artist 'Invalid Artist'" in errors[0].message
+        assert errors[0].exc_info is not None
+
+    def test_mismatched_embedding_dimensions_return_none_instead_of_raising(self, caplog):
         rng = np.random.default_rng(0)
         embeddings = [rng.random(128), rng.random(64), rng.random(128)]
 
-        try:
+        with caplog.at_level(logging.ERROR, logger="tasks.artist_gmm_manager"):
             gmm_params = fit_artist_gmm("Mismatched Artist", embeddings)
-            assert gmm_params is None or gmm_params is not None
-        except (ValueError, Exception):
-            pass
+
+        assert gmm_params is None
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "the dimension mismatch must be logged at ERROR"
+        assert "Failed to fit GMM for artist 'Mismatched Artist'" in errors[0].message
+        assert errors[0].exc_info is not None
 
     def test_very_large_component_count(self):
         embeddings = [np.random.rand(128) for _ in range(100)]
@@ -335,3 +286,154 @@ class TestEdgeCases:
         gmm_params = fit_artist_gmm("Popular Artist", embeddings)
 
         assert gmm_params['n_components'] <= GMM_N_COMPONENTS_MAX
+
+
+class TestRepresentativeSongs:
+    def test_ranks_by_direction_not_norm(self, monkeypatch):
+        import tasks.artist_gmm_manager as agm
+
+        monkeypatch.setattr(
+            agm, "artist_gmm_params", {"Artist": {"means": [[1.0, 0.0]], "weights": [1.0]}}
+        )
+        rows = [
+            ("same_small", "S small", np.array([0.01, 0.0], dtype=np.float32).tobytes()),
+            ("wrong", "W", np.array([0.0, 5.0], dtype=np.float32).tobytes()),
+            ("same_big", "S big", np.array([100.0, 0.0], dtype=np.float32).tobytes()),
+        ]
+
+        class _FakeCursor:
+            def __init__(self, data):
+                self._data = data
+
+            def execute(self, *args, **kwargs):
+                pass
+
+            def fetchall(self):
+                return self._data
+
+            def close(self):
+                pass
+
+        class _FakeConn:
+            def cursor(self):
+                return _FakeCursor(rows)
+
+        monkeypatch.setattr("database.get_db", lambda: _FakeConn())
+        songs = get_representative_songs_for_component("Artist", 0, top_k=3)
+        ids = [song["item_id"] for song in songs]
+        assert set(ids[:2]) == {"same_small", "same_big"}
+        assert ids[2] == "wrong"
+
+
+class TestPoolFallback:
+    ARTISTS = ["A", "B", "C"]
+
+    def _harness(self, monkeypatch, workers, dispatches):
+        import tasks.artist_gmm_manager as agm
+
+        monkeypatch.setattr(agm, "_gmm_worker_count", lambda _pending: workers)
+        monkeypatch.setattr(agm, "_shutdown_gmm_pool", lambda: None)
+        monkeypatch.setattr(agm, "_release_gmm_pool_temp_folders", lambda: None)
+        monkeypatch.setattr(
+            agm, "_run_fit_batches",
+            lambda cur, pending, tracks, hashes, dispatch: (
+                dispatches.append(dispatch) or dict.fromkeys(pending, {"fitted": True})
+            ),
+        )
+        return agm
+
+    def test_a_dead_worker_pool_refits_every_artist_in_process(self, monkeypatch):
+        dispatches = []
+        agm = self._harness(monkeypatch, 4, dispatches)
+
+        class _DeadPool:
+            def __enter__(self):
+                raise RuntimeError("A worker process managed by the executor died")
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(agm, "Parallel", lambda **kwargs: _DeadPool())
+
+        fitted = agm._fit_pending_artists(None, self.ARTISTS, {}, {})
+
+        assert sorted(fitted) == self.ARTISTS
+        assert len(dispatches) == 1
+
+    def test_a_dead_worker_pool_is_reported_with_a_traceback(self, monkeypatch, caplog):
+        agm = self._harness(monkeypatch, 4, [])
+
+        class _DeadPool:
+            def __enter__(self):
+                raise RuntimeError("A worker process managed by the executor died")
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(agm, "Parallel", lambda **kwargs: _DeadPool())
+
+        with caplog.at_level(logging.ERROR, logger="tasks.artist_gmm_manager"):
+            agm._fit_pending_artists(None, self.ARTISTS, {}, {})
+
+        records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert records, "a dead worker pool must be logged at ERROR"
+        assert "ARTIST GMM WORKER POOL FAILED" in records[0].message
+        assert records[0].exc_info is not None
+
+    def test_the_pool_is_shut_down_before_the_in_process_refit_starts(self, monkeypatch):
+        dispatches = []
+        agm = self._harness(monkeypatch, 4, dispatches)
+        events = []
+
+        class _DeadPool:
+            def __enter__(self):
+                raise RuntimeError("boom")
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(agm, "Parallel", lambda **kwargs: _DeadPool())
+        monkeypatch.setattr(agm, "_shutdown_gmm_pool", lambda: events.append("shutdown"))
+        monkeypatch.setattr(
+            agm, "_fit_artists_in_process",
+            lambda *args: events.append("refit") or {},
+        )
+
+        agm._fit_pending_artists(None, self.ARTISTS, {}, {})
+
+        assert events == ["shutdown", "refit"]
+
+    def test_a_healthy_worker_pool_is_used_and_never_refits_in_process(self, monkeypatch):
+        dispatches = []
+        agm = self._harness(monkeypatch, 4, dispatches)
+
+        class _LivePool:
+            def __enter__(self):
+                return lambda jobs: jobs
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(agm, "Parallel", lambda **kwargs: _LivePool())
+        monkeypatch.setattr(
+            agm, "_fit_artists_in_process",
+            lambda *args: pytest.fail("a healthy pool must not trigger the refit"),
+        )
+
+        fitted = agm._fit_pending_artists(None, self.ARTISTS, {}, {})
+
+        assert sorted(fitted) == self.ARTISTS
+        assert len(dispatches) == 1
+
+    def test_a_single_worker_count_skips_the_pool_entirely(self, monkeypatch):
+        dispatches = []
+        agm = self._harness(monkeypatch, 1, dispatches)
+        monkeypatch.setattr(
+            agm, "Parallel",
+            lambda **kwargs: pytest.fail("workers <= 1 must not build a pool"),
+        )
+
+        fitted = agm._fit_pending_artists(None, self.ARTISTS, {}, {})
+
+        assert sorted(fitted) == self.ARTISTS
+        assert len(dispatches) == 1

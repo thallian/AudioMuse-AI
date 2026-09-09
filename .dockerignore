@@ -22,7 +22,7 @@ test/
 student_clap/
 
 # Native standalone app (macOS/Linux/Windows): the per-platform source trees
-# (vendored redis/pg binaries, assets, nfpm config, runtime launchers), the shared
+# (vendored pg binaries, assets, nfpm config, runtime launchers), the shared
 # PyInstaller spec + build tooling, and build artifacts. None of it is used by the
 # Linux container, so keep it out of the image.
 native-build/
@@ -43,6 +43,11 @@ venv
 env
 .env*
 
+# SAE sparse autoencoder workspace: training code, the 4 GB venv, the embedding
+# corpus, checkpoints and every exported model. Nothing here runs in production.
+# The three runtime artifacts it produces live at the project root instead.
+SAE/
+
 # IDE and editor configuration
 .vscode/
 .idea/
@@ -51,6 +56,7 @@ env
 README.md
 docs/
 query/
+metadata/
 screenshot/
 .pytest_cache/
 htmlcov/
@@ -60,6 +66,9 @@ htmlcov/
 # Large model files and caches (these are downloaded inside the container)
 model/
 *.onnx
+# The SAE concept catalogue is small and ships in the repository; the two ONNX
+# graphs it refers to are downloaded into model/ by the Dockerfile.
+!dclap_sae_concepts.json
 *.pt
 *.pth
 *.bin

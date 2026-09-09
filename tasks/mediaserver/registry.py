@@ -8,34 +8,45 @@
 
 """Registry of configured media servers and cross-server track-id mapping.
 
-Persists every configured media server (the ``music_servers`` table) plus the
-per-track mapping from a canonical library ``item_id`` to that track's id on
-each server (the ``track_server_map`` table). The registry is the ONLY
-persistent home of media-server settings, the default server included: config
-module globals are a read-only projection of the default row (loaded by
-``config._apply_db_overrides`` at import/refresh), the setup wizard writes here
-via ``save_default_server_settings``, and init_db migrates legacy app_config
-rows in once and deletes them.
+Persists every configured media server (the music_servers table) plus the
+per-track mapping from a canonical library item_id to that track's id on each
+server (the track_server_map table). The registry is the ONLY persistent home of
+media-server settings, the default server included: config module globals are a
+read-only projection of the default row, the setup wizard writes here, and
+init_db migrates legacy app_config rows in once and deletes them.
 
 Main Features:
 * CRUD over the server registry with a single enforced default server.
-* ``save_default_server_settings`` persists the wizard's media settings;
-  ``creds_from_config`` remains only as first-boot migration seed material.
 * Resolves a normalized server context by id and translates canonical item_ids
-  to a target server's provider track ids (legacy raw ids may use identity on
-  the default server; canonical ids always require a mapping).
-* ``canonical_input_ids`` is the single input-side resolver turning
-  caller-supplied provider ids into canonical ids (fail-open pass-through).
-* ``servers_for_scope`` / ``has_secondary_servers`` resolve which servers a
-  multi-server operation should touch (None = legacy config default).
-* Self-heals the default server: the config globals are projected once, when the
-  config module is imported, so a worker that boots before the database is
-  reachable (or before the 3.0 migration filled the registry) keeps EMPTY
-  media-server settings for the life of the process and every default-server call
-  builds a URL like '/Items'; a worker that was never restarted after a wizard
-  change keeps the OLD ones and talks to the wrong machine. ``context_for``
-  compares the projection field by field against the default row and binds the row
-  itself whenever they disagree, instead of returning None.
+  to a target server's provider track ids.
+* canonical_input_ids is the single input-side resolver (fail-open pass-through).
+* servers_for_scope / has_secondary_servers resolve which servers a
+  multi-server operation should touch, and for_each_server runs one callable
+  once per server in that scope with each server's context bound: a per-server
+  failure is logged and the loop continues, but a scope where every server
+  failed raises. It returns the single result for a one-server scope, else the
+  per-server results in scope order.
+* Self-heals the default server: context_for compares the config projection
+  against the default row and binds the row when they disagree, so a stale boot
+  never talks to the wrong machine.
+* upsert_track_maps hands each mapping the Chromaprint already stored for its
+  canonical track, in the SAME transaction that writes the mapping. Matching a
+  track and knowing its fingerprint are one step, so a sweep always carries the
+  fingerprint with the mapping. The inherit rides a SAVEPOINT and can only ever
+  be skipped: the mapping write is the job and always stands. It COPIES stored
+  prints and computes none, so CHROMAPRINT_COLLECTION_ENABLED (compute new ones)
+  is the wrong switch to gate it on alone: an install with fpcalc missing but
+  CHROMAPRINT_GATE_ENABLED on still uses stored prints, and with the backfill
+  gone this is the only path that would ever fill them. The hand-over runs on
+  EVERY call, and the analysis calls this once per TRACK with a single row, so
+  nothing here may cost more than that one row is worth. Two things keep it that
+  way: the keyset index on the staging table is built only when the staged set is
+  big enough for the chunking to loop (the sweep, never the per-track flush), and
+  the whole hand-over - savepoint, statement, release - is skipped outright when
+  the catalogue has ONE server. That skip is exact, not a heuristic: a mapping can
+  only borrow from a mapping of the same item_id on a DIFFERENT server, because
+  the same server holding two files for one item_id is the ambiguity both sides
+  already refuse. One server therefore cannot inherit anything, ever.
 """
 
 import logging
@@ -47,17 +58,21 @@ import psycopg2
 from psycopg2.extras import DictCursor, Json, execute_values
 
 import config
-from database import get_db, missing_required_creds
+from database import (
+    get_db,
+    inherit_chromaprints_from_staged_maps,
+    missing_required_creds,
+)
 from sanitization import sanitize_string_for_db, sanitize_string_for_db_loud
 
 logger = logging.getLogger(__name__)
 
-_COLUMNS = (
-    "server_id", "name", "server_type", "creds",
-    "music_libraries", "is_default",
-)
 _DEFAULT_CACHE_TTL = 10.0
-_default_cache = {'expires': 0.0, 'row': None, 'secondary_expires': 0.0, 'secondary': None}
+_default_cache = {
+    'expires': 0.0, 'row': None,
+    'secondary_expires': 0.0, 'secondary': None,
+    'multi_expires': 0.0, 'multi': None,
+}
 _default_cache_lock = threading.Lock()
 _warned_once = {'projection': False, 'row': False}
 
@@ -68,6 +83,8 @@ def invalidate_server_cache():
         _default_cache['row'] = None
         _default_cache['secondary_expires'] = 0.0
         _default_cache['secondary'] = None
+        _default_cache['multi_expires'] = 0.0
+        _default_cache['multi'] = None
         _warned_once['projection'] = False
         _warned_once['row'] = False
 
@@ -209,6 +226,8 @@ def servers_for_scope(scope, conn=None):
     return servers
 
 
+
+
 def has_secondary_servers(conn=None):
     """True when any non-default server exists (cached like the default row)."""
     if conn is None:
@@ -229,6 +248,20 @@ def has_secondary_servers(conn=None):
         with _default_cache_lock:
             _default_cache['secondary'] = result
             _default_cache['secondary_expires'] = time.monotonic() + _DEFAULT_CACHE_TTL
+    return result
+
+
+def _catalogue_has_two_servers(cur):
+    now = time.monotonic()
+    with _default_cache_lock:
+        if _default_cache['multi_expires'] > now:
+            return bool(_default_cache['multi'])
+    cur.execute("SELECT EXISTS (SELECT 1 FROM music_servers OFFSET 1)")
+    row = cur.fetchone()
+    result = bool(row and row[0])
+    with _default_cache_lock:
+        _default_cache['multi'] = result
+        _default_cache['multi_expires'] = time.monotonic() + _DEFAULT_CACHE_TTL
     return result
 
 
@@ -326,6 +359,28 @@ def bind(server, conn=None):
             raise ValueError(f"Unknown music server '{server_id}'")
         ctx = {'server_id': server_id}
     return ms_context.use_server(ctx)
+
+
+def for_each_server(scope, func, *args, **kwargs):
+    servers = servers_for_scope(scope)
+    results = []
+    failures = []
+    for server in servers:
+        name = server['name'] if server else 'default server'
+        try:
+            with bind(server):
+                results.append(func(*args, **kwargs))
+        except Exception as exc:
+            logger.exception('Operation failed on %s; continuing', name)
+            failures.append(f'{name}: {exc}')
+    if failures and not results:
+        raise RuntimeError('Operation failed on every server: ' + '; '.join(failures))
+    if failures:
+        logger.warning(
+            'Operation completed on %d/%d servers (%s)',
+            len(results), len(servers), '; '.join(failures),
+        )
+    return results[0] if len(results) == 1 else results
 
 
 def _clear_default(db):
@@ -494,6 +549,9 @@ def availability_sql(alias='s'):
     )
 
 
+_TRANSLATE_IDS_CHUNK = 5000
+
+
 def translate_ids(item_ids, server_id=None, conn=None):
     """Map canonical library item_ids to their ids on ``server_id``.
 
@@ -513,23 +571,26 @@ def translate_ids(item_ids, server_id=None, conn=None):
         from tasks.simhash import is_fingerprint_id
         return {i: i for i in ids if not is_fingerprint_id(i)}
     cur = db.cursor()
+    mapped = {}
     try:
         # N provider tracks may map to one item_id on a server (duplicate files);
         # pick ONE deterministically - strongest match tier, then the smallest
         # provider id as a stable tiebreak - so a playlist target never changes
         # between runs.
-        cur.execute(
-            "SELECT DISTINCT ON (item_id) item_id, provider_track_id "
-            "FROM track_server_map WHERE server_id = %s AND item_id = ANY(%s) "
-            "ORDER BY item_id, "
-            "  CASE match_tier "
-            "    WHEN 'fingerprint' THEN 0 WHEN 'path' THEN 1 WHEN 'tail' THEN 2 "
-            "    WHEN 'exact_meta' THEN 3 WHEN 'default' THEN 4 WHEN 'norm_meta' THEN 5 "
-            "    WHEN 'title_artist' THEN 6 WHEN 'analysis' THEN 7 ELSE 8 END, "
-            "  provider_track_id",
-            (target, ids),
-        )
-        mapped = {r[0]: r[1] for r in cur.fetchall()}
+        for start in range(0, len(ids), _TRANSLATE_IDS_CHUNK):
+            chunk = ids[start:start + _TRANSLATE_IDS_CHUNK]
+            cur.execute(
+                "SELECT DISTINCT ON (item_id) item_id, provider_track_id "
+                "FROM track_server_map WHERE server_id = %s AND item_id = ANY(%s) "
+                "ORDER BY item_id, "
+                "  CASE match_tier "
+                "    WHEN 'fingerprint' THEN 0 WHEN 'path' THEN 1 WHEN 'tail' THEN 2 "
+                "    WHEN 'exact_meta' THEN 3 WHEN 'default' THEN 4 WHEN 'norm_meta' THEN 5 "
+                "    WHEN 'title_artist' THEN 6 WHEN 'analysis' THEN 7 ELSE 8 END, "
+                "  provider_track_id",
+                (target, chunk),
+            )
+            mapped.update({r[0]: r[1] for r in cur.fetchall()})
     finally:
         cur.close()
     if is_default:
@@ -793,6 +854,19 @@ def upsert_track_maps(server_id, mapping, conn=None):
             "UPDATE music_servers SET updated_at = now() WHERE server_id = %s",
             (server_id,),
         )
+        if not (
+            config.CHROMAPRINT_COLLECTION_ENABLED or config.CHROMAPRINT_GATE_ENABLED
+        ):
+            return
+        if not _catalogue_has_two_servers(cur):
+            return
+        inherited = inherit_chromaprints_from_staged_maps(cur, len(rows))
+        if inherited:
+            logger.info(
+                "%d of the %d mapping(s) written for server %s inherited the "
+                "Chromaprint already stored for their canonical track",
+                inherited, len(rows), server_id,
+            )
 
     def _run():
         return _staged_map_upsert(

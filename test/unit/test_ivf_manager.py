@@ -16,7 +16,7 @@ Main Features:
 * String normalization, same-song matching, and mood-feature parsing
 * Vector lookup prefers primed f32 over the index; load and neighbor queries raise
   when the index or id maps are unloaded
-* On-demand loading for processes that never preload (RQ workers), including the
+* On-demand loading for processes that never preload (queue workers), including the
   retry cooldown that keeps a missing index from being re-read per call
 * create_playlist_from_ids error paths and the LRU/TTL _ResultCache behavior
 """
@@ -173,33 +173,33 @@ class TestNormalizeString:
 
 class TestIsSameSong:
     def test_exact_match(self):
-        from tasks.ivf_manager import _is_same_song
+        from tasks.search_shaping import is_same_song as _is_same_song
 
         assert _is_same_song("Song Title", "Artist", "Song Title", "Artist") is True
 
     def test_case_insensitive_match(self):
-        from tasks.ivf_manager import _is_same_song
+        from tasks.search_shaping import is_same_song as _is_same_song
 
         assert _is_same_song("SONG TITLE", "ARTIST", "song title", "artist") is True
         assert _is_same_song("Song Title", "Artist Name", "song title", "artist name") is True
 
     def test_whitespace_insensitive(self):
-        from tasks.ivf_manager import _is_same_song
+        from tasks.search_shaping import is_same_song as _is_same_song
 
         assert _is_same_song("  Song Title  ", "  Artist  ", "Song Title", "Artist") is True
 
     def test_different_title_returns_false(self):
-        from tasks.ivf_manager import _is_same_song
+        from tasks.search_shaping import is_same_song as _is_same_song
 
         assert _is_same_song("Song A", "Artist", "Song B", "Artist") is False
 
     def test_different_artist_returns_false(self):
-        from tasks.ivf_manager import _is_same_song
+        from tasks.search_shaping import is_same_song as _is_same_song
 
         assert _is_same_song("Song", "Artist A", "Song", "Artist B") is False
 
     def test_empty_fields(self):
-        from tasks.ivf_manager import _is_same_song
+        from tasks.search_shaping import is_same_song as _is_same_song
 
         assert _is_same_song("", "", "", "") is True
         assert _is_same_song("Song", "", "Song", "") is True
@@ -306,7 +306,7 @@ class TestLoadIVFIndex:
     def test_skips_reload_if_already_loaded(self):
         from tasks.ivf_manager import load_ivf_index_for_querying
 
-        with patch('app_helper.get_db') as mock_get_db:
+        with patch('database.get_db') as mock_get_db:
             load_ivf_index_for_querying(force_reload=False)
 
             mock_get_db.assert_not_called()
@@ -317,7 +317,7 @@ class TestLoadIVFIndex:
     def test_loads_index_from_database(self):
         import tasks.ivf_manager as vm
 
-        with patch('app_helper.get_db') as mock_get_db:
+        with patch('database.get_db') as mock_get_db:
             mock_get_db.return_value = Mock()
             with patch('tasks.paged_ivf.load_paged_ivf_index') as mock_load:
                 mock_index = Mock()
@@ -330,19 +330,32 @@ class TestLoadIVFIndex:
                 mock_load.assert_called_once()
                 assert vm.ivf_index is mock_index
 
-    @patch('tasks.ivf_manager.ivf_index', None)
-    @patch('tasks.ivf_manager.id_map', None)
-    def test_handles_missing_index_gracefully(self):
-        with patch('app_helper.get_db') as mock_get_db:
-            mock_conn = Mock()
-            mock_cursor = Mock()
-            mock_get_db.return_value = mock_conn
-            mock_conn.cursor.return_value = mock_cursor
-            mock_cursor.fetchone.return_value = None
+    def test_index_missing_from_database_clears_stale_index_and_result_caches(self):
+        import tasks.ivf_manager as vm
+        from tasks.ivf_manager import _ResultCache, load_ivf_index_for_querying
 
-            from tasks.ivf_manager import load_ivf_index_for_querying
+        neighbor_cache = _ResultCache(60, 10)
+        max_distance_cache = _ResultCache(60, 10)
+        neighbor_cache.put('stale-neighbors', [{'item_id': 'item-1'}])
+        max_distance_cache.put('stale-max', {'max_distance': 1.0})
 
+        with (
+            patch.object(vm, 'ivf_index', Mock()),
+            patch.object(vm, 'id_map', {0: 'item-1'}),
+            patch.object(vm, 'reverse_id_map', {'item-1': 0}),
+            patch.object(vm, '_neighbor_result_cache', neighbor_cache),
+            patch.object(vm, '_max_distance_cache', max_distance_cache),
+            patch('database.get_db', return_value=Mock()),
+            patch('tasks.paged_ivf.load_paged_ivf_index', return_value=None) as mock_load,
+        ):
             load_ivf_index_for_querying(force_reload=True)
+
+            mock_load.assert_called_once()
+            assert vm.ivf_index is None
+            assert vm.id_map is None
+            assert vm.reverse_id_map is None
+            assert neighbor_cache.get('stale-neighbors') is None
+            assert max_distance_cache.get('stale-max') is None
 
 
 class TestEnsureIvfIndexLoaded:
@@ -501,7 +514,7 @@ class TestCreatePlaylistFromIds:
 
 class TestSearchTracksByTitleAndArtist:
     def test_search_with_single_keyword(self):
-        with patch('app_helper.get_db') as mock_get_db:
+        with patch('database.get_db') as mock_get_db:
             mock_conn = Mock()
             mock_cursor = Mock()
             mock_get_db.return_value = mock_conn
@@ -528,7 +541,7 @@ class TestSearchTracksByTitleAndArtist:
             assert {r['item_id'] for r in results} == {"item-1", "item-2"}
 
     def test_search_with_two_keywords(self):
-        with patch('app_helper.get_db') as mock_get_db:
+        with patch('database.get_db') as mock_get_db:
             mock_conn = Mock()
             mock_cursor = Mock()
             mock_get_db.return_value = mock_conn
@@ -556,7 +569,7 @@ class TestSearchTracksByTitleAndArtist:
             assert {r['item_id'] for r in results} == {"item-1", "item-2"}
 
     def test_returns_empty_for_no_query(self):
-        with patch('app_helper.get_db') as mock_get_db:
+        with patch('database.get_db') as mock_get_db:
             mock_conn = Mock()
             mock_cursor = Mock()
             mock_get_db.return_value = mock_conn
@@ -571,7 +584,7 @@ class TestSearchTracksByTitleAndArtist:
 
 class TestGetItemIdByTitleAndArtist:
     def test_finds_exact_match(self):
-        with patch('app_helper.get_db') as mock_get_db:
+        with patch('database.get_db') as mock_get_db:
             mock_conn = Mock()
             mock_cursor = Mock()
             mock_get_db.return_value = mock_conn
@@ -585,7 +598,7 @@ class TestGetItemIdByTitleAndArtist:
             assert result == 'found-item'
 
     def test_returns_none_when_not_found(self):
-        with patch('app_helper.get_db') as mock_get_db:
+        with patch('database.get_db') as mock_get_db:
             mock_conn = Mock()
             mock_cursor = Mock()
             mock_get_db.return_value = mock_conn
@@ -597,16 +610,6 @@ class TestGetItemIdByTitleAndArtist:
             result = get_item_id_by_title_and_artist('Unknown', 'Unknown')
 
             assert result is None
-
-
-class TestCleanupResources:
-    @patch('tasks.ivf_manager._shutdown_thread_pool')
-    def test_shuts_down_pool(self, mock_shutdown):
-        from tasks.ivf_manager import cleanup_resources
-
-        cleanup_resources()
-
-        mock_shutdown.assert_called_once()
 
 
 class TestGetMaxDistanceForId:
@@ -699,11 +702,17 @@ class TestResultCache:
         assert c.get("old") is None
         assert c.get("fresh") == 2
 
-    def test_sweep_expired_noop_when_ttl_zero(self):
+    def test_sweep_expired_leaves_entries_untouched_when_ttl_zero(self):
+        import time
         from tasks.ivf_manager import _ResultCache
 
         c = _ResultCache(0, 10)
+        c._data["k"] = (time.monotonic() - 1.0, 42)
+
         c.sweep_expired()
+
+        assert list(c._data.keys()) == ["k"]
+        assert c._data["k"][1] == 42
 
     def test_disabled_when_ttl_zero(self):
         from tasks.ivf_manager import _ResultCache
